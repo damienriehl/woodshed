@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { sha256 } from "../../contracts/src/snapshot.ts";
 
 export const CAPABILITIES = ["event", "ballot", "assignment", "live"] as const;
 export type Capability = typeof CAPABILITIES[number];
@@ -101,8 +101,7 @@ export function evaluateCutover(a: CutoverArtifact) {
 }
 
 export type ShadowPair = { capability: Capability; id: string; legacy: Record<string, unknown>; woodshed: Record<string, unknown> };
-const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(",")}]` : value && typeof value === "object" ? `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k,v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}` : JSON.stringify(value);
-const fingerprint = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
+const fingerprint = (value: unknown) => sha256(value);
 export function compareShadow(pairs: readonly ShadowPair[], options: { invariants: readonly ((pair: ShadowPair) => boolean)[] }) {
   const mismatches = pairs.filter(p => fingerprint(p.legacy) !== fingerprint(p.woodshed)).map(p => ({ capability: p.capability, idHash: fingerprint(p.id).slice(0,16) }));
   const invariantFailures = pairs.flatMap(p => options.invariants.map((check, index) => ({ check, index })).filter(x => !x.check(p)).map(x => ({ capability: p.capability, idHash: fingerprint(p.id).slice(0,16), invariant: x.index })));

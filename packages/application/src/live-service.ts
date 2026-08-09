@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { transitionQueueEntry, type PerformanceRecord, type QueueEntry, type QueueEntryState } from "../../domain/src/live.ts";
+import { canonicalJson } from "../../contracts/src/snapshot.ts";
 import type { AuthorityCoordinator } from "./live-coordinator.ts";
 
 export type LiveAction = "suggest" | "plan" | "queue" | "make-current" | "perform" | "skip" | "defer" | "restore";
@@ -22,17 +23,8 @@ export type LiveCommand = {
 };
 type Unsigned = Omit<LiveCommand, "authentication">;
 
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`)
-    .join(",")}}`;
-}
-
 export function signLiveCommand(command: Unsigned, secret: string): LiveCommand {
-  return { ...command, authentication: createHmac("sha256", secret).update(canonical(command)).digest("hex") };
+  return { ...command, authentication: createHmac("sha256", secret).update(canonicalJson(command)).digest("hex") };
 }
 
 export class LiveError extends Error {
@@ -61,6 +53,7 @@ export class LivePerformanceService {
   private receipts = new Map<string, { hash: string; result: Result }>();
   private performances: PerformanceRecord[] = [];
   private audits: { id: string; eventId: string; operationId: string; action: string; revision: number; entryId: string }[] = [];
+  private operationCounts = new Map<string, number>();
   private readonly options: {
     coordinator: AuthorityCoordinator;
     credentialFor: (device: string) => string | null;
@@ -80,7 +73,7 @@ export class LivePerformanceService {
   }
 
   execute(command: LiveCommand): Result {
-    const hash = canonical(command);
+    const hash = canonicalJson(command);
     const receiptKey = `${command.communityId}\0${command.eventId}\0${command.operationId}`;
     const prior = this.receipts.get(receiptKey);
     if (prior) {
@@ -93,7 +86,7 @@ export class LivePerformanceService {
     if (!expected) throw new LiveError("device-revoked");
     const unsigned = { ...command } as Partial<LiveCommand>;
     delete unsigned.authentication;
-    const calculated = createHmac("sha256", expected).update(canonical(unsigned)).digest("hex");
+    const calculated = createHmac("sha256", expected).update(canonicalJson(unsigned)).digest("hex");
     if (
       calculated.length !== command.authentication.length ||
       !timingSafeEqual(Buffer.from(calculated), Buffer.from(command.authentication))
@@ -116,7 +109,7 @@ export class LivePerformanceService {
     if (lease.deviceInstallationId !== command.deviceInstallationId || lease.epoch !== command.authorityEpoch) {
       throw new LiveError("superseded-authority");
     }
-    if (this.audits.filter((item) => item.eventId === command.eventId).length >= (this.options.maxOperationsPerEvent ?? 1_000)) {
+    if ((this.operationCounts.get(command.eventId) ?? 0) >= (this.options.maxOperationsPerEvent ?? 1_000)) {
       throw new LiveError("rate-limited");
     }
 
@@ -183,6 +176,7 @@ export class LivePerformanceService {
       revision: nextRevision,
       entryId: entry.id,
     }));
+    this.operationCounts.set(command.eventId, (this.operationCounts.get(command.eventId) ?? 0) + 1);
     const result = { status, entry: { ...entry }, revision: nextRevision, auditId };
     this.receipts.set(receiptKey, { hash, result });
     return result;
@@ -194,5 +188,14 @@ export class LivePerformanceService {
 
   audit(eventId: string) {
     return this.audits.filter((item) => item.eventId === eventId).map((item) => ({ ...item }));
+  }
+
+  purgeEvent(eventId: string) {
+    for (const [entryId, entry] of this.entries) if (entry.eventId === eventId) this.entries.delete(entryId);
+    for (const [receiptKey, receipt] of this.receipts) if (receipt.result.entry.eventId === eventId) this.receipts.delete(receiptKey);
+    this.revisions.delete(eventId);
+    this.operationCounts.delete(eventId);
+    this.performances = this.performances.filter((item) => item.eventId !== eventId);
+    this.audits = this.audits.filter((item) => item.eventId !== eventId);
   }
 }

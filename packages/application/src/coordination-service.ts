@@ -13,7 +13,7 @@ const id=(prefix:string,value:string)=>`${prefix}_${createHash("sha256").update(
 const allowedScopes=new Set(["free-busy:read","calendar-events:write","notifications:send"]);
 
 export class CoordinationService {
-  private arrangements=new Map<string,ArrangementVersion[]>(); private assignments=new Map<string,PerformanceAssignment>(); private polls=new Map<string,Poll>(); private sessions=new Map<string,Session>(); private connections=new Map<string,Connection>(); private deliveries=new Map<string,DeliveryRecord>(); private receipts=new Map<string,unknown>();
+  private arrangements=new Map<string,ArrangementVersion[]>(); private assignments=new Map<string,PerformanceAssignment>(); private polls=new Map<string,Poll>(); private sessions=new Map<string,Session>(); private connections=new Map<string,Connection>(); private deliveries=new Map<string,DeliveryRecord>();
   private provider:ProviderPort;
   constructor(options:{provider?:ProviderPort}={}){this.provider=options.provider??new MemoryProviderAdapter();}
   private authorize(command:Command){if(!command.communityId||!command.eventId||!command.actorId||!command.operationId||!command.roles.some(role=>role==="organizer"||role==="music-steward"||role==="performer"))throw new CoordinationError("denied");}

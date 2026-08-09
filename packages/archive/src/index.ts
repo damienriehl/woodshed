@@ -27,7 +27,6 @@ export class BoundedEncryptedArchiveBuffer {
   clear(){for(const chunk of this.chunks)chunk.fill(0);this.chunks.length=0;this.size=0}
 }
 const b64=(value:Buffer|ArrayBuffer)=>Buffer.from(value instanceof ArrayBuffer?new Uint8Array(value):value).toString("base64");
-const digest=(value:unknown)=>createHash("sha256").update(canonicalJson(value)).digest("hex");
 const recipientId=(key:KeyObject)=>createHash("sha256").update(key.export({type:"spki",format:"der"})).digest("hex").slice(0,24);
 const aad=(value:Pick<CommunityArchiveEnvelope,"envelopeVersion"|"profile"|"archiveId"|"sourceCommunityId"|"destinationCommunityId"|"createdAt"|"expiresAt"|"recipientKeyId">)=>Buffer.from(canonicalJson(value));
 function encrypted(key:Buffer,iv:Buffer,plaintext:Buffer,header:Buffer){const cipher=createCipheriv("aes-256-gcm",key,iv);cipher.setAAD(header);return{ciphertext:Buffer.concat([cipher.update(plaintext),cipher.final()]),tag:cipher.getAuthTag()}}

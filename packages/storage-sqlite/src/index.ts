@@ -1,24 +1,14 @@
-import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 import { ContractValidationError, parseCommandEnvelope, type CommandEnvelope } from "../../contracts/src/index.ts";
+import { sha256 } from "../../contracts/src/snapshot.ts";
 import { replaceBallot as replaceBallotDomain } from "../../domain/src/ballot.ts";
 import { KernelError, type BallotResult, type FailurePoint, type FirstLoopIds } from "../../conformance/src/adapter.ts";
 import { queryInvariants } from "../../conformance/src/invariants.ts";
 
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
-  return JSON.stringify(value);
-}
-
-function digest(value: unknown): string {
-  return createHash("sha256").update(stableJson(value)).digest("hex");
-}
 
 function migrationDirectory(): string {
   return fileURLToPath(new URL("../../../migrations/sqlite/", import.meta.url));
@@ -39,7 +29,7 @@ export class SqliteKernel {
     const directory = migrationDirectory();
     for (const name of readdirSync(directory).filter((entry) => entry.endsWith(".sql")).sort()) {
       const sql = readFileSync(path.join(directory, name), "utf8");
-      const checksum = digest(sql);
+      const checksum = sha256(sql);
       const existing = this.database.prepare("SELECT checksum FROM schema_migrations WHERE name = ?").get(name) as { checksum: string } | undefined;
       if (existing) {
         if (existing.checksum !== checksum) throw new Error(`migration checksum mismatch: ${name}`);
@@ -97,7 +87,7 @@ export class SqliteKernel {
     if (now.getTime() > Date.parse(envelope.expiresAt)) throw new KernelError("expired", "command expired");
     if (now.getTime() < Date.parse(envelope.issuedAt)) throw new KernelError("not-yet-valid", "command not yet valid");
     const payload = { envelope, rankings };
-    const payloadHash = digest(payload);
+    const payloadHash = sha256(payload);
     const receipt = this.database.prepare("SELECT payload_hash, result_json FROM idempotency_receipts WHERE community_id = ? AND operation_id = ?").get(envelope.communityId, envelope.operationId) as { payload_hash: string; result_json: string } | undefined;
     if (receipt) {
       if (receipt.payload_hash !== payloadHash) throw new KernelError("replay-mismatch", "operation ID payload mismatch");
@@ -113,7 +103,7 @@ export class SqliteKernel {
       `).get(envelope.actorId, scopedEventId, envelope.communityId, envelope.communityId);
       if (!scope) throw new KernelError("denied", "community or event scope denied");
 
-      const ballotId = `ballot_${digest(`${scopedEventId}:${envelope.actorId}`).slice(0, 24)}`;
+      const ballotId = `ballot_${sha256(`${scopedEventId}:${envelope.actorId}`).slice(0, 24)}`;
       this.database.prepare(`
         INSERT OR IGNORE INTO ballots(id, community_id, event_id, participation_id, current_revision, state)
         VALUES (?, ?, ?, ?, 0, 'open')
@@ -133,7 +123,7 @@ export class SqliteKernel {
       this.database.prepare("INSERT INTO ballot_versions(ballot_id, community_id, event_id, revision, operation_id, rankings_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(ballotId, envelope.communityId, scopedEventId, outcome.revision, envelope.operationId, JSON.stringify(outcome.rankings), now.toISOString());
       if (failurePoint === "after-state") throw new Error("injected failure after state");
 
-      const auditId = `audit_${digest(`${envelope.communityId}:${envelope.operationId}`).slice(0, 24)}`;
+      const auditId = `audit_${sha256(`${envelope.communityId}:${envelope.operationId}`).slice(0, 24)}`;
       this.database.prepare(`
         INSERT INTO audit_events(id, community_id, event_id, actor_id, capability, operation_id, aggregate_type, aggregate_id, aggregate_revision, occurred_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
