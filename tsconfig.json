@@ -15,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["packages/**/*.ts", "test/contracts/**/*.ts", "test/conformance/**/*.ts"]
+  "include": ["packages/**/*.ts", "test/contracts/**/*.ts", "test/conformance/**/*.ts", "test/snapshot/**/*.ts"]
 }

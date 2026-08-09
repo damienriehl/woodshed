@@ -161,3 +161,5 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
     operationId: string(item.operationId, "operationId"), expectedRevision: item.expectedRevision as number, issuedAt, expiresAt,
   };
 }
+
+export * from "./snapshot.ts";

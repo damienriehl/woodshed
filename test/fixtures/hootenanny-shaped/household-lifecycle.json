@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "profile": "hootenanny/v1",
+  "mode": "full",
+  "snapshotId": "snapshot_synthetic_households",
+  "sourceIdentity": "source_synthetic",
+  "destinationCommunityId": "community_synthetic",
+  "createdAt": "2030-01-01T00:00:00.000Z",
+  "expiresAt": "2030-01-02T00:00:00.000Z",
+  "startWatermark": "0001",
+  "endWatermark": "0001",
+  "records": [
+    { "type": "community", "sourceId": "community_1", "parentSourceId": null, "tombstone": false, "attributes": {} },
+    { "type": "household", "sourceId": "household_1", "parentSourceId": "community_1", "tombstone": false, "attributes": { "memberSourceIds": ["person_1", "person_2"] } },
+    { "type": "person", "sourceId": "person_1", "parentSourceId": "household_1", "tombstone": false, "attributes": {} },
+    { "type": "person", "sourceId": "person_2", "parentSourceId": "household_1", "tombstone": true, "attributes": {} },
+    { "type": "household", "sourceId": "household_2", "parentSourceId": "community_1", "tombstone": false, "attributes": { "splitFromSourceId": "household_1" } }
+  ],
+  "counts": { "community": 1, "household": 2, "person": 2 },
+  "recordHashes": {
+    "community_1": "e01033f5f8337ea4e4525cd3c348cf80562577fb1f864ecec1961f6a59d34887",
+    "household_1": "fbfd87f2f45f8a83acef3af618ee4bc7fba539b5c0001defc697520348e00d97",
+    "person_1": "9df28e3ddac783517d1c2664c49adc7b0cd0de88174ee4bb6f3051ea90c32263",
+    "person_2": "4f9380d62aa3fb6ee9d9fcd26a7193e3e0f3b38a5509a9dec49635210915a70c",
+    "household_2": "f1d785088dd806a5619e9de180dcae95a39e69a835fe87e30b8a1475a1a19806"
+  }
+}
