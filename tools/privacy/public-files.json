@@ -140,6 +140,7 @@
     "docs/install/self-hosted.md",
     "docs/operations/archive-portability.md",
     "docs/operations/recovery.md",
+    "docs/residual-review-findings/first-public-foundation.md",
     "packages/archive/package.json",
     "packages/archive/src/index.ts",
     "packages/archive/src/operations.ts",

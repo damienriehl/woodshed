@@ -24,9 +24,9 @@ The conformance invariant catalog provides executable checks for current-ballot 
 
 The D1 adapter is tested through Miniflare's programmatic `getD1Database` API, so the second runtime is a genuine local workerd/D1 binding rather than a SQLite-shaped mock. Miniflare is pinned exactly and the test pins compatibility date `2025-07-18`. Local and deployed D1 data are separate by design. Deployments inject the reviewed, one-statement-per-line SQL migration contents into the Worker-safe adapter; the adapter itself imports no Node runtime modules. D1 applies each migration and its checksum receipt in one batch. D1 batching and result metadata remain adapter details; callers receive only the canonical first-loop result and `KernelError` taxonomy.
 
-This proof covers participant ballot replacement only. It does not claim conformance for live authority coordination, assignments, rehearsal, archives, or an HTTP interface.
+The shared first-loop storage proof covers participant ballot replacement. Additional suites now exercise encrypted snapshots and archives, rehearsal coordination repositories, live authority and offline replay, and the Worker entrypoint. These remain separate contracts rather than an expanded ballot-kernel interface.
 
-Live authority epochs, archives, private migration payloads, assignments, rehearsals, and offline performance coordination remain outside this kernel and belong to later implementation units.
+Node/SQLite is the complete implemented application runtime. The Cloudflare adapter is deliberately experimental: it serves D1-backed discovery, ballot replacement, live commands, and Durable Object authority transitions, but it does not yet issue participant sessions or expose the Node runtime's proposal, draft-setlist, staffing, and rehearsal endpoints. Its asynchronous D1 coordination repository is conformance-tested but is not yet wired to an asynchronous rehearsal application service. These limitations block presenting Cloudflare as a complete deploy target.
 
 ## Operational design rules
 
