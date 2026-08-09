@@ -80,7 +80,7 @@ describe("cutover and shadow UAT", () => {
   it("compares synthetic shadow records and invariants without leaking values", () => {
     const pairs: ShadowPair[] = (["ballot", "event", "assignment", "live"] as const).map(capability => ({ capability, id: `${capability}-1`, legacy: { revision: 2, state: "active" }, woodshed: { revision: 2, state: "active" } }));
     assert.deepEqual(compareShadow(pairs, { invariants: [p => p.legacy.revision === p.woodshed.revision] }), { compared: 4, mismatches: [], invariantFailures: [] });
-    const mismatch = compareShadow([{ ...pairs[0], woodshed: { revision: 3, state: "active" } }], { invariants: [] });
+    const mismatch = compareShadow([{ ...pairs[0]!, woodshed: { revision: 3, state: "active" } }], { invariants: [] });
     assert.equal(mismatch.mismatches[0]?.idHash.length, 16);
     assert.equal(JSON.stringify(mismatch).includes("live-1"), false);
   });

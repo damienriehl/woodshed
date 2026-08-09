@@ -145,6 +145,7 @@
     "packages/graduation/src/index.ts",
     "test/uat/graduation.test.ts",
     "tools/validation/run-recommendation.mjs",
+    "tools/validation/run-recommendation.d.mts",
     "test/fixtures/synthetic/recommendation-validation.json"
   ]
 }

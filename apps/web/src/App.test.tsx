@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { render,screen,waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { userEvent } from "@testing-library/user-event";
 import { describe,expect,it } from "vitest";
 import { LiveWorkspace, RankedBallot, RehearsalWorkspace } from "./App.tsx";
 

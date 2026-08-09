@@ -10,10 +10,11 @@
     "noImplicitOverride": true,
     "verbatimModuleSyntax": true,
     "allowImportingTsExtensions": true,
+    "jsx": "react-jsx",
     "erasableSyntaxOnly": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["packages/**/*.ts", "apps/api-node/**/*.ts", "apps/api-worker/**/*.ts", "apps/operator/**/*.ts", "test/contracts/**/*.ts", "test/conformance/**/*.ts", "test/snapshot/**/*.ts", "test/e2e/**/*.ts"]
+  "include": ["packages/**/*.ts", "apps/api-node/**/*.ts", "apps/api-worker/**/*.ts", "apps/operator/**/*.ts", "apps/web/**/*.ts", "apps/web/**/*.tsx", "test/contracts/**/*.ts", "test/conformance/**/*.ts", "test/snapshot/**/*.ts", "test/e2e/**/*.ts", "test/uat/**/*.ts"]
 }
