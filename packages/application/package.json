@@ -1,0 +1,1 @@
+{"name":"@woodshed/application","version":"0.0.0","private":true,"type":"module","exports":{"./authorization":"./src/authorization.ts","./data-classification":"./src/data-classification.ts"}}

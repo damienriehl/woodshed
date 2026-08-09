@@ -8,13 +8,20 @@
   "engines": {
     "node": ">=24"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "build": "node tools/verify-foundation.mjs && node tools/privacy/check-manifest.mjs",
     "lint": "node --check tools/privacy/scanner.mjs && node --check tools/privacy/scan.mjs && node --check tools/privacy/check-manifest.mjs && node --check tools/release/verify.mjs",
-    "typecheck": "node --check tools/privacy/scanner.mjs && node --check tools/privacy/scan.mjs && node --check tools/privacy/check-manifest.mjs && node --check tools/release/verify.mjs",
-    "test": "node --test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node test/contracts/kernel.test.ts && node --test test/privacy/*.test.mjs",
     "privacy": "node tools/privacy/scan.mjs --worktree",
     "privacy:release": "node tools/privacy/check-manifest.mjs && node tools/privacy/scan.mjs --tracked --history --worktree",
     "verify:release": "node tools/release/verify.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
   }
 }

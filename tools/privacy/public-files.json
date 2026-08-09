@@ -10,7 +10,23 @@
     "SECURITY.md",
     "docs/architecture.md",
     "docs/privacy.md",
+    "migrations/sqlite/001_first_loop.sql",
+    "migrations/sqlite/002_consent_guard.sql",
     "package.json",
+    "package-lock.json",
+    "packages/application/package.json",
+    "packages/application/src/authorization.ts",
+    "packages/application/src/data-classification.ts",
+    "packages/conformance/package.json",
+    "packages/conformance/src/invariants.ts",
+    "packages/contracts/package.json",
+    "packages/contracts/src/index.ts",
+    "packages/domain/package.json",
+    "packages/domain/src/ballot.ts",
+    "packages/domain/src/proposal.ts",
+    "packages/storage-sqlite/package.json",
+    "packages/storage-sqlite/src/index.ts",
+    "test/contracts/kernel.test.ts",
     "test/fixtures/synthetic/community.json",
     "test/privacy/scan.test.mjs",
     "tools/privacy/check-manifest.mjs",
@@ -18,6 +34,7 @@
     "tools/privacy/scan.mjs",
     "tools/privacy/scanner.mjs",
     "tools/release/verify.mjs",
-    "tools/verify-foundation.mjs"
+    "tools/verify-foundation.mjs",
+    "tsconfig.json"
   ]
 }
