@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "status": "template",
+  "destination": "community-owned-cloud",
+  "requires": ["managed-sqlite-or-d1", "durable-coordinator", "secret-store", "encrypted-object-storage", "scheduled-backups"],
+  "defaults": { "privateContent": false, "backupCadenceHours": 24, "retentionDays": 30 },
+  "guidedInputs": ["community-name", "region", "recovery-contact"],
+  "productionReady": false
+}

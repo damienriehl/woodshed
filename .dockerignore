@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+**/node_modules
+**/.worktrees
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.bak
+*.zip
+*.tgz
+*.tar
+*.tar.gz
+*.env
+!.env.example

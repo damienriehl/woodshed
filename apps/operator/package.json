@@ -1,0 +1,1 @@
+{"name":"@woodshed/operator","private":true,"type":"module","bin":{"woodshed-operator":"./src/cli.ts"}}

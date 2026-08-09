@@ -10,7 +10,7 @@ const CONTENT_RULES = [
   ["postal-address", /\b\d{1,6}\s+[A-Za-z0-9.' -]{2,}\s(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b[^\n]*\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/i],
 ];
 
-const FORBIDDEN_ARTIFACT = /(?:^|\/)(?:.*(?:generated|dump|backup|archive).*\.sql|.*\.(?:sqlite3?|db|dump|bak)|.*(?:backup|archive).*\.(?:json|zip|tgz|tar(?:\.gz)?)|release\.(?:zip|tgz|tar(?:\.gz)?))$/i;
+const FORBIDDEN_ARTIFACT = /(?:^|\/)(?:[^/]*(?:generated|dump|backup|archive)[^/]*\.sql|[^/]*\.(?:sqlite3?|db|dump|bak)|[^/]*(?:backup|archive)[^/]*\.(?:json|zip|tgz|tar(?:\.gz)?)|release\.(?:zip|tgz|tar(?:\.gz)?))$/i;
 const SKIP_DIRECTORIES = new Set([".git", "node_modules"]);
 
 function normalized(file) {

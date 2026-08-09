@@ -1,0 +1,25 @@
+services:
+  woodshed:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    read_only: true
+    environment:
+      WOODSHED_DESTINATION: node-sqlite
+      WOODSHED_DB: /var/lib/woodshed/community.sqlite
+      WOODSHED_KEY_CUSTODY: file-mounted
+      PORT: 8787
+    volumes:
+      - woodshed-data:/var/lib/woodshed
+      - type: bind
+        source: ./secrets
+        target: /run/secrets
+        read_only: true
+    ports: ["127.0.0.1:8787:8787"]
+    healthcheck:
+      test: ["CMD", "node", "apps/operator/src/cli.ts", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  woodshed-data: {}

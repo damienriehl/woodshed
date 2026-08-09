@@ -1,4 +1,5 @@
 import type { ChoiceHttpPort } from "../../../packages/application/src/choice-port.ts";
+export { LiveCoordinator } from "./live-do.ts";
 
 export type WorkerBindings = { CHOICE_APPLICATION: ChoiceHttpPort };
 const BODYLESS_METHODS=new Set(["GET","HEAD"]);

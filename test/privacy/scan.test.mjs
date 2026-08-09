@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { runPrivacyScan } from "../../tools/privacy/scan.mjs";
 import { verifyManifest } from "../../tools/privacy/check-manifest.mjs";
-import { scanPaths } from "../../tools/privacy/scanner.mjs";
+import { scanBuffer, scanPaths } from "../../tools/privacy/scanner.mjs";
 
 async function fixture(files) {
   const root = await mkdtemp(path.join(os.tmpdir(), "woodshed-privacy-"));
@@ -118,4 +118,9 @@ test("public manifest fails closed on a file that was not reviewed", async () =>
   const result = await verifyManifest(root, ["reviewed.txt"]);
   assert.deepEqual(result.unexpected, ["surprise.txt"]);
   assert.deepEqual(result.missing, []);
+});
+
+test("does not confuse an archive source directory with an exported archive artifact", () => {
+  const result = scanBuffer("packages/archive/package.json", Buffer.from('{"name":"archive-contract"}'));
+  assert.deepEqual(result, []);
 });

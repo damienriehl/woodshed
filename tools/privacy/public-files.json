@@ -1,6 +1,7 @@
 {
   "files": [
     ".env.example",
+    ".dockerignore",
     ".github/workflows/ci.yml",
     ".github/workflows/privacy-gate.yml",
     ".gitignore",
@@ -111,6 +112,29 @@
     "packages/storage-sqlite/src/live-authority.ts",
     "apps/web/src/offline-db.ts",
     "apps/web/public/sw.js",
-    "apps/web/public/manifest.webmanifest"
+    "apps/web/public/manifest.webmanifest",
+    "apps/operator/package.json",
+    "apps/operator/src/cli.ts",
+    "apps/operator/src/index.ts",
+    "deploy/cloudflare/wrangler.jsonc",
+    "deploy/docker/Dockerfile",
+    "deploy/docker/compose.yaml",
+    "deploy/one-click/manifest.json",
+    "docs/extensions/contracts.md",
+    "docs/install/community-cloud.md",
+    "docs/install/self-hosted.md",
+    "docs/operations/archive-portability.md",
+    "docs/operations/recovery.md",
+    "packages/archive/package.json",
+    "packages/archive/src/index.ts",
+    "packages/archive/src/operations.ts",
+    "packages/extensions/package.json",
+    "packages/extensions/src/index.ts",
+    "packages/providers/src/registry.ts",
+    "test/conformance/deployment/archive.test.ts",
+    "test/conformance/deployment/operations.test.ts",
+    "apps/api-worker/src/live-do.ts",
+    "packages/archive/src/destinations.ts",
+    "test/conformance/deployment/destinations.test.ts"
   ]
 }

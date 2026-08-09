@@ -1,0 +1,14 @@
+export type MigrationStep={id:string;phase:"expand"|"backfill"|"compatibility"|"enforce"|"contract";checksum:string;destructive:boolean};
+export class MigrationLedger {
+  readonly applied=new Map<string,MigrationStep>();
+  private readonly versions:{minimumReadable:number;current:number};
+  constructor(versions:{minimumReadable:number;current:number}){this.versions=versions}
+  apply(step:MigrationStep){if(!/^[a-f0-9]{64}$/.test(step.checksum))throw new Error("migration checksum invalid");const prior=this.applied.get(step.id);if(prior){if(prior.checksum!==step.checksum)throw new Error("migration checksum mismatch");return}if(step.destructive||step.phase==="contract")throw new Error("destructive contract step blocked without compatibility retirement evidence");this.applied.set(step.id,{...step})}
+  dryRun(input:{binaryVersion:number;archiveVersion:number}){const issues:string[]=[];if(input.binaryVersion<this.versions.minimumReadable||input.binaryVersion>this.versions.current)issues.push("unsupported binary version");if(input.archiveVersion<this.versions.minimumReadable||input.archiveVersion>this.versions.current)issues.push("unsupported archive version");return{safe:issues.length===0,issues,steps:[...this.applied.values()]}}
+}
+export type BackupEvidence={lastBackupAt:string;lastRestoreDrillAt:string;rollbackEvidenceAt:string;offsite:boolean;encrypted:boolean;cleanDestinationVerified:boolean};
+export type RecoveryPolicy={maxBackupAgeMs:number;maxRestoreDrillAgeMs:number;requireOffsite:boolean};
+export const DESTINATION_RECOVERY={nodeSqlite:{rpoHours:24,rtoHours:4,cadence:"daily",retentionDays:30,keyCustody:"operator",offsite:true},cloudflare:{rpoHours:24,rtoHours:2,cadence:"daily",retentionDays:30,keyCustody:"platform secret store",offsite:true},oneClick:{rpoHours:24,rtoHours:4,cadence:"managed daily",retentionDays:30,keyCustody:"community cloud secret store",offsite:true}} as const;
+export function verifyBackupPolicy(e:BackupEvidence,p:RecoveryPolicy,now=new Date()){if(!e.encrypted)throw new Error("backup encryption missing");if(p.requireOffsite&&!e.offsite)throw new Error("offsite backup missing");if(now.getTime()-Date.parse(e.lastBackupAt)>p.maxBackupAgeMs)throw new Error("backup age gate failed");if(now.getTime()-Date.parse(e.lastRestoreDrillAt)>p.maxRestoreDrillAgeMs)throw new Error("restore drill age gate failed");if(!Number.isFinite(Date.parse(e.rollbackEvidenceAt)))throw new Error("rollback evidence missing");return true}
+export function verifyRestore(e:BackupEvidence){if(!e.cleanDestinationVerified)throw new Error("clean destination restore not verified");return true}
+export function evaluateHealth(e:BackupEvidence,p:RecoveryPolicy,now=new Date()){const checks:string[]=[];try{verifyBackupPolicy(e,p,now);verifyRestore(e)}catch(error){checks.push(error instanceof Error?error.message:"health failure")}return{status:checks.length?"degraded" as const:"healthy" as const,checks}}
