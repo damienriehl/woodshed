@@ -4,6 +4,7 @@
     ".dockerignore",
     ".github/workflows/ci.yml",
     ".github/workflows/privacy-gate.yml",
+    ".github/workflows/uat.yml",
     ".gitignore",
     "CONTRIBUTING.md",
     "LICENSE",
@@ -80,6 +81,10 @@
     "docs/visual-reference/participant-choice-desktop.png",
     "docs/visual-reference/participant-choice-mobile.png",
     "docs/validation/recommendation-baseline.md",
+    "docs/validation/cutover-uat.md",
+    "docs/migration/authority-graduation.md",
+    "docs/migration/cutover-artifact.schema.json",
+    "docs/operations/cutover.md",
     "migrations/d1/002_participant_choice.sql",
     "migrations/d1/003_rehearsal_coordination.sql",
     "migrations/d1/004_live_performance.sql",
@@ -135,6 +140,11 @@
     "test/conformance/deployment/operations.test.ts",
     "apps/api-worker/src/live-do.ts",
     "packages/archive/src/destinations.ts",
-    "test/conformance/deployment/destinations.test.ts"
+    "test/conformance/deployment/destinations.test.ts",
+    "packages/graduation/package.json",
+    "packages/graduation/src/index.ts",
+    "test/uat/graduation.test.ts",
+    "tools/validation/run-recommendation.mjs",
+    "test/fixtures/synthetic/recommendation-validation.json"
   ]
 }

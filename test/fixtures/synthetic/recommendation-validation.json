@@ -1,0 +1,16 @@
+{
+  "datasetKind": "synthetic",
+  "containsPrivateData": false,
+  "evidenceTime": "2026-01-01T00:00:00.000Z",
+  "version": "draft-setlist/v1",
+  "config": { "demand": 0.7, "feasibility": 0.3 },
+  "seed": "public-synthetic-seed-v1",
+  "input": [
+    { "id": "synthetic-song-1", "demand": 1, "feasibility": 0.8 },
+    { "id": "synthetic-song-2", "demand": 0.6, "feasibility": null }
+  ],
+  "organizerTrials": [
+    { "acceptedTopFive": true, "changedPositions": 1, "totalPositions": 5, "understoodFactors": true },
+    { "acceptedTopFive": true, "changedPositions": 0, "totalPositions": 5, "understoodFactors": true }
+  ]
+}
