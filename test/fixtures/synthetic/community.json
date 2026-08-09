@@ -1,0 +1,16 @@
+{
+  "communityId": "community_example_01",
+  "name": "Lantern Song Circle",
+  "organizer": {
+    "personId": "person_example_01",
+    "name": "Avery Example",
+    "email": "person@example.com"
+  },
+  "events": [
+    {
+      "eventId": "event_example_01",
+      "name": "Autumn Community Sing",
+      "visibility": "public"
+    }
+  ]
+}

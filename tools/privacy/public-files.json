@@ -1,0 +1,23 @@
+{
+  "files": [
+    ".env.example",
+    ".github/workflows/ci.yml",
+    ".github/workflows/privacy-gate.yml",
+    ".gitignore",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "docs/architecture.md",
+    "docs/privacy.md",
+    "package.json",
+    "test/fixtures/synthetic/community.json",
+    "test/privacy/scan.test.mjs",
+    "tools/privacy/check-manifest.mjs",
+    "tools/privacy/public-files.json",
+    "tools/privacy/scan.mjs",
+    "tools/privacy/scanner.mjs",
+    "tools/release/verify.mjs",
+    "tools/verify-foundation.mjs"
+  ]
+}
