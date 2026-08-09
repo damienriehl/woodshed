@@ -8,6 +8,10 @@ services:
       WOODSHED_DESTINATION: node-sqlite
       WOODSHED_DB: /var/lib/woodshed/community.sqlite
       WOODSHED_KEY_CUSTODY: file-mounted
+      WOODSHED_KEY_PATH: /run/secrets/archive.key
+      WOODSHED_BACKUP_EVIDENCE: /var/lib/woodshed/backup-evidence.json
+      WOODSHED_HEALTH_URL: http://127.0.0.1:8787/api/discovery
+      WOODSHED_VERSION: "1"
       PORT: 8787
     volumes:
       - woodshed-data:/var/lib/woodshed

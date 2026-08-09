@@ -19,6 +19,17 @@ export class MemoryDownloadAuthorizer implements DownloadAuthorizationPort {
   sign(value:string){return createHmac("sha256",this.key).update(value).digest("hex")}
   verify(value:string,signature:string){const expected=this.sign(value),left=Buffer.from(expected),right=Buffer.from(signature);return left.length===right.length&&timingSafeEqual(left,right)}
 }
+export interface ArchiveExportAuthorizationPort {
+  canExport(input:{communityId:string;actorId:string}):boolean;
+}
+export class DenyArchiveExportAuthorizer implements ArchiveExportAuthorizationPort {
+  canExport(){return false}
+}
+export class MemoryArchiveExportAuthorizer implements ArchiveExportAuthorizationPort {
+  private readonly grants:Set<string>;
+  constructor(grants:readonly {communityId:string;actorId:string}[]=[]){this.grants=new Set(grants.map(grant=>canonicalJson(grant)))}
+  canExport(input:{communityId:string;actorId:string}){return this.grants.has(canonicalJson(input))}
+}
 export class BoundedEncryptedArchiveBuffer {
   private readonly chunks:Buffer[]=[]; private size=0;
   private readonly maxBytes:number;
@@ -85,8 +96,9 @@ export class ArchiveCoordinator {
   private readonly repo:InMemoryArchiveRepository;
   private readonly limits:{maxActivePerCommunity:number;maxArchiveBytes:number;downloadTtlMs:number};
   private readonly authorizer:DownloadAuthorizationPort;
-  constructor(repo:InMemoryArchiveRepository,limits:{maxActivePerCommunity:number;maxArchiveBytes:number;downloadTtlMs:number}={maxActivePerCommunity:2,maxArchiveBytes:32*1024*1024,downloadTtlMs:5*60_000},authorizer:DownloadAuthorizationPort=new MemoryDownloadAuthorizer()){this.repo=repo;this.limits=limits;this.authorizer=authorizer}
-  request(input:{communityId:string;actorId:string;capability:string;now:Date}){if(input.capability!=="archive:export")throw new Error("archive request denied");const active=[...this.repo.requests.values()].filter(r=>r.communityId===input.communityId&&(r.state==="requested"||r.state==="prepared"));if(active.length>=this.limits.maxActivePerCommunity)throw new Error("archive quota exceeded");const id=`archive_request_${randomBytes(12).toString("hex")}`,request:Request={id,communityId:input.communityId,actorId:input.actorId,state:"requested",createdAt:input.now.toISOString()};this.repo.requests.set(id,request);this.audit(request,"requested",input.actorId,input.now);return structuredClone(request)}
+  private readonly exportAuthorization:ArchiveExportAuthorizationPort;
+  constructor(repo:InMemoryArchiveRepository,limits:{maxActivePerCommunity:number;maxArchiveBytes:number;downloadTtlMs:number}={maxActivePerCommunity:2,maxArchiveBytes:32*1024*1024,downloadTtlMs:5*60_000},authorizer:DownloadAuthorizationPort=new MemoryDownloadAuthorizer(),exportAuthorization:ArchiveExportAuthorizationPort=new DenyArchiveExportAuthorizer()){this.repo=repo;this.limits=limits;this.authorizer=authorizer;this.exportAuthorization=exportAuthorization}
+  request(input:{communityId:string;actorId:string;now:Date}){if(!this.exportAuthorization.canExport({communityId:input.communityId,actorId:input.actorId}))throw new Error("archive request denied");const active=[...this.repo.requests.values()].filter(r=>r.communityId===input.communityId&&(r.state==="requested"||r.state==="prepared"));if(active.length>=this.limits.maxActivePerCommunity)throw new Error("archive quota exceeded");const id=`archive_request_${randomBytes(12).toString("hex")}`,request:Request={id,communityId:input.communityId,actorId:input.actorId,state:"requested",createdAt:input.now.toISOString()};this.repo.requests.set(id,request);this.audit(request,"requested",input.actorId,input.now);return structuredClone(request)}
   prepare(id:string,envelope:CommunityArchiveEnvelope,now:Date){const request=this.required(id);if(request.state!=="requested")throw new Error("archive is not requested");if(envelope.envelopeVersion!==1||envelope.profile!==COMMUNITY_ARCHIVE_PROFILE||envelope.schemaVersion!==SUPPORTED_SCHEMA)throw new Error("unsupported archive envelope");if(envelope.sourceCommunityId!==request.communityId)throw new Error("archive source community mismatch");const createdAt=Date.parse(envelope.createdAt),expiresAt=Date.parse(envelope.expiresAt);if(!Number.isFinite(createdAt)||!Number.isFinite(expiresAt)||createdAt>now.getTime()||expiresAt<=now.getTime()||expiresAt<=createdAt||expiresAt-createdAt>MAX_ARCHIVE_LIFETIME_MS)throw new Error("archive lifecycle metadata invalid");if(!envelope.archiveId||!envelope.destinationCommunityId||!envelope.recipientKeyId)throw new Error("archive identity metadata invalid");if(Buffer.byteLength(canonicalJson(envelope))>this.limits.maxArchiveBytes)throw new Error("archive size quota exceeded");request.state="prepared";request.envelope=envelope;request.expiresAt=envelope.expiresAt;this.audit(request,"prepared",request.actorId,now);return structuredClone(request)}
   authorizeDownload(id:string,actorId:string,now:Date){const request=this.required(id);if(request.state!=="prepared"||request.actorId!==actorId)throw new Error("archive download denied");const expiresAt=Math.min(Date.parse(request.expiresAt!),now.getTime()+this.limits.downloadTtlMs),body={requestId:id,actorId,expiresAt};return{...body,signature:this.authorizer.sign(canonicalJson(body))} }
   download(auth:{requestId:string;actorId:string;expiresAt:number;signature:string},now:Date){const body={requestId:auth.requestId,actorId:auth.actorId,expiresAt:auth.expiresAt};if(!this.authorizer.verify(canonicalJson(body),auth.signature)||now.getTime()>=auth.expiresAt)throw new Error("download authorization expired or invalid");const request=this.required(auth.requestId);if(request.state==="revoked")throw new Error("archive revoked");if(request.state!=="prepared")throw new Error("archive unavailable");request.state="downloaded";this.audit(request,"downloaded",auth.actorId,now);return structuredClone(request)}

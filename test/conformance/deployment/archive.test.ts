@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { generateKeyPairSync } from "node:crypto";
 import {
-  ArchiveCoordinator, BoundedEncryptedArchiveBuffer, InMemoryArchiveRepository, MemoryKeyCustody,
+  ArchiveCoordinator, BoundedEncryptedArchiveBuffer, InMemoryArchiveRepository, MemoryArchiveExportAuthorizer, MemoryKeyCustody,
   canonicalManifest, createCommunityArchive, openCommunityArchive,
   validateArchiveEntryName, type CommunityArchive,
 } from "../../../packages/archive/src/index.ts";
@@ -24,29 +24,31 @@ function archive(destinationCommunityId="community_destination",sourceCommunityI
   }, { recipientPublicKey:keys.publicKey, keyCustody:new MemoryKeyCustody(), now });
 }
 
+const exportAuthorization=()=>new MemoryArchiveExportAuthorizer([{communityId:"community_source",actorId:"admin_one"}]);
+
 test("request lifecycle is audited, quota bounded, signed, revocable, and expires cryptographically", async () => {
   const repo = new InMemoryArchiveRepository();
-  const coordinator = new ArchiveCoordinator(repo, { maxActivePerCommunity:1, maxArchiveBytes:200_000, downloadTtlMs:60_000 });
-  const request = coordinator.request({ communityId:"community_source", actorId:"admin_one", capability:"archive:export", now });
+  const coordinator = new ArchiveCoordinator(repo, { maxActivePerCommunity:1, maxArchiveBytes:200_000, downloadTtlMs:60_000 },undefined,exportAuthorization());
+  const request = coordinator.request({ communityId:"community_source", actorId:"admin_one", now });
   assert.equal(request.state,"requested");
   const prepared = coordinator.prepare(request.id, archive(), now);
   assert.equal(prepared.state,"prepared");
-  assert.throws(()=>coordinator.request({ communityId:"community_source", actorId:"admin_two", capability:"archive:export", now }),/quota/i);
+  assert.throws(()=>coordinator.request({ communityId:"community_source", actorId:"admin_two", now }),/denied/i);
   const authorization = coordinator.authorizeDownload(request.id,"admin_one",now);
   assert.equal(coordinator.download(authorization,now).state,"downloaded");
   assert.throws(()=>coordinator.download(authorization,now),/unavailable/i);
   coordinator.revoke(request.id,"admin_one",now);
   assert.throws(()=>coordinator.download(authorization,now),/revoked/i);
   assert.equal(repo.audit.length >= 4,true);
-  const expiring=coordinator.request({communityId:"community_source",actorId:"admin_one",capability:"archive:export",now});
+  const expiring=coordinator.request({communityId:"community_source",actorId:"admin_one",now});
   coordinator.prepare(expiring.id,archive(),now);coordinator.expire(new Date("2026-08-09T14:00:00Z"));
   assert.equal(repo.requests.get(expiring.id)?.state,"expired");
   assert.throws(()=>openCommunityArchive(archive(),{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:"community_destination",now:new Date("2026-08-09T14:00:00Z")}),/expired/i);
 });
 
 test("archive preparation and revocation remain scoped to the requesting community and actor",()=>{
-  const repo=new InMemoryArchiveRepository();const coordinator=new ArchiveCoordinator(repo);
-  const request=coordinator.request({communityId:"community_source",actorId:"admin_one",capability:"archive:export",now});
+  const repo=new InMemoryArchiveRepository();const coordinator=new ArchiveCoordinator(repo,undefined,undefined,exportAuthorization());
+  const request=coordinator.request({communityId:"community_source",actorId:"admin_one",now});
   assert.throws(()=>coordinator.prepare(request.id,archive("community_destination","community_other"),now),/community/i);
   coordinator.prepare(request.id,archive(),now);
   assert.throws(()=>coordinator.revoke(request.id,"admin_other",now),/denied/i);
@@ -71,7 +73,18 @@ test("archive preparation rejects malformed, future, expired, and overlong lifec
     {...archive(),expiresAt:"2026-08-09T11:59:00Z"},
     {...archive(),expiresAt:"2026-09-09T13:00:00Z"},
   ];
-  for(const envelope of cases){const coordinator=new ArchiveCoordinator(new InMemoryArchiveRepository());const request=coordinator.request({communityId:"community_source",actorId:"admin_one",capability:"archive:export",now});assert.throws(()=>coordinator.prepare(request.id,envelope,now),/lifecycle/i)}
+  for(const envelope of cases){const coordinator=new ArchiveCoordinator(new InMemoryArchiveRepository(),undefined,undefined,exportAuthorization());const request=coordinator.request({communityId:"community_source",actorId:"admin_one",now});assert.throws(()=>coordinator.prepare(request.id,envelope,now),/lifecycle/i)}
+});
+
+test("archive export authorization is server-owned, scoped, and deny-by-default",()=>{
+  const denied=new ArchiveCoordinator(new InMemoryArchiveRepository());
+  assert.throws(()=>denied.request({communityId:"community_source",actorId:"admin_one",now}),/denied/i);
+  const forged={communityId:"community_source",actorId:"admin_one",capability:"archive:export",now};
+  assert.throws(()=>denied.request(forged),/denied/i);
+  const authorized=new ArchiveCoordinator(new InMemoryArchiveRepository(),undefined,undefined,exportAuthorization());
+  assert.throws(()=>authorized.request({communityId:"community_other",actorId:"admin_one",now}),/denied/i);
+  assert.throws(()=>authorized.request({communityId:"community_source",actorId:"admin_two",now}),/denied/i);
+  assert.equal(authorized.request({communityId:"community_source",actorId:"admin_one",now}).state,"requested");
 });
 
 test("dry run defaults to new community and reports conflicts without state changes", () => {
