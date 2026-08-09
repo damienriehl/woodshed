@@ -20,4 +20,5 @@ jobs:
           node-version: 24
       - run: npm ci --ignore-scripts
       - run: npm run test:uat
+      - run: npm run build
       - run: npm run privacy:release
