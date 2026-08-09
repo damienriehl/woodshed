@@ -22,7 +22,7 @@ CREATE TABLE performance_assignments (
   FOREIGN KEY(decision_id,decision_revision) REFERENCES event_song_decision_versions(id,revision)
 ) STRICT;
 CREATE TABLE rehearsal_polls (id TEXT PRIMARY KEY,community_id TEXT NOT NULL REFERENCES communities(id),event_id TEXT NOT NULL REFERENCES events(id),revision INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('open','closed')),time_zone TEXT NOT NULL,slots_json TEXT NOT NULL CHECK(json_valid(slots_json))) STRICT;
-CREATE TABLE provider_connections (id TEXT PRIMARY KEY,community_id TEXT NOT NULL REFERENCES communities(id),kind TEXT NOT NULL,scopes_json TEXT NOT NULL CHECK(json_valid(scopes_json)),retention TEXT NOT NULL,revision INTEGER NOT NULL,revoked_at TEXT) STRICT;
+CREATE TABLE provider_connections (id TEXT PRIMARY KEY,community_id TEXT NOT NULL REFERENCES communities(id),event_id TEXT NOT NULL REFERENCES events(id),owner_id TEXT NOT NULL,kind TEXT NOT NULL,scopes_json TEXT NOT NULL CHECK(json_valid(scopes_json)),retention TEXT NOT NULL,revision INTEGER NOT NULL,revoked_at TEXT) STRICT;
 CREATE TABLE provider_delivery_records (id TEXT PRIMARY KEY,connection_id TEXT NOT NULL REFERENCES provider_connections(id),request_hash TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','sent','revoked')),attempts INTEGER NOT NULL) STRICT;
 CREATE TRIGGER event_song_decision_versions_immutable_update BEFORE UPDATE ON event_song_decision_versions BEGIN SELECT RAISE(ABORT,'decision-version-immutable'); END;
 CREATE TRIGGER event_song_decision_versions_immutable_delete BEFORE DELETE ON event_song_decision_versions BEGIN SELECT RAISE(ABORT,'decision-version-immutable'); END;

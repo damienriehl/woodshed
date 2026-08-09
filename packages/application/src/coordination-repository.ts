@@ -22,6 +22,13 @@ export interface CoordinationRepository {
   commit(snapshot: CoordinationSnapshot, mutation: CoordinationMutation): void;
 }
 
+/** Persistence port for runtimes, such as Workers D1, whose database API is asynchronous. */
+export interface AsyncCoordinationRepository {
+  load(): Promise<CoordinationSnapshot>;
+  receipt(scope: string, operationId: string): Promise<CoordinationReceipt | undefined>;
+  commit(snapshot: CoordinationSnapshot, mutation: CoordinationMutation): Promise<void>;
+}
+
 export const emptyCoordinationSnapshot = (): CoordinationSnapshot => ({ storageRevision:0, arrangements:{}, assignments:{}, polls:{}, sessions:{}, connections:{}, deliveries:{} });
 export const coordinationPayloadHash = (value: unknown) => sha256(value);
 

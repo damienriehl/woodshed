@@ -116,6 +116,13 @@ test("provider grants are scoped and revocable; callbacks and sends are idempote
   assert.throws(()=>service.receiveProviderCallback("calendar_1","callback_2",{}),CoordinationError);
 });
 
+test("provider connection identifiers cannot be claimed by another tenant or owner",()=>{
+  const service=new CoordinationService();
+  service.connectProvider(command("connect-shared",0),{connectionId:"shared_connection",kind:"calendar",scopes:["free-busy:read"],retention:"delete-on-disconnect"});
+  assert.throws(()=>service.connectProvider({communityId:"community_other",eventId:"event_other",actorId:"organizer_2",roles:["organizer"],operationId:"claim-shared",expectedRevision:0},{connectionId:"shared_connection",kind:"notification",scopes:["notifications:send"],retention:"delete-on-disconnect"}),/conflict/);
+  assert.throws(()=>service.connectProvider({...command("owner-shared",0),actorId:"organizer_2"},{connectionId:"shared_connection",kind:"notification",scopes:["notifications:send"],retention:"delete-on-disconnect"}),/conflict/);
+});
+
 test("provider disconnect only marks local revocation after remote revocation succeeds",async()=>{
   const provider:ProviderPort={send:async()=>{},revoke:async()=>{throw new Error("offline");}};
   const service=new CoordinationService({provider});

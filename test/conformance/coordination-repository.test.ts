@@ -26,6 +26,21 @@ test("SQLite coordination state and scoped receipts survive restart",()=>{
   secondDb.close();
 });
 
+test("SQLite provider callback deduplication survives restart atomically",()=>{
+  const filename=path.join(mkdtempSync(path.join(tmpdir(),"woodshed-callback-")),"db.sqlite");
+  const firstDb=new DatabaseSync(filename);firstDb.exec(readFileSync(new URL("../../migrations/sqlite/006_coordination_repository.sql",import.meta.url),"utf8"));
+  const first=new CoordinationService({repository:new SqliteCoordinationRepository(firstDb)});
+  first.connectProvider(command("connect-provider"),{connectionId:"calendar_restart",kind:"calendar",scopes:["free-busy:read"],retention:"delete-on-disconnect"});
+  assert.equal(first.receiveProviderCallback("calendar_restart","callback_restart",{busy:["opaque"]}),"accepted");
+  firstDb.close();
+  const secondDb=new DatabaseSync(filename);const second=new CoordinationService({repository:new SqliteCoordinationRepository(secondDb)});
+  assert.equal(second.receiveProviderCallback("calendar_restart","callback_restart",{busy:["opaque"]}),"duplicate");
+  assert.throws(()=>second.receiveProviderCallback("calendar_restart","callback_restart",{busy:["changed"]}),/replay-mismatch/);
+  assert.equal((secondDb.prepare("SELECT count(*) count FROM coordination_receipts WHERE operation_id='callback_restart'").get() as {count:number}).count,1);
+  assert.equal((secondDb.prepare("SELECT count(*) count FROM coordination_audit_events WHERE capability='provider:callback'").get() as {count:number}).count,1);
+  secondDb.close();
+});
+
 test("SQLite coordination repository rejects stale snapshot writers without partial audit or receipt",()=>{
   const db=new DatabaseSync(":memory:");db.exec(readFileSync(new URL("../../migrations/sqlite/006_coordination_repository.sql",import.meta.url),"utf8"));const first=new SqliteCoordinationRepository(db),second=new SqliteCoordinationRepository(db);const stale=second.load(),fresh=first.load();const mutation=(operationId:string):CoordinationMutation=>({scope:"community:event:actor",operationId,payloadHash:operationId,actorId:"actor",communityId:"community",eventId:"event",capability:"poll:create",result:{operationId}});first.commit(fresh,mutation("first"));assert.throws(()=>second.commit(stale,mutation("stale")),/storage conflict/);assert.equal((db.prepare("SELECT count(*) count FROM coordination_audit_events").get() as {count:number}).count,1);assert.equal((db.prepare("SELECT count(*) count FROM coordination_receipts").get() as {count:number}).count,1);db.close();
 });

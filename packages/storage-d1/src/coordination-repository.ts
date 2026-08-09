@@ -1,7 +1,7 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { emptyCoordinationSnapshot, type CoordinationMutation, type CoordinationSnapshot } from "../../application/src/coordination-repository.ts";
+import { emptyCoordinationSnapshot, type AsyncCoordinationRepository, type CoordinationMutation, type CoordinationSnapshot } from "../../application/src/coordination-repository.ts";
 
-export class D1CoordinationRepository {
+export class D1CoordinationRepository implements AsyncCoordinationRepository {
   private readonly database:D1Database;
   constructor(database:D1Database){this.database=database;}
   async load(){const row=await this.database.prepare("SELECT revision,snapshot_json FROM coordination_state WHERE singleton=1").first<{revision:number;snapshot_json:string}>();return row?{...(JSON.parse(row.snapshot_json) as CoordinationSnapshot),storageRevision:row.revision}:emptyCoordinationSnapshot();}
