@@ -37,6 +37,12 @@ test("encrypted snapshot imports atomically and duplicate is idempotent", async 
   assert.equal(store.active(destination)?.records.length, 4);
 });
 
+test("encrypted snapshot validates recipient identity and bounded base64 input",()=>{
+  const envelope=createEnvelope(snapshot(),{recipientPublicKey:keys.publicKey,destinationCommunityId:destination,now});
+  assert.throws(()=>openEnvelope({...envelope,recipientKeyId:"wrong"},{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:destination,now}),/recipient key/i);
+  assert.throws(()=>openEnvelope({...envelope,ciphertext:"not base64!"},{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:destination,now}),/ciphertext/i);
+});
+
 test("rejects tamper, wrong recipient/destination, expiry and truncation", () => {
   const envelope = createEnvelope(snapshot(), { recipientPublicKey: keys.publicKey, destinationCommunityId: destination, now });
   const bad = structuredClone(envelope); bad.ciphertext = Buffer.from(randomBytes(8)).toString("base64");
@@ -98,4 +104,11 @@ test("expired staging and key material purge is re-entrant", () => {
 test("checked-in household lifecycle fixture satisfies the neutral contract", async () => {
   const fixture = JSON.parse(await readFile(new URL("../fixtures/hootenanny-shaped/household-lifecycle.json", import.meta.url), "utf8"));
   assert.equal(parseNeutralSnapshot(fixture).records.length, 5);
+});
+
+test("snapshot attributes have bounded depth and scalar size",()=>{
+  const deep=snapshot();let value:Record<string,unknown>={};deep.records[0]!.attributes=value;for(let i=0;i<66;i++){const next:Record<string,unknown>={};value.next=next;value=next}deep.recordHashes=Object.fromEntries(deep.records.map(record=>[record.sourceId,sha256(record)]));
+  assert.throws(()=>parseNeutralSnapshot(deep),/depth/i);
+  const wide=snapshot();wide.records[0]!.attributes={value:"x".repeat(1024*1024+1)} as typeof wide.records[0]["attributes"];wide.recordHashes=Object.fromEntries(wide.records.map(record=>[record.sourceId,sha256(record)]));
+  assert.throws(()=>parseNeutralSnapshot(wide),/string size/i);
 });

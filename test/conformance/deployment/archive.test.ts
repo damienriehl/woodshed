@@ -61,6 +61,17 @@ test("encrypted archive rejects wrong destination/key, tamper and truncation", (
   assert.throws(()=>openCommunityArchive(value,{recipientPrivateKey:other.privateKey,expectedDestinationCommunityId:"community_destination",now}));
   assert.throws(()=>openCommunityArchive({...value,ciphertext:value.ciphertext.slice(0,-8)},{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:"community_destination",now}));
   assert.throws(()=>openCommunityArchive({...value,payloadTag:"A".repeat(value.payloadTag.length)},{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:"community_destination",now}));
+  assert.throws(()=>openCommunityArchive({...value,recipientKeyId:"wrong"},{recipientPrivateKey:keys.privateKey,expectedDestinationCommunityId:"community_destination",now}),/recipient key/i);
+});
+
+test("archive preparation rejects malformed, future, expired, and overlong lifecycle metadata",()=>{
+  const cases=[
+    {...archive(),createdAt:"not-a-date"},
+    {...archive(),createdAt:"2026-08-09T12:01:00Z"},
+    {...archive(),expiresAt:"2026-08-09T11:59:00Z"},
+    {...archive(),expiresAt:"2026-09-09T13:00:00Z"},
+  ];
+  for(const envelope of cases){const coordinator=new ArchiveCoordinator(new InMemoryArchiveRepository());const request=coordinator.request({communityId:"community_source",actorId:"admin_one",capability:"archive:export",now});assert.throws(()=>coordinator.prepare(request.id,envelope,now),/lifecycle/i)}
 });
 
 test("dry run defaults to new community and reports conflicts without state changes", () => {

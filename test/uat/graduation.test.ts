@@ -51,6 +51,13 @@ describe("per-capability authority graduation", () => {
     registry.transition("ballot","conformance-verified",{conformanceId:"proof-6"});
     assert.equal(registry.get("ballot").state,"conformance-verified");
   });
+  it("binds cutover to the exact refresh watermark that passed conformance",()=>{
+    const registry=new AuthorityRegistry();
+    registry.transition("live","shadow-imported",{refreshWatermark:8});
+    registry.transition("live","conformance-verified",{conformanceId:"proof-8"});
+    assert.throws(()=>registry.transition("live","Woodshed-authoritative",{cutoverWatermark:9,commandsDrained:true,legacyWriterFrozen:true,exactlyOneWriter:true}),/exact conformed watermark/i);
+    registry.transition("live","Woodshed-authoritative",{cutoverWatermark:8,commandsDrained:true,legacyWriterFrozen:true,exactlyOneWriter:true});
+  });
   it("requires safe rollback evidence once Woodshed accepts writes", () => {
     const registry = new AuthorityRegistry();
     registry.transition("assignment", "shadow-imported", { refreshWatermark: 1 });
@@ -70,6 +77,10 @@ describe("cutover and shadow UAT", () => {
     assert.match(evaluateCutover(completeArtifact({ deploy: { ...completeArtifact().deploy, order: ["reader", "writer"] } })).failures.join(" "), /deploy order/);
     assert.match(evaluateCutover(completeArtifact({ approvals: { ...completeArtifact().approvals, exactlyOneWriter: false } })).failures.join(" "), /exactly one writer/);
     assert.match(evaluateCutover({ ...completeArtifact(), unexpected: true } as CutoverArtifact).failures.join(" "), /unknown fields/);
+    assert.match(evaluateCutover(undefined).failures.join(" "), /invalid/);
+    assert.match(evaluateCutover({ artifactVersion:2 }).failures.join(" "), /version/);
+    assert.match(evaluateCutover({ ...completeArtifact(), capability:"unknown" }).failures.join(" "), /capability/);
+    assert.match(evaluateCutover({ ...completeArtifact(), rollback:{} }).failures.join(" "), /malformed/);
     assert.match(evaluateCutover(completeArtifact({ deploy: { ...completeArtifact().deploy, immutableOriginVerified: false } })).failures.join(" "), /immutable-origin-before-alias/);
     assert.equal(evaluateCutover(completeArtifact()).readyForLegacyRetirement, false);
     const retired = completeArtifact({ approvals: { ...completeArtifact().approvals, legacyRetirementApproved: true } });

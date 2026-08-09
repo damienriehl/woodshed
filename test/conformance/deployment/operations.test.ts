@@ -26,6 +26,14 @@ test("health gates stale backups, restore drills and missing rollback evidence",
   assert.throws(()=>verifyRestore({...evidence,cleanDestinationVerified:false}),/clean destination/i);
 });
 
+test("health rejects malformed and future recovery timestamps",()=>{
+  const now=new Date("2026-08-09T12:00:00Z"),policy={maxBackupAgeMs:7_200_000,maxRestoreDrillAgeMs:14*86_400_000,requireOffsite:true};
+  const evidence={lastBackupAt:"2026-08-09T11:00:00Z",lastRestoreDrillAt:"2026-08-01T12:00:00Z",rollbackEvidenceAt:"2026-08-08T12:00:00Z",offsite:true,encrypted:true,cleanDestinationVerified:true};
+  assert.throws(()=>verifyBackupPolicy({...evidence,lastBackupAt:"not-a-date"},policy,now),/timestamp invalid/);
+  assert.throws(()=>verifyBackupPolicy({...evidence,lastRestoreDrillAt:"2026-08-10T12:00:00Z"},policy,now),/timestamp invalid/);
+  assert.throws(()=>verifyBackupPolicy({...evidence,rollbackEvidenceAt:"2026-08-10T12:00:00Z"},policy,now),/rollback evidence invalid/);
+});
+
 test("extensions cannot bypass authorization, rights or privacy and private content defaults off", async () => {
   const host=new ExtensionHost();
   assert.equal(host.privateContentEnabled,false);

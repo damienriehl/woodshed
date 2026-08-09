@@ -92,6 +92,10 @@ export function registerFirstLoopStorageConformance(name: string, createHarness:
       await rejectsCode(() => kernel.replaceBallot(firstLoopCommand(), [IDS.songA], new Date("2030-01-01T12:10:00.457Z")), "expired");
       await rejectsCode(() => kernel.replaceBallot(firstLoopCommand(), [IDS.songA], new Date("2030-01-01T11:59:59.999Z")), "not-yet-valid");
       await rejectsCode(() => kernel.replaceBallot(firstLoopCommand(), [IDS.songC, IDS.songC], now), "invalid-ballot");
+      await rejectsCode(
+        () => kernel.replaceBallot(firstLoopCommand({ operationId: "operation_demo_ineligible" }), [IDS.songC], now),
+        "invalid-ballot",
+      );
       await kernel.replaceBallot(firstLoopCommand(), [IDS.songA], now);
       await rejectsCode(() => kernel.replaceBallot(firstLoopCommand(), [IDS.songB], now), "replay-mismatch");
       await rejectsCode(() => kernel.replaceBallot(firstLoopCommand({ operationId: "operation_demo_stale" }), [IDS.songB], now), "conflict");

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CoordinationError, CoordinationService } from "../../../packages/application/src/coordination-service.ts";
-import { MemoryProviderAdapter } from "../../../packages/providers/src/index.ts";
+import { MemoryProviderAdapter, type ProviderPort } from "../../../packages/providers/src/index.ts";
 
 const command = (operationId:string, expectedRevision:number) => ({
   communityId:"community_demo", eventId:"event_public", actorId:"organizer_1",
@@ -66,12 +66,19 @@ test("rehearsal poll uses instant-based DST-safe slots, required weighting, clos
   ],requiredPersonIds:["performer_a"]});
   service.respondToPoll(command("p1",poll.revision),{pollId:poll.id,personId:"performer_a",responses:{before:"available",after:"unavailable"}});
   service.respondToPoll(command("p2",2),{pollId:poll.id,personId:"performer_b",responses:{before:"if-needed",after:"available"}});
-  assert.equal(service.rankPoll(poll.id)[0]?.slotId,"before");
+  assert.equal(service.rankPoll(command("rank-1",0),poll.id)[0]?.slotId,"before");
   service.closePoll(command("close",3),poll.id);
   assert.throws(()=>service.respondToPoll(command("late",4),{pollId:poll.id,personId:"performer_a",responses:{after:"available"}}),/poll-closed/);
   service.reopenPoll(command("reopen",4),poll.id);
   service.respondToPoll(command("edit",5),{pollId:poll.id,personId:"performer_a",responses:{before:"unavailable",after:"available"}});
-  assert.equal(service.rankPoll(poll.id)[0]?.slotId,"after");
+  assert.equal(service.rankPoll(command("rank-2",0),poll.id)[0]?.slotId,"after");
+});
+
+test("poll reads and response values are scoped and validated",()=>{
+  const service=new CoordinationService();
+  const poll=service.createPoll(command("poll-scope",0),{timeZone:"UTC",slots:[{id:"one",startsAt:"2026-08-20T18:00:00.000Z",endsAt:"2026-08-20T20:00:00.000Z"}],requiredPersonIds:[]});
+  assert.throws(()=>service.rankPoll({...command("rank-wrong",0),eventId:"event_other"},poll.id),/denied/);
+  assert.throws(()=>service.respondToPoll(command("invalid-availability",poll.revision),{pollId:poll.id,personId:"organizer_1",responses:{one:"sometimes" as "available"}}),/conflict/);
 });
 
 test("agenda lifecycle records attendance and targeted readiness outcomes",()=>{
@@ -84,6 +91,17 @@ test("agenda lifecycle records attendance and targeted readiness outcomes",()=>{
   assert.equal(cancelled.state,"cancelled");
 });
 
+test("recording outcomes prevalidates every assignment before mutating",()=>{
+  const service=new CoordinationService();
+  const arrangement=service.createArrangement(command("atomic-arrangement",0),{songId:"song_alpha",key:"C",notes:"",rightsState:"cleared",parts:[{id:"lead",name:"Lead",required:true}]});
+  const assignment=service.volunteer(command("atomic-volunteer",0),{decisionId:arrangement.id,partId:"lead",performerId:"performer_a",level:"committed"});
+  const poll=service.createPoll(command("atomic-poll",0),{timeZone:"UTC",slots:[{id:"one",startsAt:"2026-08-20T18:00:00.000Z",endsAt:"2026-08-20T20:00:00.000Z"}],requiredPersonIds:[]});
+  const session=service.publishSession(command("atomic-session",poll.revision),{pollId:poll.id,slotId:"one",agenda:[]});
+  assert.throws(()=>service.recordOutcome(command("atomic-outcome",session.revision),session.id,{attendance:["performer_a"],readinessUpdates:[{assignmentId:assignment.id,state:"performance-ready"},{assignmentId:"missing",state:"learning"}]}),/not-found/);
+  assert.equal(service.assignment(assignment.id).readiness,"interested");
+  assert.equal(service.cancelSession(command("atomic-cancel",session.revision),session.id,"Still unchanged").revision,2);
+});
+
 test("provider grants are scoped and revocable; callbacks and sends are idempotent across rate limits",async()=>{
   const adapter=new MemoryProviderAdapter({failFirstWithRateLimit:true}); const service=new CoordinationService({provider:adapter});
   service.connectProvider(command("connect",0),{connectionId:"calendar_1",kind:"notification",scopes:["notifications:send"],retention:"delete-on-disconnect"});
@@ -94,8 +112,16 @@ test("provider grants are scoped and revocable; callbacks and sends are idempote
   assert.equal((await service.sendNotification(command("send",0),{deliveryId:"delivery_1",connectionId:"calendar_1",category:"rehearsal-update",recipientRef:"person_ref"})).state,"sent");
   assert.equal((await service.sendNotification(command("send",0),{deliveryId:"delivery_1",connectionId:"calendar_1",category:"rehearsal-update",recipientRef:"person_ref"})).state,"sent");
   assert.equal(adapter.sent.length,1);
-  service.disconnectProvider(command("disconnect",1),"calendar_1");
+  await service.disconnectProvider(command("disconnect",1),"calendar_1");
   assert.throws(()=>service.receiveProviderCallback("calendar_1","callback_2",{}),CoordinationError);
+});
+
+test("provider disconnect only marks local revocation after remote revocation succeeds",async()=>{
+  const provider:ProviderPort={send:async()=>{},revoke:async()=>{throw new Error("offline");}};
+  const service=new CoordinationService({provider});
+  service.connectProvider(command("connect-failing",0),{connectionId:"failing",kind:"calendar",scopes:["free-busy:read"],retention:"delete-on-disconnect"});
+  await assert.rejects(service.disconnectProvider(command("disconnect-failing",1),"failing"),/provider-failed/);
+  assert.equal(service.receiveProviderCallback("failing","still-active",{}),"accepted");
 });
 
 test("notifications require an explicit send scope",async()=>{

@@ -57,6 +57,9 @@ export class SqliteKernel {
     insertSong.run(ids.songA, ids.community, "Example Song One");
     insertSong.run(ids.songB, ids.community, "Example Song Two");
     insertSong.run(ids.songC, ids.community, "Example Song Three");
+    const makeEligible = this.database.prepare("INSERT OR IGNORE INTO event_eligible_songs(event_id, song_id, added_at) VALUES (?, ?, ?)");
+    makeEligible.run(ids.event, ids.songA, new Date(0).toISOString());
+    makeEligible.run(ids.event, ids.songB, new Date(0).toISOString());
   }
 
   count(table: string): number {
@@ -111,7 +114,14 @@ export class SqliteKernel {
       const current = this.database.prepare("SELECT current_revision FROM ballots WHERE id = ? AND community_id = ? AND event_id = ?").get(ballotId, envelope.communityId, scopedEventId) as { current_revision: number } | undefined;
       if (!current || current.current_revision !== envelope.expectedRevision) throw new KernelError("conflict", `stale revision: expected ${envelope.expectedRevision}`);
 
-      const eligible = this.database.prepare("SELECT id FROM canonical_songs WHERE community_id = ?").all(envelope.communityId).map((row) => (row as { id: string }).id);
+      const eligible = this.database.prepare(`
+        SELECT s.id
+        FROM event_eligible_songs eligible
+        JOIN events e ON e.id = eligible.event_id
+        JOIN canonical_songs s ON s.id = eligible.song_id
+        WHERE eligible.event_id = ? AND e.community_id = ? AND s.community_id = ?
+        ORDER BY s.id
+      `).all(scopedEventId, envelope.communityId, envelope.communityId).map((row) => (row as { id: string }).id);
       let outcome;
       try { outcome = replaceBallotDomain(current.current_revision === 0 ? undefined : { revision: current.current_revision, rankings: [] }, { rankings, eligibleSongIds: eligible }).current; }
       catch (error) {

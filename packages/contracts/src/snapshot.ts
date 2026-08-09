@@ -3,6 +3,10 @@ import { ContractValidationError } from "./index.ts";
 
 export const SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const SNAPSHOT_PROFILE = "hootenanny/v1" as const;
+const MAX_RECORDS = 100_000;
+const MAX_ATTRIBUTES_BYTES = 16 * 1024 * 1024;
+const MAX_ATTRIBUTE_DEPTH = 64;
+const MAX_STRING_BYTES = 1024 * 1024;
 export type SnapshotRecord = { type: string; sourceId: string; parentSourceId: string | null; tombstone: boolean; attributes: Record<string, unknown> };
 export type NeutralSnapshot = {
   schemaVersion: 1; profile: string; mode: "full"; snapshotId: string; sourceIdentity: string;
@@ -17,6 +21,23 @@ export function canonicalJson(value: unknown): string {
 }
 export const sha256 = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 
+function boundedValueSize(value: unknown, depth = 0): number {
+  if (depth > MAX_ATTRIBUTE_DEPTH) throw new ContractValidationError("snapshot attribute nesting depth exceeded");
+  if (value === null || typeof value === "boolean") return 4;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new ContractValidationError("snapshot attributes contain a non-finite number");
+    return 16;
+  }
+  if (typeof value === "string") {
+    const size = Buffer.byteLength(value);
+    if (size > MAX_STRING_BYTES) throw new ContractValidationError("snapshot attribute string size exceeded");
+    return size;
+  }
+  if (Array.isArray(value)) return value.reduce((size, item) => size + boundedValueSize(item, depth + 1), 0);
+  if (value && typeof value === "object") return Object.entries(value as Record<string, unknown>).reduce((size, [key, item]) => size + Buffer.byteLength(key) + boundedValueSize(item, depth + 1), 0);
+  throw new ContractValidationError("snapshot attributes contain an unsupported value");
+}
+
 export function parseNeutralSnapshot(value: unknown): NeutralSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ContractValidationError("snapshot must be an object");
   const s = value as Record<string, unknown>;
@@ -30,10 +51,14 @@ export function parseNeutralSnapshot(value: unknown): NeutralSnapshot {
   if (!/^\d+$/.test(s.startWatermark as string) || !/^\d+$/.test(s.endWatermark as string)) throw new ContractValidationError("snapshot watermark must be a numeric sequence");
   if (s.startWatermark !== s.endWatermark) throw new ContractValidationError("snapshot does not prove a consistent source watermark");
   if (!Array.isArray(s.records)) throw new ContractValidationError("snapshot records must be an array");
+  if (s.records.length > MAX_RECORDS) throw new ContractValidationError("snapshot record limit exceeded");
+  let attributeBytes = 0;
   const records = s.records.map((raw, i) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ContractValidationError(`record ${i} is invalid`);
     const r = raw as Record<string, unknown>;
     if (typeof r.type !== "string" || typeof r.sourceId !== "string" || (r.parentSourceId !== null && typeof r.parentSourceId !== "string") || typeof r.tombstone !== "boolean" || !r.attributes || typeof r.attributes !== "object" || Array.isArray(r.attributes)) throw new ContractValidationError(`record ${i} is invalid`);
+    attributeBytes += boundedValueSize(r.attributes);
+    if (attributeBytes > MAX_ATTRIBUTES_BYTES) throw new ContractValidationError("snapshot attribute size limit exceeded");
     return r as SnapshotRecord;
   });
   const ids = new Set(records.map(r => r.sourceId));

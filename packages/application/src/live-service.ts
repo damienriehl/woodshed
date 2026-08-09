@@ -47,6 +47,25 @@ const target: Record<LiveAction, QueueEntryState> = {
   restore: "restored",
 };
 
+const actions = new Set<LiveAction>(Object.keys(target) as LiveAction[]);
+const identifierFields = ["communityId", "eventId", "actorId", "deviceInstallationId", "operationId", "entryId"] as const;
+
+function parseLiveCommand(value: unknown): LiveCommand {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new LiveError("invalid-command");
+  const command = value as Record<string, unknown>;
+  if (command.schemaVersion !== 1) throw new LiveError("unsupported-schema");
+  for (const field of identifierFields) {
+    if (typeof command[field] !== "string" || command[field].length === 0) throw new LiveError("invalid-command");
+  }
+  if (!Number.isSafeInteger(command.authorityEpoch) || (command.authorityEpoch as number) < 1) throw new LiveError("invalid-command");
+  if (!Number.isSafeInteger(command.baseRevision) || (command.baseRevision as number) < 0) throw new LiveError("invalid-command");
+  if (typeof command.issuedAt !== "string" || typeof command.expiresAt !== "string") throw new LiveError("invalid-command");
+  if (typeof command.action !== "string" || !actions.has(command.action as LiveAction)) throw new LiveError("invalid-command");
+  if (!command.payload || typeof command.payload !== "object" || Array.isArray(command.payload)) throw new LiveError("invalid-payload");
+  if (typeof command.authentication !== "string" || !/^[a-f0-9]{64}$/i.test(command.authentication)) throw new LiveError("authentication-failed");
+  return command as LiveCommand;
+}
+
 export class LivePerformanceService {
   private entries = new Map<string, QueueEntry>();
   private revisions = new Map<string, number>();
@@ -60,6 +79,7 @@ export class LivePerformanceService {
     now?: () => Date;
     maxOperationsPerEvent?: number;
     eventOpen?: (eventId: string) => boolean;
+    communityForEvent: (eventId: string) => string | null;
   };
 
   constructor(options: {
@@ -68,11 +88,13 @@ export class LivePerformanceService {
     now?: () => Date;
     maxOperationsPerEvent?: number;
     eventOpen?: (eventId: string) => boolean;
+    communityForEvent: (eventId: string) => string | null;
   }) {
     this.options = options;
   }
 
-  execute(command: LiveCommand): Result {
+  execute(rawCommand: unknown): Result {
+    const command = parseLiveCommand(rawCommand);
     const hash = canonicalJson(command);
     const receiptKey = `${command.communityId}\0${command.eventId}\0${command.operationId}`;
     const prior = this.receipts.get(receiptKey);
@@ -80,7 +102,7 @@ export class LivePerformanceService {
       if (prior.hash !== hash) throw new LiveError("replay-mismatch");
       return prior.result;
     }
-    if (command.schemaVersion !== 1) throw new LiveError("unsupported-schema");
+    if (this.options.communityForEvent(command.eventId) !== command.communityId) throw new LiveError("scope-mismatch");
 
     const expected = this.options.credentialFor(command.deviceInstallationId);
     if (!expected) throw new LiveError("device-revoked");

@@ -61,6 +61,8 @@ export class D1Kernel {
       this.database.prepare("INSERT OR IGNORE INTO canonical_songs(id, community_id, title) VALUES (?, ?, ?)").bind(ids.songA, ids.community, "Example Song One"),
       this.database.prepare("INSERT OR IGNORE INTO canonical_songs(id, community_id, title) VALUES (?, ?, ?)").bind(ids.songB, ids.community, "Example Song Two"),
       this.database.prepare("INSERT OR IGNORE INTO canonical_songs(id, community_id, title) VALUES (?, ?, ?)").bind(ids.songC, ids.community, "Example Song Three"),
+      this.database.prepare("INSERT OR IGNORE INTO event_eligible_songs(event_id, song_id, added_at) VALUES (?, ?, ?)").bind(ids.event, ids.songA, new Date(0).toISOString()),
+      this.database.prepare("INSERT OR IGNORE INTO event_eligible_songs(event_id, song_id, added_at) VALUES (?, ?, ?)").bind(ids.event, ids.songB, new Date(0).toISOString()),
     ]);
   }
 
@@ -116,7 +118,14 @@ export class D1Kernel {
     const currentRevision = Number(current?.current_revision ?? 0);
     if (currentRevision !== envelope.expectedRevision) throw new KernelError("conflict", `stale revision: expected ${envelope.expectedRevision}`);
 
-    const eligibleRows = await this.database.prepare("SELECT id FROM canonical_songs WHERE community_id = ? ORDER BY id").bind(envelope.communityId).all<{ id: string }>();
+    const eligibleRows = await this.database.prepare(`
+      SELECT s.id
+      FROM event_eligible_songs eligible
+      JOIN events e ON e.id = eligible.event_id
+      JOIN canonical_songs s ON s.id = eligible.song_id
+      WHERE eligible.event_id = ? AND e.community_id = ? AND s.community_id = ?
+      ORDER BY s.id
+    `).bind(eventId, envelope.communityId, envelope.communityId).all<{ id: string }>();
     let outcome;
     try {
       outcome = replaceBallotDomain(currentRevision === 0 ? undefined : { revision: currentRevision, rankings: [] }, { rankings, eligibleSongIds: eligibleRows.results.map(({ id }) => id) }).current;

@@ -3,7 +3,7 @@ import { sha256 } from "../../contracts/src/snapshot.ts";
 export const CAPABILITIES = ["event", "ballot", "assignment", "live"] as const;
 export type Capability = typeof CAPABILITIES[number];
 export type AuthorityState = "legacy-authoritative" | "shadow-imported" | "conformance-verified" | "Woodshed-authoritative" | "legacy-retired";
-type AuthorityRecord = { state: AuthorityState; refreshWatermark?: number; cutoverWatermark?: number; acceptedWrites: boolean; evidence: string[] };
+type AuthorityRecord = { state: AuthorityState; refreshWatermark?: number; conformedWatermark?: number; cutoverWatermark?: number; acceptedWrites: boolean; evidence: string[] };
 type TransitionEvidence = { refreshWatermark?: number; conformanceId?: string; cutoverWatermark?: number; commandsDrained?: boolean; legacyWriterFrozen?: boolean; exactlyOneWriter?: boolean; retirementApproval?: string };
 type Rollback = { strategy: "journal-replay" | "freeze-snapshot-cutback" | "irreversible-forward-fix" | "none"; evidenceId?: string };
 const NEXT: Record<AuthorityState, AuthorityState | null> = { "legacy-authoritative": "shadow-imported", "shadow-imported": "conformance-verified", "conformance-verified": "Woodshed-authoritative", "Woodshed-authoritative": "legacy-retired", "legacy-retired": null };
@@ -15,10 +15,11 @@ export class AuthorityRegistry {
     const current = this.records.get(capability)!;
     if (NEXT[current.state] !== next) throw new Error(`illegal authority transition: ${current.state} -> ${next}`);
     if (next === "shadow-imported" && !Number.isSafeInteger(evidence.refreshWatermark)) throw new Error("shadow import watermark required");
-    if (next === "conformance-verified" && !evidence.conformanceId) throw new Error("conformance evidence required");
-    if (next === "Woodshed-authoritative" && (!Number.isSafeInteger(evidence.cutoverWatermark) || !evidence.commandsDrained || !evidence.legacyWriterFrozen || !evidence.exactlyOneWriter)) throw new Error("cutover drain, freeze, watermark, and exactly-one-writer evidence required");
+    if (next === "conformance-verified" && (!evidence.conformanceId || !Number.isSafeInteger(current.refreshWatermark))) throw new Error("conformance evidence and refresh watermark required");
+    if (next === "Woodshed-authoritative" && (!Number.isSafeInteger(evidence.cutoverWatermark) || evidence.cutoverWatermark !== current.conformedWatermark || current.refreshWatermark !== current.conformedWatermark || !evidence.commandsDrained || !evidence.legacyWriterFrozen || !evidence.exactlyOneWriter)) throw new Error("cutover drain, freeze, exact conformed watermark, and exactly-one-writer evidence required");
     if (next === "legacy-retired" && !evidence.retirementApproval) throw new Error("legacy retirement approval required");
     current.state = next;
+    if (next === "conformance-verified") current.conformedWatermark = current.refreshWatermark;
     if (evidence.refreshWatermark !== undefined) current.refreshWatermark = evidence.refreshWatermark;
     if (evidence.cutoverWatermark !== undefined) current.cutoverWatermark = evidence.cutoverWatermark;
     current.evidence.push(...Object.values(evidence).filter(v => typeof v === "string"));
@@ -29,6 +30,7 @@ export class AuthorityRegistry {
     if (!Number.isSafeInteger(watermark) || watermark < (current.refreshWatermark ?? 0)) throw new Error("refresh watermark must be monotonic");
     if (current.state === "conformance-verified") current.state = "shadow-imported";
     current.refreshWatermark = watermark;
+    current.conformedWatermark = undefined;
     current.evidence.push(`refresh:${watermark}`);
   }
   assertRead(capability: Capability, system: "legacy" | "woodshed") {
@@ -63,28 +65,44 @@ export type CutoverArtifact = {
   observability: { errorRate: number; mismatchRate: number; queueDepth: number; owner: string; runbook: string };
   approvals: { readFirstUat: boolean; commandDrain: boolean; writerFreeze: boolean; shadowReconciled: boolean; exactlyOneWriter: boolean; publicationApproved: boolean; legacyRetirementApproved: boolean };
 };
-export function evaluateCutover(a: CutoverArtifact) {
+export function evaluateCutover(value: unknown) {
   const failures: string[] = [];
+  const invalid = () => ({ readyForAuthority: false, readyForLegacyRetirement: false, failures, observationFailures: [] as string[] });
   const rejectUnknown = (label: string, value: unknown, allowed: readonly string[]) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) { failures.push(`${label} inventory invalid`); return; }
     const unknown = Object.keys(value).filter(key => !allowed.includes(key));
     if (unknown.length) failures.push(`${label} inventory contains unknown fields`);
   };
+  if (!value || typeof value !== "object" || Array.isArray(value)) { failures.push("cutover inventory invalid"); return invalid(); }
+  const a = value as Partial<CutoverArtifact> & Record<string, unknown>;
   rejectUnknown("cutover", a, ["artifactVersion", "capability", "owner", "approver", "release", "baseline", "recovery", "deploy", "observations", "rollback", "observability", "approvals"]);
+  if (a.artifactVersion !== 1) failures.push("unsupported cutover artifact version");
+  if (!CAPABILITIES.includes(a.capability as Capability)) failures.push("unsupported cutover capability");
+  if (typeof a.owner !== "string" || typeof a.approver !== "string") { failures.push("distinct owner and approver required"); return invalid(); }
+  if (!a.release || !a.baseline || !a.recovery || !a.deploy || !Array.isArray(a.observations) || !a.rollback || !a.observability || !a.approvals) { failures.push("cutover inventory incomplete"); return invalid(); }
+  const records=[a.release,a.baseline,a.recovery,a.deploy,a.rollback,a.observability,a.approvals];
+  if(records.some(item=>typeof item!=="object"||Array.isArray(item))||typeof a.rollback.expected!=="object"||!a.rollback.expected){failures.push("cutover inventory malformed");return invalid()}
+  if(a.observations.some(item=>!item||typeof item!=="object"||Array.isArray(item))){failures.push("cutover observations malformed");return invalid()}
+  const metrics=[a.rollback.expected.errorRateMax,a.rollback.expected.mismatchRateMax,a.observability.errorRate,a.observability.mismatchRate,a.observability.queueDepth];
+  if(!Array.isArray(a.baseline.queries)||!Array.isArray(a.deploy.order)||!Array.isArray(a.rollback.commands)||metrics.some(metric=>typeof metric!=="number"||!Number.isFinite(metric))||Object.values(a.approvals).some(flag=>typeof flag!=="boolean")){failures.push("cutover inventory malformed");return invalid()}
+  if(a.observations.some(item=>typeof item.at!=="string"||(item.status!=="pass"&&item.status!=="fail")||typeof item.evidenceId!=="string")){failures.push("cutover observations malformed");return invalid()}
   rejectUnknown("release", a.release, ["sha", "configFingerprint", "schemaVersion", "privacyProvenance", "exactReleaseMarker"]);
   rejectUnknown("baseline", a.baseline, ["queries", "resultFingerprint"]);
   rejectUnknown("recovery", a.recovery, ["backupId", "restoreProofId", "strategy", "journalStart"]);
   rejectUnknown("deploy", a.deploy, ["order", "routingFlag", "immutableOrigin", "immutableOriginVerified", "alias", "aliasChangedAfterOriginVerification", "pinnedCli"]);
   rejectUnknown("rollback", a.rollback, ["commands", "expected"]);
+  rejectUnknown("rollback thresholds", a.rollback.expected, ["errorRateMax", "mismatchRateMax"]);
   rejectUnknown("observability", a.observability, ["errorRate", "mismatchRate", "queueDepth", "owner", "runbook"]);
   rejectUnknown("approvals", a.approvals, ["readFirstUat", "commandDrain", "writerFreeze", "shadowReconciled", "exactlyOneWriter", "publicationApproved", "legacyRetirementApproved"]);
+  a.observations.forEach(item=>rejectUnknown("observation",item,["at","status","evidenceId"]));
   if (!a.owner || !a.approver || a.owner === a.approver) failures.push("distinct owner and approver required");
   if (!/^[a-f0-9]{40}$/.test(a.release.sha) || !/^[a-f0-9]{64}$/.test(a.release.configFingerprint) || !a.release.schemaVersion || !a.release.privacyProvenance || a.release.exactReleaseMarker !== `release:${a.release.sha}`) failures.push("frozen release inventory invalid");
   if (!a.baseline.queries.length || !/^[a-f0-9]{64}$/.test(a.baseline.resultFingerprint)) failures.push("baseline queries and results required");
   if (!a.recovery.backupId || !a.recovery.restoreProofId || a.recovery.strategy === "none") failures.push("backup, restore proof, and safe recovery strategy required");
   if (a.recovery.strategy === "journal-replay" && !a.recovery.journalStart) failures.push("journal replay start required");
   const requiredOrder = ["schema-expand", "reader", "writer", "route"];
-  if (requiredOrder.some((x, i) => a.deploy.order[i] !== x)) failures.push("deploy order is incomplete or unsafe");
+  const deploy=a.deploy;
+  if (requiredOrder.some((x, i) => deploy.order[i] !== x)) failures.push("deploy order is incomplete or unsafe");
   if (!a.deploy.routingFlag || !a.deploy.immutableOrigin || !a.deploy.immutableOriginVerified || !a.deploy.alias || !a.deploy.aliasChangedAfterOriginVerification || !/^wrangler@\d+\.\d+\.\d+$/.test(a.deploy.pinnedCli)) failures.push("routing, immutable-origin-before-alias evidence, and pinned deployment inventory required");
   const observationFailures: string[] = [];
   for (const at of ["+5m", "+1h", "+4h", "+24h"]) if (!a.observations.some(x => x.at === at && x.status === "pass" && x.evidenceId)) observationFailures.push(`missing ${at} observation`);

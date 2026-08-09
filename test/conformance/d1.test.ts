@@ -11,10 +11,10 @@ const COMPATIBILITY_DATE = "2025-07-18";
 
 registerFirstLoopStorageConformance("Miniflare D1", async () => {
   const persist = await mkdtemp(path.join(os.tmpdir(), "woodshed-d1-"));
-  const migrations = [{
-    name: "001_first_loop.sql",
-    sql: await readFile(new URL("../../migrations/d1/001_first_loop.sql", import.meta.url), "utf8"),
-  }];
+  const migrations = await Promise.all(["001_first_loop.sql", "002_participant_choice.sql"].map(async (name) => ({
+    name,
+    sql: await readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8"),
+  })));
   let miniflare: Miniflare | undefined;
 
   async function open() {
