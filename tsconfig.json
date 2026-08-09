@@ -3,7 +3,7 @@
     "target": "ES2023",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM"],
     "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -15,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "noEmit": true
   },
-  "include": ["packages/**/*.ts", "test/contracts/**/*.ts", "test/conformance/**/*.ts", "test/snapshot/**/*.ts"]
+  "include": ["packages/**/*.ts", "apps/api-node/**/*.ts", "test/contracts/**/*.ts", "test/conformance/**/*.ts", "test/snapshot/**/*.ts", "test/e2e/**/*.ts"]
 }

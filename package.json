@@ -9,13 +9,15 @@
     "node": ">=24"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ],
   "scripts": {
-    "build": "node tools/verify-foundation.mjs && node tools/privacy/check-manifest.mjs",
+    "build": "npm run build -w @woodshed/web && node tools/verify-foundation.mjs && node tools/privacy/check-manifest.mjs",
     "lint": "node --check tools/privacy/scanner.mjs && node --check tools/privacy/scan.mjs && node --check tools/privacy/check-manifest.mjs && node --check tools/release/verify.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node test/contracts/kernel.test.ts && node --test test/conformance/*.test.ts test/privacy/*.test.mjs test/snapshot/*.test.ts",
+    "test": "node test/contracts/kernel.test.ts && node --test test/conformance/*.test.ts test/privacy/*.test.mjs test/snapshot/*.test.ts test/e2e/participant-choice/*.test.ts && npm run test -w @woodshed/web -- --run",
+    "dev": "npm run dev -w @woodshed/web",
     "test:snapshot": "node --test test/snapshot/*.test.ts",
     "test:conformance": "node --test test/conformance/*.test.ts",
     "privacy": "node tools/privacy/scan.mjs --worktree",

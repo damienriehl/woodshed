@@ -1,0 +1,1 @@
+{"name":"@woodshed/api-node","version":"0.0.0","private":true,"type":"module","scripts":{"dev":"node --watch src/server.ts"},"dependencies":{"@hono/node-server":"2.1.0","hono":"4.13.1"}}
