@@ -15,3 +15,5 @@ The scanner reports only the rule and path, never the matched value. Unreadable 
 Private compatibility snapshots belong in access-controlled private infrastructure with bounded retention. Public fixtures may preserve structural edge cases only after an allowlisted transformation and a successful privacy scan.
 
 Storage conformance uses generated identifiers and titles only. Miniflare persists D1 state in a fresh operating-system temporary directory that the test removes; neither that directory nor any private snapshot belongs in the repository, CI artifacts, logs, or screenshots.
+
+Calendar integrations request free/busy scope by default and do not ingest calendar titles. Provider callbacks and notification destinations use opaque references. Disconnecting a provider revokes access and deletes callback-derived state; bounded delivery receipts remain only when needed for idempotency and audit. See [Arrangement and rehearsal coordination](rehearsal-coordination.md).
