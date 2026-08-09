@@ -6,7 +6,7 @@ This repository is a clean-history rebuild. It contains synthetic examples only 
 
 ## Requirements
 
-- Node.js 20 or newer (Node.js 24 is the reference release)
+- Node.js 24 or newer (Node.js 24 is the reference release)
 - Git, for tracked-file and history release checks
 
 ## Verify the foundation
@@ -18,6 +18,8 @@ npm run typecheck
 npm run build
 npm run privacy
 ```
+
+`npm run test:conformance` exercises the same participant-choice behavior against both the Node SQLite reference adapter and a genuine local Cloudflare D1 binding hosted by Miniflare. The D1 test is local-only and never connects to production data.
 
 Before publishing a release, run `npm run verify:release -- --expected-ref <full-commit-sha>` from a clean checkout. This binds the evidence to the exact release identity and scans the worktree, tracked files, and reachable history.
 

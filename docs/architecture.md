@@ -18,6 +18,14 @@ Every mutable first-loop operation is community-scoped, revision-aware, expiring
 
 The conformance invariant catalog provides executable checks for current-ballot uniqueness, immutable-history references, complete audit and receipt linkage, community isolation, and non-broadening event consent. Migration files have immutable checksums and replay safely on empty or populated databases.
 
+## First-loop storage conformance
+
+`packages/conformance/src/adapter.ts` defines the deliberately small storage port for the participant-choice loop. The common black-box suite runs unchanged against `SqliteKernel` and `D1Kernel`; it verifies migration replay, synthetic tenant seeding, ranked ordering, millisecond timestamp preservation, capability and aggregate checks, tenant isolation, revoked participation, compare-and-swap conflicts, idempotent replay and payload mismatch, and rollback of state + audit + receipt.
+
+The D1 adapter is tested through Miniflare's programmatic `getD1Database` API, so the second runtime is a genuine local workerd/D1 binding rather than a SQLite-shaped mock. Miniflare is pinned exactly and the test pins compatibility date `2025-07-18`. Local and deployed D1 data are separate by design. Deployments inject the reviewed, one-statement-per-line SQL migration contents into the Worker-safe adapter; the adapter itself imports no Node runtime modules. D1 applies each migration and its checksum receipt in one batch. D1 batching and result metadata remain adapter details; callers receive only the canonical first-loop result and `KernelError` taxonomy.
+
+This proof covers participant ballot replacement only. It does not claim conformance for live authority coordination, assignments, rehearsal, archives, or an HTTP interface.
+
 Live authority epochs, archives, private migration payloads, assignments, rehearsals, and offline performance coordination remain outside this kernel and belong to later implementation units.
 
 ## Operational design rules

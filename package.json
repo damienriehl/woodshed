@@ -15,13 +15,20 @@
     "build": "node tools/verify-foundation.mjs && node tools/privacy/check-manifest.mjs",
     "lint": "node --check tools/privacy/scanner.mjs && node --check tools/privacy/scan.mjs && node --check tools/privacy/check-manifest.mjs && node --check tools/release/verify.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node test/contracts/kernel.test.ts && node --test test/privacy/*.test.mjs",
+    "test": "node test/contracts/kernel.test.ts && node --test test/conformance/*.test.ts test/privacy/*.test.mjs",
+    "test:conformance": "node --test test/conformance/*.test.ts",
     "privacy": "node tools/privacy/scan.mjs --worktree",
     "privacy:release": "node tools/privacy/check-manifest.mjs && node tools/privacy/scan.mjs --tracked --history --worktree",
     "verify:release": "node tools/release/verify.mjs"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "4.20250718.0",
     "@types/node": "24.13.3",
+    "miniflare": "3.20250718.3",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "undici": "6.28.0",
+    "ws": "8.21.0"
   }
 }

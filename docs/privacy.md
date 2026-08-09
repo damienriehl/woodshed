@@ -13,3 +13,5 @@ PII, credentials, bearer or capability tokens, private hosts, production SQL, da
 The scanner reports only the rule and path, never the matched value. Unreadable inputs and inventory failures fail closed. Release checks scan the worktree, Git index, and reachable history. CI and demonstrations must run without production credentials.
 
 Private compatibility snapshots belong in access-controlled private infrastructure with bounded retention. Public fixtures may preserve structural edge cases only after an allowlisted transformation and a successful privacy scan.
+
+Storage conformance uses generated identifiers and titles only. Miniflare persists D1 state in a fresh operating-system temporary directory that the test removes; neither that directory nor any private snapshot belongs in the repository, CI artifacts, logs, or screenshots.
