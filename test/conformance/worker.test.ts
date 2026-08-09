@@ -86,8 +86,33 @@ describe("Cloudflare Worker runtime", () => {
       assert.equal(saved.status, 200);
       assert.equal((await saved.json() as { revision: number }).revision, 1);
 
+      await fixture.DB.prepare("UPDATE ballots SET state='closed' WHERE event_id=? AND participation_id=?").bind("event_public", "participation_host").run();
+      const closed = await fixture.fetch("/api/events/event_public/ballot", { method: "PUT", headers: fixture.authHeaders(true), body: JSON.stringify({ expectedRevision: 1, rankings: current.candidates.map(({ id }) => id), operationId: "operation_ballot_closed" }) });
+      assert.equal(closed.status, 409);
+      assert.deepEqual(await closed.json(), { error: "voting-closed" });
+      await fixture.DB.prepare("UPDATE ballots SET state='reopened' WHERE event_id=? AND participation_id=?").bind("event_public", "participation_host").run();
+      const reopened = await fixture.fetch("/api/events/event_public/ballot", { method: "PUT", headers: fixture.authHeaders(true), body: JSON.stringify({ expectedRevision: 1, rankings: current.candidates.map(({ id }) => id), operationId: "operation_ballot_reopened" }) });
+      assert.equal(reopened.status, 200);
+      assert.equal((await reopened.json() as { revision: number }).revision, 2);
+      await fixture.DB.prepare("UPDATE ballots SET state='final' WHERE event_id=? AND participation_id=?").bind("event_public", "participation_host").run();
+      const finalized = await fixture.fetch("/api/events/event_public/ballot", { method: "PUT", headers: fixture.authHeaders(true), body: JSON.stringify({ expectedRevision: 2, rankings: current.candidates.map(({ id }) => id), operationId: "operation_ballot_final" }) });
+      assert.equal(finalized.status, 409);
+
       const crossTenant = await fixture.fetch("/api/events/event_other/ballot", { headers: fixture.authHeaders() });
       assert.equal(crossTenant.status, 403);
+    } finally { await fixture.close(); }
+  });
+
+  it("proves sessions through the participation and event scope and rejects either revocation or a non-finite expiry", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.prepare("UPDATE guest_participations SET revoked_at=? WHERE id=?").bind("2030-01-01T00:00:00Z", "participation_host").run();
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: fixture.authHeaders() })).status, 401);
+      await fixture.DB.prepare("UPDATE guest_participations SET revoked_at=NULL WHERE id=?").bind("participation_host").run();
+      await fixture.DB.prepare("UPDATE participant_sessions SET revoked_at=? WHERE id_hash=?").bind("2030-01-01T00:00:00Z", sessionHash).run();
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: fixture.authHeaders() })).status, 401);
+      await fixture.DB.prepare("UPDATE participant_sessions SET revoked_at=NULL,expires_at='not-a-date' WHERE id_hash=?").bind(sessionHash).run();
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: fixture.authHeaders() })).status, 401);
     } finally { await fixture.close(); }
   });
 
@@ -102,11 +127,23 @@ describe("Cloudflare Worker runtime", () => {
       assert.equal(acquiredAuthority.epoch, 1);
       assert.equal(acquiredAuthority.commandCredential.length,64);
 
-      const queued = await fixture.fetch("/api/events/event_public/live/commands", {
-        method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand()),
-      });
+      const command = await signedCommand();
+      const [queued, concurrentRetry] = await Promise.all([
+        fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(command) }),
+        fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(command) }),
+      ]);
       assert.equal(queued.status, 200);
-      assert.equal((await queued.json() as { entry: { state: string } }).entry.state, "queued");
+      assert.equal(concurrentRetry.status, 200);
+      const queuedBody = await queued.json() as { entry: { state: string } };
+      assert.equal(queuedBody.entry.state, "queued");
+      assert.deepEqual(await concurrentRetry.json(), queuedBody);
+
+      const ineligible = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand({ operationId: "operation_ineligible", baseRevision: 1, entryId: "entry_bad_song", payload: { songId: "song_other" } })) });
+      assert.equal(ineligible.status, 400);
+      assert.deepEqual(await ineligible.json(), { error: "invalid-payload" });
+      const notEventEligible = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand({ operationId: "operation_not_event_eligible", baseRevision: 1, entryId: "entry_unlisted_song", payload: { songId: "song_charlie" } })) });
+      assert.equal(notEventEligible.status, 400);
+      assert.deepEqual(await notEventEligible.json(), { error: "invalid-payload" });
 
       const offline = await fixture.fetch("/api/events/event_public/live/commands", {
         method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand({ operationId: "operation_offline", entryId: "entry_song_bravo", payload: { songId: "song_bravo" } })),
@@ -119,8 +156,12 @@ describe("Cloudflare Worker runtime", () => {
       });
       assert.equal(handoff.status, 201);
       const { token } = await handoff.json() as { token: string };
+      const cancelled = await fixture.fetch("/api/events/event_public/live/authority/handoffs/cancel", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ token, deviceInstallationId: "device_stage" }) });
+      assert.equal(cancelled.status, 200);
+      const replacementHandoff = await fixture.fetch("/api/events/event_public/live/authority/handoffs", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ fromDeviceInstallationId: "device_stage", toDeviceInstallationId: "device_backup" }) });
+      const replacementToken = (await replacementHandoff.json() as { token: string }).token;
       const confirmed = await fixture.fetch("/api/events/event_public/live/authority/handoffs/confirm", {
-        method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ token, deviceInstallationId: "device_backup" }),
+        method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ token: replacementToken, deviceInstallationId: "device_backup" }),
       });
       assert.equal(confirmed.status, 200);
       assert.equal((await confirmed.json() as { epoch: number }).epoch, 2);
@@ -138,6 +179,31 @@ describe("Cloudflare Worker runtime", () => {
       });
       assert.equal(oldWriter.status, 409);
       assert.deepEqual(await oldWriter.json(), { error: "superseded-authority" });
+
+      const pendingAtRecovery = await fixture.fetch("/api/events/event_public/live/authority/handoffs", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ fromDeviceInstallationId: "device_backup", toDeviceInstallationId: "device_abandoned" }) });
+      const abandonedToken = (await pendingAtRecovery.json() as { token: string }).token;
+      const recovery = await fixture.fetch("/api/events/event_public/live/authority/revoke-recover", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ lostDeviceInstallationId: "device_backup", recoveryDeviceInstallationId: "device_recovery" }) });
+      assert.equal(recovery.status, 200);
+      assert.equal((await recovery.json() as { epoch: number }).epoch, 3);
+      const stalePending = await fixture.fetch("/api/events/event_public/live/authority/handoffs/confirm", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ token: abandonedToken, deviceInstallationId: "device_abandoned" }) });
+      assert.equal(stalePending.status, 403);
+    } finally { await fixture.close(); }
+  });
+
+  it("bounds new live operations at 1000 per event while preserving exact replay", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.fetch("/api/events/event_public/live/authority/acquire", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify({ deviceInstallationId: "device_stage" }) });
+      const original = await signedCommand();
+      const first = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(original) });
+      const firstBody = await first.json();
+      await fixture.DB.exec("WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<999) INSERT INTO live_operation_receipts(event_id,operation_id,command_hash,result_json,audit_event_id,created_at) SELECT 'event_public','operation_fill_' || value,'hash_' || value,'{}','audit_fill_' || value,'2030-01-01T12:00:00.000Z' FROM sequence");
+      const replay = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(original) });
+      assert.equal(replay.status, 200);
+      assert.deepEqual(await replay.json(), firstBody);
+      const limited = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand({ operationId: "operation_over_limit", baseRevision: 1, entryId: "entry_song_bravo", payload: { songId: "song_bravo" } })) });
+      assert.equal(limited.status, 429);
+      assert.deepEqual(await limited.json(), { error: "rate-limited" });
     } finally { await fixture.close(); }
   });
 });
@@ -156,13 +222,15 @@ async function runtime() {
   await DB.batch([
     DB.prepare("INSERT INTO communities(id,name) VALUES (?,?),(?,?)").bind("community_demo", "Demo", "community_other", "Other"),
     DB.prepare("INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES (?,?,?,'live','public','invite'),(?,?,?,'live','private','invite')").bind("event_public", "community_demo", "Singalong", "event_other", "community_other", "Other"),
-    DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?),(?,?,?)").bind("song_alpha", "community_demo", "North Star", "song_bravo", "community_demo", "Open Road"),
+    DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?),(?,?,?),(?,?,?)").bind("song_alpha", "community_demo", "North Star", "song_bravo", "community_demo", "Open Road", "song_charlie", "community_demo", "Not Eligible"),
+    DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?)").bind("song_other", "community_other", "Wrong Tenant"),
     DB.prepare("INSERT INTO event_eligible_songs(event_id,song_id,added_at) VALUES (?,?,?),(?,?,?)").bind("event_public", "song_alpha", "2026-01-01T00:00:00Z", "event_public", "song_bravo", "2026-01-01T00:00:00Z"),
     DB.prepare("INSERT INTO guest_participations(id,community_id,event_id) VALUES (?,?,?)").bind("participation_host", "community_demo", "event_public"),
     DB.prepare("INSERT INTO participant_sessions(id_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,'invite',?)").bind(sessionHash, "participation_host", "community_demo", "event_public", "community-admin", "2031-01-01T00:00:00Z"),
   ]);
   const env: WorkerBindings = { DB, LIVE_COORDINATOR: authorityNamespace(), APP_ORIGIN: origin, LIVE_COMMAND_SECRET: liveSecret, CLOCK_ISO: "2030-01-01T12:01:00.000Z" };
   return {
+    DB,
     fetch(pathname: string, init?: RequestInit) { return worker.fetch(new Request(`${origin}${pathname}`, init), env); },
     authHeaders(mutating = false) { return { authorization: `Bearer ${sessionToken}`, ...(mutating ? { origin, "x-csrf-token": "same-origin", "content-type": "application/json" } : {}) }; },
     async close() { await miniflare.dispose(); await rm(persist, { recursive: true, force: true }); },

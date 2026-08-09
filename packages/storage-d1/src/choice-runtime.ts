@@ -28,8 +28,9 @@ export class D1ChoiceRuntime {
   }
 
   async session(token: string): Promise<RuntimeSession> {
-    const row = await this.database.prepare("SELECT participation_id,community_id,event_id,role,expires_at,revoked_at FROM participant_sessions WHERE id_hash=?").bind(await webSha256(token)).first<Record<string, string | null>>();
-    if (!row || row.revoked_at || Date.parse(String(row.expires_at)) < this.now().getTime()) throw new RuntimeError("unauthorized");
+    const row = await this.database.prepare("SELECT s.participation_id,s.community_id,s.event_id,s.role,s.expires_at,s.revoked_at AS session_revoked_at,p.revoked_at AS participation_revoked_at FROM participant_sessions s JOIN guest_participations p ON p.id=s.participation_id AND p.community_id=s.community_id AND p.event_id=s.event_id JOIN events e ON e.id=s.event_id AND e.community_id=s.community_id WHERE s.id_hash=?").bind(await webSha256(token)).first<Record<string, string | null>>();
+    const expiresAt = Date.parse(String(row?.expires_at));
+    if (!row || row.session_revoked_at || row.participation_revoked_at || !Number.isFinite(expiresAt) || expiresAt <= this.now().getTime()) throw new RuntimeError("unauthorized");
     return { participationId: String(row.participation_id), communityId: String(row.community_id), eventId: String(row.event_id), role: String(row.role) };
   }
 
@@ -50,6 +51,8 @@ export class D1ChoiceRuntime {
   async replaceBallot(session: RuntimeSession, value: unknown) {
     const body = record(value);
     if (!Number.isSafeInteger(body.expectedRevision) || (body.expectedRevision as number) < 0 || !Array.isArray(body.rankings) || !body.rankings.every((item) => typeof item === "string") || typeof body.operationId !== "string" || body.operationId.length === 0) throw new RuntimeError("invalid-command");
+    const state = await this.database.prepare("SELECT state FROM ballots WHERE community_id=? AND event_id=? AND participation_id=?").bind(session.communityId, session.eventId, session.participationId).first<{ state: string }>();
+    if (state && !["open", "reopened"].includes(state.state)) throw new RuntimeError("voting-closed");
     const now = this.now();
     const envelope = {
       schemaVersion: 1, aggregateType: "ballot", aggregateId: `${session.participationId}:${session.eventId}`, scope: "event",

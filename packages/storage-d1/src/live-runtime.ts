@@ -34,6 +34,8 @@ export class D1LiveRuntime {
     const commandHash=await webSha256(canonical(command));
     const prior=await this.database.prepare("SELECT command_hash,result_json FROM live_operation_receipts WHERE event_id=? AND operation_id=?").bind(eventId,operationId).first<{command_hash:string;result_json:string}>();
     if(prior){if(prior.command_hash!==commandHash)throw new RuntimeError("replay-mismatch");return JSON.parse(prior.result_json);}
+    const operationCount=await this.database.prepare("SELECT COUNT(*) AS count FROM live_operation_receipts WHERE event_id=?").bind(eventId).first<{count:number}>();
+    if(Number(operationCount?.count??0)>=1_000)throw new RuntimeError("rate-limited");
     const revisionRow=await this.database.prepare("SELECT revision FROM live_event_revisions WHERE event_id=?").bind(eventId).first<{revision:number}>();
     const revision=Number(revisionRow?.revision??0),entryId=command.entryId as string;
     const existing=await this.database.prepare("SELECT * FROM live_queue_entries WHERE id=?").bind(entryId).first<Record<string,string|number>>();
@@ -42,6 +44,8 @@ export class D1LiveRuntime {
     if(command.baseRevision!==revision){if(command.action==="queue"&&!existing){state="suggested";status="suggested";}else throw new RuntimeError("stale-revision");}
     if(existing)try{transitionQueueEntry(existing.state as QueueEntryState,state);}catch{throw new RuntimeError("invalid-transition");}
     const payload=command.payload as Record<string,unknown>,songId=typeof payload.songId==="string"?payload.songId:String(existing?.song_id??"");if(!songId)throw new RuntimeError("invalid-payload");
+    const eligibleSong=await this.database.prepare("SELECT 1 FROM canonical_songs s JOIN event_eligible_songs e ON e.song_id=s.id WHERE s.id=? AND s.community_id=? AND e.event_id=?").bind(songId,communityId,eventId).first();
+    if(!eligibleSong)throw new RuntimeError("invalid-payload");
     const nextRevision=revision+1,at=now.toISOString(),auditId=`audit_${(await webSha256(`${eventId}:${operationId}`)).slice(0,24)}`;
     const entry={id:entryId,communityId,eventId,songId,state,revision:Number(existing?.revision??0)+1,audienceVisible:state!=="planned"&&state!=="deferred",createdAt:String(existing?.created_at??at),updatedAt:at};
     const result={status,entry,revision:nextRevision,auditId};
@@ -53,7 +57,11 @@ export class D1LiveRuntime {
     if(state==="performed")statements.push(this.database.prepare("INSERT INTO performance_history(id,event_id,entry_id,song_id,performed_at,authority_epoch,revision) VALUES (?,?,?,?,?,?,?)").bind(`performance_${operationId}`,eventId,entryId,songId,at,command.authorityEpoch,nextRevision));
     statements.push(this.database.prepare("INSERT INTO live_audit_events(id,event_id,operation_id,action,revision,entry_id,occurred_at) VALUES (?,?,?,?,?,?,?)").bind(auditId,eventId,operationId,command.action,nextRevision,entryId,at));
     statements.push(this.database.prepare("INSERT INTO live_operation_receipts(event_id,operation_id,command_hash,result_json,audit_event_id,created_at) VALUES (?,?,?,?,?,?)").bind(eventId,operationId,commandHash,JSON.stringify(result),auditId,at));
-    try{await this.database.batch(statements);}catch(error){throw new RuntimeError("conflict",error instanceof Error?error.message:"conflict");}
+    try{await this.database.batch(statements);}catch(error){
+      const raced=await this.database.prepare("SELECT command_hash,result_json FROM live_operation_receipts WHERE event_id=? AND operation_id=?").bind(eventId,operationId).first<{command_hash:string;result_json:string}>();
+      if(raced){if(raced.command_hash!==commandHash)throw new RuntimeError("replay-mismatch");return JSON.parse(raced.result_json);}
+      throw new RuntimeError("conflict",error instanceof Error?error.message:"conflict");
+    }
     return result;
   }
 
