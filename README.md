@@ -9,6 +9,30 @@ This repository is a clean-history rebuild. It contains synthetic examples only 
 - Node.js 24 or newer (Node.js 24 is the reference release)
 - Git, for tracked-file and history release checks
 
+## Run the public foundation
+
+Install the exact reviewed dependency graph:
+
+```sh
+npm ci
+```
+
+Start the interactive synthetic-data prototype:
+
+```sh
+npm run dev
+```
+
+Vite prints the local browser URL. The prototype demonstrates the participant, rehearsal, and stage-lead interaction model, but it is intentionally not connected to the API yet; changes reset on refresh.
+
+To run the Node/SQLite API reference in a second terminal:
+
+```sh
+npm run dev -w @woodshed/api-node
+```
+
+The API creates `woodshed.sqlite` in the working directory unless `WOODSHED_DB` names another path. API integration instructions and a real organizer onboarding flow remain release work; do not treat the synthetic browser prototype as a production deployment.
+
 ## Verify the foundation
 
 ```sh
