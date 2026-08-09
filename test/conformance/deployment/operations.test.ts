@@ -6,11 +6,12 @@ import {
 } from "../../../packages/archive/src/operations.ts";
 import { ExtensionHost } from "../../../packages/extensions/src/index.ts";
 import { ProviderRegistry } from "../../../packages/providers/src/registry.ts";
-import { healthResponse, probeOperatorHealth, type OperatorHealthAdapter } from "../../../apps/operator/src/index.ts";
+import { healthResponse, probeOperatorHealth, requiredMigrationManifest, type OperatorHealthAdapter } from "../../../apps/operator/src/index.ts";
 import { readFile } from "node:fs/promises";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { systemHealthAdapter } from "../../../apps/operator/src/index.ts";
 
@@ -76,13 +77,13 @@ test("operator health probes the service, database migrations, key custody, and 
   const adapter:OperatorHealthAdapter={
     async service(url){calls.push(`service:${url}`);return true},
     database(path){calls.push(`database:${path}`);return true},
-    migrations(path){calls.push(`migrations:${path}`);return true},
+    migrations(path,migrationsPath){calls.push(`migrations:${path}:${migrationsPath}`);return true},
     keyCustody(path){calls.push(`key:${path}`);return true},
     backupEvidence(path){calls.push(`backup:${path}`);return backup},
   };
-  const result=await probeOperatorHealth({destination:"node-sqlite",version:"1",serviceUrl:"http://127.0.0.1:8787/api/discovery",databasePath:"/data/community.sqlite",keyPath:"/run/secrets/archive.key",backupEvidencePath:"/data/backup-evidence.json",policy:{maxBackupAgeMs:7_200_000,maxRestoreDrillAgeMs:14*86_400_000,requireOffsite:true}},adapter,new Date("2026-08-09T12:00:00Z"));
+  const result=await probeOperatorHealth({destination:"node-sqlite",version:"1",serviceUrl:"http://127.0.0.1:8787/api/discovery",databasePath:"/data/community.sqlite",migrationsPath:"/app/migrations/sqlite",keyPath:"/run/secrets/archive.key",backupEvidencePath:"/data/backup-evidence.json",policy:{maxBackupAgeMs:7_200_000,maxRestoreDrillAgeMs:14*86_400_000,requireOffsite:true}},adapter,new Date("2026-08-09T12:00:00Z"));
   assert.equal(result.status,"healthy");
-  assert.deepEqual(calls,["service:http://127.0.0.1:8787/api/discovery","database:/data/community.sqlite","migrations:/data/community.sqlite","key:/run/secrets/archive.key","backup:/data/backup-evidence.json"]);
+  assert.deepEqual(calls,["service:http://127.0.0.1:8787/api/discovery","database:/data/community.sqlite","migrations:/data/community.sqlite:/app/migrations/sqlite","key:/run/secrets/archive.key","backup:/data/backup-evidence.json"]);
 });
 
 test("operator health is non-ready when adapter config or any real probe is missing",async()=>{
@@ -90,22 +91,34 @@ test("operator health is non-ready when adapter config or any real probe is miss
   const missing=await probeOperatorHealth(undefined,adapter);
   assert.equal(missing.status,"adapter-required");
   assert.equal(missing.exitCode,1);
-  const degraded=await probeOperatorHealth({destination:"node-sqlite",version:"1",serviceUrl:"http://service",databasePath:"/db",keyPath:"/key",backupEvidencePath:"/backup",policy:{maxBackupAgeMs:1,maxRestoreDrillAgeMs:1,requireOffsite:true}},adapter);
+  const degraded=await probeOperatorHealth({destination:"node-sqlite",version:"1",serviceUrl:"http://service",databasePath:"/db",migrationsPath:"/migrations",keyPath:"/key",backupEvidencePath:"/backup",policy:{maxBackupAgeMs:1,maxRestoreDrillAgeMs:1,requireOffsite:true}},adapter);
   assert.equal(degraded.status,"degraded");
   assert.equal(degraded.exitCode,1);
   assert.equal(degraded.checks.migrations,false);
   assert.match(degraded.recovery.join(" "),/missing evidence/i);
 });
 
-test("system health adapter validates real SQLite, migration, key, and recovery artifacts",async()=>{
+test("system health adapter requires the exact ordered SQLite migration source manifest",async()=>{
   const directory=await mkdtemp(join(tmpdir(),"woodshed-health-")),databasePath=join(directory,"community.sqlite"),keyPath=join(directory,"archive.key"),backupEvidencePath=join(directory,"backup.json");
+  const migrationsPath=fileURLToPath(new URL("../../../migrations/sqlite/",import.meta.url));
+  const manifest=requiredMigrationManifest(migrationsPath);
   const database=new DatabaseSync(databasePath);
-  database.exec("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, checksum TEXT NOT NULL); INSERT INTO schema_migrations VALUES('001', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')");
+  database.exec("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, checksum TEXT NOT NULL)");
+  const insert=database.prepare("INSERT INTO schema_migrations(name, checksum) VALUES (?, ?)");
+  for(const migration of manifest.slice(0,-1))insert.run(migration.name,migration.checksum);
+  assert.equal(systemHealthAdapter.migrations(databasePath,migrationsPath),false,"incomplete ledger must be rejected");
+  insert.run(manifest.at(-1)!.name,"a".repeat(64));
+  assert.equal(systemHealthAdapter.migrations(databasePath,migrationsPath),false,"fabricated checksum must be rejected");
+  database.prepare("UPDATE schema_migrations SET checksum=? WHERE name=?").run(manifest.at(-1)!.checksum,manifest.at(-1)!.name);
+  insert.run("999_unrecognized.sql","b".repeat(64));
+  assert.equal(systemHealthAdapter.migrations(databasePath,migrationsPath),false,"extra migration must be rejected");
+  database.prepare("DELETE FROM schema_migrations WHERE name=?").run("999_unrecognized.sql");
+  assert.equal(systemHealthAdapter.migrations(databasePath,migrationsPath),true,"current source-derived ledger must be accepted");
   database.close();
   await writeFile(keyPath,Buffer.alloc(32,1));
   await writeFile(backupEvidencePath,JSON.stringify({backupArtifactId:"backup-7",restoreProofId:"restore-4",lastBackupAt:"2026-08-09T11:00:00Z",lastRestoreDrillAt:"2026-08-01T12:00:00Z",rollbackEvidenceAt:"2026-08-08T12:00:00Z",offsite:true,encrypted:true,cleanDestinationVerified:true}));
   assert.equal(systemHealthAdapter.database(databasePath),true);
-  assert.equal(systemHealthAdapter.migrations(databasePath),true);
+  assert.equal(systemHealthAdapter.migrations(databasePath,migrationsPath),true);
   assert.equal(await systemHealthAdapter.keyCustody(keyPath),true);
   assert.equal((await systemHealthAdapter.backupEvidence(backupEvidencePath)).cleanDestinationVerified,true);
   await writeFile(keyPath,"short");
