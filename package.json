@@ -23,6 +23,7 @@
     "dev": "node tools/dev.mjs",
     "test:snapshot": "node --test test/snapshot/*.test.ts",
     "test:conformance": "node --test test/conformance/*.test.ts test/conformance/*.test.mjs",
+    "smoke:cloudflare": "node tools/cloudflare-smoke.mjs",
     "test:rehearsal": "node --test test/e2e/rehearsal/*.test.ts",
     "test:live": "node --test test/e2e/live/*.test.ts",
     "privacy": "node tools/privacy/scan.mjs --worktree",
@@ -34,6 +35,7 @@
     "@types/node": "24.13.3",
     "@types/react": "19.1.17",
     "@types/react-dom": "19.1.11",
+    "esbuild": "0.28.2",
     "miniflare": "3.20250718.3",
     "typescript": "5.9.3"
   },

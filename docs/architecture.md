@@ -26,7 +26,7 @@ The D1 adapter is tested through Miniflare's programmatic `getD1Database` API, s
 
 The shared first-loop storage proof covers participant ballot replacement. Additional suites now exercise encrypted snapshots and archives, rehearsal coordination repositories, live authority and offline replay, and the Worker entrypoint. These remain separate contracts rather than an expanded ballot-kernel interface.
 
-Node/SQLite is the complete implemented application runtime. The Cloudflare adapter is deliberately experimental: it serves D1-backed discovery, ballot replacement, live commands, and Durable Object authority transitions, but it does not yet issue participant sessions or expose the Node runtime's proposal, draft-setlist, staffing, and rehearsal endpoints. Its asynchronous D1 coordination repository is conformance-tested but is not yet wired to an asynchronous rehearsal application service. These limitations block presenting Cloudflare as a complete deploy target.
+Node/SQLite is the complete implemented application runtime. The Cloudflare adapter is deliberately experimental: it serves D1-backed discovery, public accountless sessions, ranked ballot read/write, proposals, logout, live commands, and Durable Object authority transitions. It does not yet expose the Node runtime's invite exchange, account claiming, draft-setlist, staffing, and rehearsal endpoints. Its asynchronous D1 coordination repository is conformance-tested but is not yet wired to an asynchronous rehearsal application service. These limitations block presenting Cloudflare as a complete deploy target.
 
 ## Operational design rules
 
