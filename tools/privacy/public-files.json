@@ -141,6 +141,7 @@
     "docs/operations/archive-portability.md",
     "docs/operations/recovery.md",
     "docs/residual-review-findings/first-public-foundation.md",
+    "docs/dogfood-reports/2026-08-09-dogfood-clean-install-dogfood.md",
     "packages/archive/package.json",
     "packages/archive/src/index.ts",
     "packages/archive/src/operations.ts",

@@ -35,6 +35,7 @@ nav { display: flex; gap: 1rem; }
 nav a { color: white; padding: .55rem .2rem; text-underline-offset: .4rem; }
 
 main { display: grid; grid-template-columns: minmax(230px, 290px) minmax(0, 850px); gap: 2rem; max-width: 1200px; margin: 0 auto; padding: 2rem; }
+.demo-notice { display: flex; gap: .5rem; justify-content: center; background: #fff0c9; color: #5f4309; border-bottom: 1px solid #d8b96e; padding: .65rem 1rem; font-size: .9rem; }
 aside { border-right: 1px solid var(--line); padding-right: 1.5rem; }
 h1, h2 { font-family: Georgia, serif; margin: .15rem 0 .65rem; line-height: 1.1; }
 h3 { font-family: Georgia, serif; font-size: 1.55rem; margin: .15rem 0 .7rem; }
@@ -99,6 +100,8 @@ dl { margin: .3rem 0 0; }
   .brand small { max-width: 12rem; }
   nav a:last-child { display: none; }
   main { display: block; padding: 1rem; }
+  .demo-notice { display: block; }
+  .demo-notice span { display: block; }
   aside { border: 0; border-bottom: 1px solid var(--line); padding: 0 0 1rem; }
   .event-list { grid-template-columns: 1fr 1fr; }
   .focus-card { grid-template-columns: 1fr; }
