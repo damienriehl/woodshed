@@ -6,6 +6,7 @@ import { CoordinationError, CoordinationService } from "../../../packages/applic
 
 type Variables = { sessionId: string };
 const SESSION_COOKIE = "woodshed_session";
+const sessionCookie = (eventId: string) => `${SESSION_COOKIE}_${eventId}`;
 const sessionCookieOptions = (origin: string) => ({ httpOnly: true, sameSite: "Lax", secure: origin.startsWith("https://"), path: "/", maxAge: 86_400 } as const);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const ERROR_STATUS = {
@@ -44,15 +45,15 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
   app.get("/api/session/exchange", (context) => {
     const capability = context.req.query("capability"); if (!capability) throw new ChoiceError("invalid-capability");
     const session = service.exchangeInvite(capability);
-    setCookie(context, SESSION_COOKIE, session.id, cookieOptions);
+    setCookie(context, sessionCookie(session.eventId), session.id, cookieOptions);
     return context.redirect(`/events/${session.eventId}`, 303);
   });
   app.post("/api/events/:eventId/join-open", (context) => {
     const entry = service.eventEntry(context.req.param("eventId"), null); if (entry.outcome !== "eligible-open") throw new ChoiceError("denied");
-    const session = service.openPublicSession(context.req.param("eventId")); setCookie(context,SESSION_COOKIE,session.id,cookieOptions); return context.json({assurance:session.assurance});
+    const eventId=context.req.param("eventId");const session = service.openPublicSession(eventId); setCookie(context,sessionCookie(eventId),session.id,cookieOptions); return context.json({assurance:session.assurance});
   });
   app.use("/api/events/:eventId/*", async (context, next) => {
-    const sessionId=getCookie(context,SESSION_COOKIE);if(!sessionId)throw new ChoiceError("unauthorized");service.assertEvent(sessionId,context.req.param("eventId"));context.set("sessionId",sessionId);
+    const eventId=context.req.param("eventId");const cookies=getCookie(context);const sessionId=cookies[sessionCookie(eventId)]??cookies[SESSION_COOKIE]??Object.entries(cookies).find(([name])=>name.startsWith(`${SESSION_COOKIE}_`))?.[1];if(!sessionId)throw new ChoiceError("unauthorized");service.assertEvent(sessionId,eventId);context.set("sessionId",sessionId);
     await next();
   });
   app.get("/api/events/:eventId/ballot", (context) => context.json(service.getBallot(context.get("sessionId"))));
@@ -73,6 +74,6 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
   app.post("/api/events/:eventId/rehearsal-polls/:pollId/close",async context=>{const body=await context.req.json<Record<string,unknown>>();return context.json(coordination.closePoll(coordinationCommand(context.get("sessionId"),body),context.req.param("pollId")));});
   app.post("/api/events/:eventId/rehearsal-polls/:pollId/reopen",async context=>{const body=await context.req.json<Record<string,unknown>>();return context.json(coordination.reopenPoll(coordinationCommand(context.get("sessionId"),body),context.req.param("pollId")));});
   app.post("/api/events/:eventId/rehearsals",async context=>{const body=await context.req.json<Record<string,unknown>>();if(typeof body.pollId!=="string"||typeof body.slotId!=="string"||!Array.isArray(body.agenda)||!body.agenda.every(value=>typeof value==="string"))throw new CoordinationError("invalid-request");return context.json(coordination.publishSession(coordinationCommand(context.get("sessionId"),body),{pollId:body.pollId,slotId:body.slotId,agenda:body.agenda as string[]}),201);});
-  app.post("/api/logout", (context) => { deleteCookie(context,SESSION_COOKIE,{path:"/"}); return context.body(null,204); });
+  app.post("/api/logout", (context) => { for(const name of Object.keys(getCookie(context)))if(name===SESSION_COOKIE||name.startsWith(`${SESSION_COOKIE}_`))deleteCookie(context,name,{path:"/"}); return context.body(null,204); });
   return app;
 }

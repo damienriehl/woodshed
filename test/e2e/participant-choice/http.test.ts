@@ -55,6 +55,26 @@ test("invite redirect can load its authorized unlisted event context", async () 
   service.close();
 });
 
+test("event-scoped cookies resume the original ballot after switching away and back", async () => {
+  const service = new ChoiceService(":memory:"); service.migrate(); service.seedDemo({ publicParticipationPolicy: "open" });
+  const secondEvent = { id:"event_second",communityId:"community_demo",name:"Second Event",state:"voting",visibility:"public",participationPolicy:"open",proposalPolicy:"editorial" } as const;
+  service.createEvent(secondEvent);
+  const app = createApi(service, { origin: "https://woodshed.example" });
+  const cookies = new Map<string,string>();
+  const request = async (path:string, init:RequestInit={}) => {
+    const headers=new Headers(init.headers);headers.set("origin","https://woodshed.example");headers.set("x-csrf-token","same-origin");headers.set("cookie",[...cookies].map(([name,value])=>`${name}=${value}`).join("; "));
+    const response=await app.request(path,{...init,headers});const set=response.headers.get("set-cookie")?.split(";",1)[0]?.split("=");if(set?.[0]&&set[1])cookies.set(set[0],set[1]);return response;
+  };
+  await request("/api/events/event_public/join-open",{method:"POST"});
+  const first=await (await request("/api/events/event_public/ballot")).json() as {revision:number;candidates:{id:string}[]};
+  await request("/api/events/event_public/ballot",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({expectedRevision:first.revision,rankings:first.candidates.map(({id})=>id),operationId:"operation_first_event"})});
+  await request("/api/events/event_second/join-open",{method:"POST"});
+  const resumed=await (await request("/api/events/event_public/ballot")).json() as {revision:number};
+  assert.equal(resumed.revision,first.revision+1);
+  assert.equal(cookies.size,2);
+  service.close();
+});
+
 test("browser client joins, persists a ranked ballot and proposal, then reloads them through HTTP", async () => {
   const origin = "http://127.0.0.1:5173";
   const service = new ChoiceService(":memory:"); service.migrate(); service.seedDemo({ publicParticipationPolicy: "open" });
