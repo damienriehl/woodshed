@@ -16,6 +16,7 @@ export type WoodshedApi = {
   activeEvents(): Promise<{ events: DiscoveredEvent[] }>;
   eventContext(eventId: string): Promise<{ event: DiscoveredEvent }>;
   joinOpen(eventId: string): Promise<{ assurance: "open-public" }>;
+  recover(eventId:string):Promise<{assurance:"open-public"|"invite"}>;
   ballot(eventId: string): Promise<Ballot>;
   saveBallot(eventId: string, input: { expectedRevision: number; rankings: string[]; operationId: string }): Promise<SavedBallot>;
   propose(eventId: string, input: { title: string; operationId: string }): Promise<Proposal>;
@@ -56,6 +57,7 @@ export function createWoodshedApi(fetcher: typeof fetch = fetch, options: { time
     activeEvents: () => request("/api/session/events"),
     eventContext: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/context`),
     joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await request<{assurance:"open-public"}>(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})});joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError&&error.status<500)joinRetries.delete(eventId);throw error;} },
+    recover:(eventId)=>request(`/api/events/${encodeURIComponent(eventId)}/recover`,{method:"POST",headers:mutationHeaders,body:"{}"}),
     ballot: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`),
     saveBallot: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) }),
     propose: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/proposals`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(input) }),
