@@ -9,6 +9,7 @@ import { Miniflare } from "miniflare";
 
 import worker, { type WorkerBindings } from "../../apps/api-worker/src/index.ts";
 import { LiveCoordinator } from "../../apps/api-worker/src/live-do.ts";
+import { D1ChoiceRuntime } from "../../packages/storage-d1/src/choice-runtime.ts";
 
 const origin = "https://woodshed.example";
 const liveSecret = "test-live-command-secret";
@@ -124,6 +125,8 @@ describe("Cloudflare Worker runtime", () => {
     } finally { await fixture.close(); }
   });
 
+  it("rejects a ballot when voting closes after the preflight check but before the atomic write",async()=>{const fixture=await runtime();try{const choice=new D1ChoiceRuntime(fixture.DB,()=>new Date("2030-01-01T12:01:00.000Z"),async()=>{await fixture.DB.prepare("UPDATE events SET state='completed' WHERE id='event_public'").run();}),session=await choice.session(sessionToken);await assert.rejects(()=>choice.replaceBallot(session,{expectedRevision:0,rankings:["song_alpha","song_bravo"],operationId:"operation_close_race"}),(error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="voting-closed");assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM ballot_versions WHERE operation_id='operation_close_race'").first<{count:number}>())?.count,0);assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM idempotency_receipts WHERE operation_id='operation_close_race'").first<{count:number}>())?.count,0);}finally{await fixture.close();}});
+
   it("persists authenticated live commands, history, state, and confirmed authority handoff", async () => {
     const fixture = await runtime();
     try {
@@ -224,7 +227,7 @@ async function runtime() {
     d1Databases: { DB: "woodshed-worker" }, d1Persist: persist,
   });
   const DB = await miniflare.getD1Database("DB");
-  for (const name of ["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"]) {
+  for (const name of ["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql", "008_ballot_lifecycle_guard.sql"]) {
     await DB.exec(await readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8"));
   }
   await DB.batch([

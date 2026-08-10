@@ -100,6 +100,7 @@
     "migrations/d1/006_worker_runtime.sql",
     "migrations/d1/007_open_join_receipts.sql",
     "migrations/d1/007_participation_recovery.sql",
+    "migrations/d1/008_ballot_lifecycle_guard.sql",
     "migrations/sqlite/003_participant_choice.sql",
     "migrations/sqlite/004_rehearsal_coordination.sql",
     "migrations/sqlite/005_live_performance.sql",

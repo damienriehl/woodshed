@@ -20,7 +20,8 @@ export async function webSha256(value: string) { return hex(await crypto.subtle.
 export class D1ChoiceRuntime {
   private readonly database:D1Database;
   private readonly now:()=>Date;
-  constructor(database: D1Database, now: () => Date = () => new Date()) {this.database=database;this.now=now;}
+  private readonly beforeBallotMutation:()=>Promise<void>;
+  constructor(database: D1Database, now: () => Date = () => new Date(), beforeBallotMutation:()=>Promise<void>=async()=>{}) {this.database=database;this.now=now;this.beforeBallotMutation=beforeBallotMutation;}
 
   async discoverEvents() {
     const rows = await this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE visibility='public' AND state <> 'draft' ORDER BY name").all();
@@ -61,6 +62,7 @@ export class D1ChoiceRuntime {
       communityId: session.communityId, eventId: session.eventId, actorId: session.participationId, capability: "ballot:replace",
       operationId: body.operationId, expectedRevision: body.expectedRevision, issuedAt: new Date(now.getTime() - 1_000).toISOString(), expiresAt: new Date(now.getTime() + 300_000).toISOString(),
     };
+    await this.beforeBallotMutation();
     return new D1Kernel(this.database, []).replaceBallot(envelope, body.rankings as string[], now);
   }
 
