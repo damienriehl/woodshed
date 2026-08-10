@@ -13,6 +13,7 @@ export type Proposal = { id: string; title: string; state: "submitted" | "eligib
 
 export type WoodshedApi = {
   discover(): Promise<{ events: DiscoveredEvent[] }>;
+  eventContext(eventId: string): Promise<{ event: DiscoveredEvent }>;
   joinOpen(eventId: string): Promise<{ assurance: "open-public" }>;
   ballot(eventId: string): Promise<Ballot>;
   saveBallot(eventId: string, input: { expectedRevision: number; rankings: string[]; operationId: string }): Promise<SavedBallot>;
@@ -43,6 +44,7 @@ export function createWoodshedApi(fetcher: typeof fetch = fetch): WoodshedApi {
   const request = (path: string, init?: RequestInit) => fetcher(path, { credentials: "same-origin", ...init });
   return {
     discover: () => json(request("/api/discovery")),
+    eventContext: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/context`)),
     joinOpen: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/join-open`, { method: "POST", headers: mutationHeaders })),
     ballot: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`)),
     saveBallot: (eventId, input) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) })),

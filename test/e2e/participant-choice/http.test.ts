@@ -42,6 +42,19 @@ test("loopback HTTP preview joins an open event with a context-appropriate cooki
   service.close();
 });
 
+test("invite redirect can load its authorized unlisted event context", async () => {
+  const service = new ChoiceService(":memory:"); service.migrate(); service.seedDemo();
+  const app = createApi(service, { origin: "https://woodshed.example" });
+  const invite = service.issueInvite("event_unlisted", "participant");
+  const exchanged = await app.request(`/api/session/exchange?capability=${encodeURIComponent(invite.capability)}`);
+  assert.equal(exchanged.headers.get("location"), "/events/event_unlisted");
+  const cookie = (exchanged.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+  const response = await app.request("/api/events/event_unlisted/context", { headers: { cookie } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { event: { id:"event_unlisted",name:"Band Workshop",state:"published",visibility:"unlisted",participationPolicy:"invite" } });
+  service.close();
+});
+
 test("browser client joins, persists a ranked ballot and proposal, then reloads them through HTTP", async () => {
   const origin = "http://127.0.0.1:5173";
   const service = new ChoiceService(":memory:"); service.migrate(); service.seedDemo({ publicParticipationPolicy: "open" });

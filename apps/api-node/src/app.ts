@@ -56,6 +56,7 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
     await next();
   });
   app.get("/api/events/:eventId/ballot", (context) => context.json(service.getBallot(context.get("sessionId"))));
+  app.get("/api/events/:eventId/context", (context) => context.json({event:service.eventContext(context.get("sessionId"))}));
   app.put("/api/events/:eventId/ballot", async (context) => { const body=await context.req.json<{expectedRevision:number;rankings:string[];operationId:string}>(); return context.json(service.replaceBallot(context.get("sessionId"),body.expectedRevision,body.rankings,body.operationId)); });
   app.post("/api/events/:eventId/proposals", async (context) => { const body=await context.req.json<{title:string;operationId:string}>(); return context.json(service.propose(context.get("sessionId"),body.title,body.operationId),201); });
   app.get("/api/events/:eventId/draft", (context) => context.json(service.draft(context.req.param("eventId"))));

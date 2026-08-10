@@ -110,6 +110,7 @@ export class ChoiceService {
     return {id,participationId:String(row.participation_id),communityId:String(row.community_id),eventId:String(row.event_id),role:String(row.role),assurance:row.assurance as Session["assurance"]};
   }
   assertEvent(sessionId:string,eventId:string){const session=this.session(sessionId);if(session.eventId!==eventId)throw new ChoiceError("denied");return session;}
+  eventContext(sessionId:string){const session=this.session(sessionId);const event=this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE id=? AND community_id=?").get(session.eventId,session.communityId);if(!event)throw new ChoiceError("not-found");return event;}
   getBallot(sessionId:string){
     const s=this.session(sessionId), prior=this.database.prepare("SELECT candidate_order_json,rankings_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;rankings_json:string;current_revision:number}|undefined;
     const ids=(this.database.prepare("SELECT song_id FROM event_eligible_songs WHERE event_id=? ORDER BY added_at,song_id").all(s.eventId) as {song_id:string}[]).map(r=>r.song_id);
