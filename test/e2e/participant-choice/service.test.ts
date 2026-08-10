@@ -53,6 +53,15 @@ test("invite capability is hashed, single-exchange, expirable and revocable", ()
   app.close();
 });
 
+test("routine session expiry recovers the same open-event participation", () => {
+  let now=new Date("2026-01-02T12:00:00Z");const app=new ChoiceService(":memory:",{now:()=>now});app.migrate();app.seedDemo({publicParticipationPolicy:"open"});
+  const first=app.openPublicSession("event_public","join_before_expiry"),ballot=app.getBallot(first.id),rankings=ballot.candidates.map(({id})=>id);
+  app.replaceBallot(first.id,ballot.revision,rankings,"operation_before_expiry");now=new Date("2026-01-04T12:00:00Z");
+  assert.throws(()=>app.getBallot(first.id),(error:unknown)=>error instanceof ChoiceError&&error.code==="unauthorized");
+  assert.ok("recoveryCapability" in first);const recovered=app.recoverPublicSession("event_public",first.recoveryCapability);
+  assert.equal(recovered.participationId,first.participationId);assert.equal(app.getBallot(recovered.id).revision,1);app.close();
+});
+
 test("ballot CAS, replay, append, close/reopen, removal and secrecy", () => {
   const app = service();
   const session = app.openPublicSession("event_public","join_ballot");

@@ -13,6 +13,7 @@ export type Proposal = { id: string; title: string; state: "submitted" | "eligib
 
 export type WoodshedApi = {
   discover(): Promise<{ events: DiscoveredEvent[] }>;
+  activeEvents(): Promise<{ events: DiscoveredEvent[] }>;
   eventContext(eventId: string): Promise<{ event: DiscoveredEvent }>;
   joinOpen(eventId: string): Promise<{ assurance: "open-public" }>;
   ballot(eventId: string): Promise<Ballot>;
@@ -52,6 +53,7 @@ export function createWoodshedApi(fetcher: typeof fetch = fetch, options: { time
   };
   return {
     discover: () => request("/api/discovery"),
+    activeEvents: () => request("/api/session/events"),
     eventContext: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/context`),
     joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await request<{assurance:"open-public"}>(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})});joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError&&error.status<500)joinRetries.delete(eventId);throw error;} },
     ballot: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`),

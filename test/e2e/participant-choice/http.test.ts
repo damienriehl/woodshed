@@ -56,6 +56,8 @@ test("invite redirect can load its authorized unlisted event context", async () 
   const response = await app.request("/api/events/event_unlisted/context", { headers: { cookie } });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { event: { id:"event_unlisted",name:"Band Workshop",state:"published",visibility:"unlisted",participationPolicy:"invite" } });
+  const active = await app.request("/api/session/events", { headers: { cookie } });
+  assert.deepEqual(await active.json(), { events: [{ id:"event_unlisted",name:"Band Workshop",state:"published",visibility:"unlisted",participationPolicy:"invite" }] });
   service.close();
 });
 
