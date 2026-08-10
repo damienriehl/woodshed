@@ -1,11 +1,20 @@
 import { serve } from "@hono/node-server";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { createApi } from "./app.ts";
 import { ChoiceService } from "../../../packages/application/src/choice-service.ts";
 import { CoordinationService } from "../../../packages/application/src/coordination-service.ts";
 import { SqliteCoordinationRepository } from "../../../packages/storage-sqlite/src/coordination-repository.ts";
 
-const service = new ChoiceService(process.env.WOODSHED_DB ?? "woodshed.sqlite");
+const demo = process.argv.includes("--demo");
+const devInstance = process.env.WOODSHED_DEV_INSTANCE ?? createHash("sha256").update(process.cwd()).digest("hex").slice(0,12);
+const databasePath = process.env.WOODSHED_DB ?? (demo ? path.join(tmpdir(),`woodshed-public-demo-${devInstance}.sqlite`) : "woodshed.sqlite");
+const service = new ChoiceService(databasePath);
 service.migrate();
+if (demo) service.seedDemo({ publicParticipationPolicy: "open" });
 const coordination = new CoordinationService({repository:new SqliteCoordinationRepository(service.database)});
 const port = Number(process.env.PORT ?? 3000);
-serve({ fetch: createApi(service,{origin:process.env.WOODSHED_ORIGIN ?? `http://127.0.0.1:${port}`,coordination}).fetch, port });
+const origin = process.env.WOODSHED_ORIGIN ?? (demo ? "http://127.0.0.1:5173" : `http://127.0.0.1:${port}`);
+const server = serve({ fetch: createApi(service,{origin,coordination}).fetch, port });
+server.on("listening", () => console.log(`Woodshed API listening on http://127.0.0.1:${port}${demo ? ` with synthetic demo data at ${databasePath}` : ""}`));

@@ -6,7 +6,7 @@ import { CoordinationError, CoordinationService } from "../../../packages/applic
 
 type Variables = { sessionId: string };
 const SESSION_COOKIE = "woodshed_session";
-const SESSION_COOKIE_OPTIONS = { httpOnly: true, sameSite: "Lax", secure: true, path: "/", maxAge: 86_400 } as const;
+const sessionCookieOptions = (origin: string) => ({ httpOnly: true, sameSite: "Lax", secure: origin.startsWith("https://"), path: "/", maxAge: 86_400 } as const);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const ERROR_STATUS = {
   unauthorized: 401,
@@ -18,6 +18,7 @@ const ERROR_STATUS = {
 export function createApi(service: ChoiceService, options: { origin: string; coordination?: CoordinationService }) {
   const app = new Hono<{ Variables: Variables }>();
   const coordination=options.coordination??new CoordinationService();
+  const cookieOptions=sessionCookieOptions(options.origin);
   app.use("*", async (context, next) => {
     context.header("Referrer-Policy", "no-referrer");
     context.header("X-Content-Type-Options", "nosniff");
@@ -32,22 +33,26 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
     }
     return context.json({ error: "internal-error" }, 500);
   });
+  app.use("/api/*", async (context, next) => {
+    if (!SAFE_METHODS.has(context.req.method) &&
+        (context.req.header("origin") !== options.origin || context.req.header("x-csrf-token") !== "same-origin")) {
+      throw new ChoiceError("denied");
+    }
+    await next();
+  });
   app.get("/api/discovery", (context) => context.json({ events: service.discoverEvents() }));
   app.get("/api/session/exchange", (context) => {
     const capability = context.req.query("capability"); if (!capability) throw new ChoiceError("invalid-capability");
     const session = service.exchangeInvite(capability);
-    setCookie(context, SESSION_COOKIE, session.id, SESSION_COOKIE_OPTIONS);
+    setCookie(context, SESSION_COOKIE, session.id, cookieOptions);
     return context.redirect(`/events/${session.eventId}`, 303);
   });
   app.post("/api/events/:eventId/join-open", (context) => {
     const entry = service.eventEntry(context.req.param("eventId"), null); if (entry.outcome !== "eligible-open") throw new ChoiceError("denied");
-    const session = service.openPublicSession(context.req.param("eventId")); setCookie(context,SESSION_COOKIE,session.id,SESSION_COOKIE_OPTIONS); return context.json({assurance:session.assurance});
+    const session = service.openPublicSession(context.req.param("eventId")); setCookie(context,SESSION_COOKIE,session.id,cookieOptions); return context.json({assurance:session.assurance});
   });
   app.use("/api/events/:eventId/*", async (context, next) => {
     const sessionId=getCookie(context,SESSION_COOKIE);if(!sessionId)throw new ChoiceError("unauthorized");service.assertEvent(sessionId,context.req.param("eventId"));context.set("sessionId",sessionId);
-    if (!SAFE_METHODS.has(context.req.method)) {
-      if(context.req.header("origin")!==options.origin||context.req.header("x-csrf-token")!=="same-origin")throw new ChoiceError("denied");
-    }
     await next();
   });
   app.get("/api/events/:eventId/ballot", (context) => context.json(service.getBallot(context.get("sessionId"))));

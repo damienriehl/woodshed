@@ -29,7 +29,7 @@ const snapshot = (watermark = "0002") => {
 
 test("encrypted snapshot imports atomically and duplicate is idempotent", async () => {
   const store = new InMemorySnapshotStore();
-  const importer = new SnapshotImporter(store);
+  const importer = new SnapshotImporter(store,()=>now);
   const envelope = createEnvelope(snapshot(), { recipientPublicKey: keys.publicKey, destinationCommunityId: destination, now });
   const result = await importer.import(openEnvelope(envelope, { recipientPrivateKey: keys.privateKey, expectedDestinationCommunityId: destination, now }));
   assert.equal(result.status, "committed");
@@ -55,7 +55,7 @@ test("rejects tamper, wrong recipient/destination, expiry and truncation", () =>
 });
 
 test("rejects older, unknown/delta, missing parents; crash is invisible and retryable", async () => {
-  const store = new InMemorySnapshotStore(); const importer = new SnapshotImporter(store);
+  const store = new InMemorySnapshotStore(); const importer = new SnapshotImporter(store,()=>now);
   await importer.import(snapshot("0002"));
   await assert.rejects(importer.import(snapshot("0001")), /older/);
   await assert.rejects(importer.import({ ...snapshot("0003"), schemaVersion: 2 as 1 }), /schema/);
@@ -71,7 +71,7 @@ test("rejects older, unknown/delta, missing parents; crash is invisible and retr
 
 test("validates required hashes, unique IDs, dates, expiry, and numeric watermark ordering", async () => {
   const store = new InMemorySnapshotStore();
-  const importer = new SnapshotImporter(store);
+  const importer = new SnapshotImporter(store,()=>now);
   await importer.import(snapshot("2"), now);
   assert.equal((await importer.import(snapshot("10"), now)).status, "committed");
 

@@ -38,18 +38,32 @@ export class ChoiceService {
       this.database.exec("BEGIN IMMEDIATE");try{this.database.exec(sql);this.database.prepare("INSERT INTO schema_migrations(name,checksum,applied_at) VALUES (?,?,?)").run(name,checksum,new Date(0).toISOString());this.database.exec("COMMIT");}catch(error){this.database.exec("ROLLBACK");throw error;}
     }
   }
-  seedDemo() {
-    this.database.exec(`
+  seedDemo(options: { publicParticipationPolicy?: "invite" | "open" } = {}) {
+    const existing = this.database.prepare("SELECT id FROM communities WHERE id='community_demo'").get();
+    if (existing) {
+      if (options.publicParticipationPolicy) {
+        const changed=this.database.prepare("UPDATE events SET participation_policy=? WHERE id='event_public' AND community_id='community_demo'").run(options.publicParticipationPolicy);
+        if(changed.changes!==1)throw new ChoiceError("invalid-demo-dataset");
+      }
+      return;
+    }
+    const communityCount = Number((this.database.prepare("SELECT count(*) AS count FROM communities").get() as { count: number }).count);
+    if (communityCount !== 0) throw new ChoiceError("demo-seed-requires-empty-database");
+    this.database.exec("BEGIN IMMEDIATE");
+    try { this.database.exec(`
       INSERT INTO communities(id,name) VALUES ('community_demo','River City Music Circle'),('community_other','Other Community');
       INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES
         ('event_public','community_demo','Summer Singalong','voting','public','invite'),
         ('event_unlisted','community_demo','Band Workshop','published','unlisted','invite'),
         ('event_private','community_demo','Private Rehearsal','draft','private','invite'),
-        ('event_other','community_other','Other Event','voting','public','open');
+        ('event_other','community_other','Other Event','voting','private','open');
       INSERT INTO canonical_songs(id,community_id,title) VALUES ('song_alpha','community_demo','North Star'),('song_bravo','community_demo','Open Road'),('song_charlie','community_demo','Quiet River');
       INSERT INTO event_eligible_songs(event_id,song_id,added_at) VALUES ('event_public','song_alpha','2026-01-01T00:00:00Z'),('event_public','song_bravo','2026-01-01T00:00:00Z');
       INSERT INTO event_song_decisions(id,community_id,event_id,song_id,revision,snapshot_json,created_at) VALUES ('decision_alpha','community_demo','event_public','song_alpha',1,'{"title":"North Star"}','2026-01-01T00:00:00Z'),('decision_bravo','community_demo','event_public','song_bravo',1,'{"title":"Open Road"}','2026-01-01T00:00:00Z');
     `);
+      if (options.publicParticipationPolicy === "open") this.database.prepare("UPDATE events SET participation_policy='open' WHERE id='event_public'").run();
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
   discoverEvents() { return this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE visibility='public' AND state <> 'draft' ORDER BY name").all(); }
   eventEntry(eventId: string, capability: string | null) {
@@ -97,9 +111,10 @@ export class ChoiceService {
   }
   assertEvent(sessionId:string,eventId:string){const session=this.session(sessionId);if(session.eventId!==eventId)throw new ChoiceError("denied");return session;}
   getBallot(sessionId:string){
-    const s=this.session(sessionId), prior=this.database.prepare("SELECT candidate_order_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;current_revision:number}|undefined;
+    const s=this.session(sessionId), prior=this.database.prepare("SELECT candidate_order_json,rankings_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;rankings_json:string;current_revision:number}|undefined;
     const ids=(this.database.prepare("SELECT song_id FROM event_eligible_songs WHERE event_id=? ORDER BY added_at,song_id").all(s.eventId) as {song_id:string}[]).map(r=>r.song_id);
-    const order=stableCandidateOrder(s.participationId,ids,prior?JSON.parse(prior.candidate_order_json):[]);
+    const priorOrder=prior?JSON.parse(prior.current_revision>0?prior.rankings_json:prior.candidate_order_json) as string[]:[];
+    const order=stableCandidateOrder(s.participationId,ids,priorOrder);
     const serializedOrder=JSON.stringify(order);
     if(prior && prior.candidate_order_json!==serializedOrder)this.database.prepare("UPDATE participant_ballots SET candidate_order_json=? WHERE participation_id=?").run(serializedOrder,s.participationId);
     else if(!prior)this.database.prepare("INSERT INTO participant_ballots(participation_id,event_id,current_revision,state,candidate_order_json) VALUES (?,?,0,'open',?)").run(s.participationId,s.eventId,serializedOrder);

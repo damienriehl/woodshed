@@ -14,6 +14,18 @@ test("discovery keeps visibility separate from eligibility", () => {
   app.close();
 });
 
+test("development bootstrap is idempotent and can expose an open synthetic event", () => {
+  const app = new ChoiceService(":memory:", { now: () => new Date("2026-01-02T12:00:00Z") });
+  app.migrate();
+  app.seedDemo();
+  assert.equal(app.eventEntry("event_public", null).outcome, "discoverable-ineligible");
+  app.seedDemo({ publicParticipationPolicy: "open" });
+  app.seedDemo({ publicParticipationPolicy: "open" });
+  assert.equal(app.eventEntry("event_public", null).outcome, "eligible-open");
+  assert.deepEqual(app.discoverEvents().map((event) => event.id), ["event_public"]);
+  app.close();
+});
+
 test("invite capability is hashed, single-exchange, expirable and revocable", () => {
   const app = service();
   const issued = app.issueInvite("event_public", "participant");
@@ -32,13 +44,15 @@ test("ballot CAS, replay, append, close/reopen, removal and secrecy", () => {
   const app = service();
   const session = app.openPublicSession("event_public");
   const ballot = app.getBallot(session.id);
+  const rankings = ballot.candidates.map((candidate) => candidate.id).reverse();
   const operationId = "operation_first";
-  const saved = app.replaceBallot(session.id, ballot.revision, ballot.candidates.map((candidate) => candidate.id), operationId);
+  const saved = app.replaceBallot(session.id, ballot.revision, rankings, operationId);
   assert.equal(saved.revision, 1);
-  assert.deepEqual(app.replaceBallot(session.id, 0, ballot.candidates.map((candidate) => candidate.id), operationId), saved);
-  assert.throws(() => app.replaceBallot(session.id, 0, ballot.candidates.map((candidate) => candidate.id), "operation_stale"), (error: unknown) => error instanceof ChoiceError && error.code === "conflict");
+  assert.deepEqual(app.replaceBallot(session.id, 0, rankings, operationId), saved);
+  assert.throws(() => app.replaceBallot(session.id, 0, rankings, "operation_stale"), (error: unknown) => error instanceof ChoiceError && error.code === "conflict");
+  assert.deepEqual(app.getBallot(session.id).candidates.map((candidate) => candidate.id), rankings);
   app.addEligibleSong("event_public", "song_charlie");
-  assert.deepEqual(app.getBallot(session.id).candidates.slice(0, -1), ballot.candidates);
+  assert.deepEqual(app.getBallot(session.id).candidates.slice(0, -1).map((candidate) => candidate.id), rankings);
   app.setVotingState("event_public", "closed");
   assert.throws(() => app.replaceBallot(session.id, 1, [], "operation_late"), (error: unknown) => error instanceof ChoiceError && error.code === "voting-closed");
   app.setVotingState("event_public", "reopened");

@@ -8,7 +8,7 @@ New events use ranked choice. Imported flat ballots retain their original interp
 
 `draft-setlist/v1` separates participant demand from feasibility, distinguishes unknown feasibility from zero, records its version, weights, seed, and input fingerprint, and preserves organizer override reasons.
 
-Run the Node API with `npm run dev -w @woodshed/api-node` and the responsive React preview with `npm run dev`.
+Run `npm run dev` to start the Node/SQLite API with synthetic demo data and the responsive React preview together. The browser reuses an existing scoped guest session before creating a new open-public participation, so ballot revisions and rankings survive reload. Rehearsal and live controls remain explicitly synthetic until their browser/API slices ship.
 
 ## Visual reference
 
@@ -16,3 +16,5 @@ The checked-in references use invented community, event, and song data. They pre
 
 - [Desktop participant-choice reference](visual-reference/participant-choice-desktop.png)
 - [Mobile participant-choice reference](visual-reference/participant-choice-mobile.png)
+- [Desktop API-backed onboarding reference](visual-reference/api-backed-onboarding-desktop.png)
+- [Mobile API-backed onboarding reference](visual-reference/api-backed-onboarding-mobile.png)

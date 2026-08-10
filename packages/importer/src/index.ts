@@ -10,6 +10,7 @@ export class InMemorySnapshotStore {
 }
 export class SnapshotImporter {
   private readonly store:InMemorySnapshotStore;
-  constructor(store:InMemorySnapshotStore){this.store=store;}
-  async import(value:unknown,now=new Date()){const s=parseNeutralSnapshot(value);if(Date.parse(s.expiresAt)<=now.getTime())throw new Error("snapshot expired");const active=this.store.active(s.destinationCommunityId);if(active?.snapshotId===s.snapshotId)return {status:"duplicate" as const};if(active&&BigInt(s.endWatermark)<=BigInt(active.watermark))throw new Error("older snapshot rejected");this.store.stage(s);this.store.commit(s);return {status:"committed" as const};}
+  private readonly now:()=>Date;
+  constructor(store:InMemorySnapshotStore,now=()=>new Date()){this.store=store;this.now=now;}
+  async import(value:unknown,now=this.now()){const s=parseNeutralSnapshot(value);if(Date.parse(s.expiresAt)<=now.getTime())throw new Error("snapshot expired");const active=this.store.active(s.destinationCommunityId);if(active?.snapshotId===s.snapshotId)return {status:"duplicate" as const};if(active&&BigInt(s.endWatermark)<=BigInt(active.watermark))throw new Error("older snapshot rejected");this.store.stage(s,now);this.store.commit(s);return {status:"committed" as const};}
 }
