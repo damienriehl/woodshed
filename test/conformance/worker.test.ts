@@ -9,12 +9,14 @@ import { Miniflare } from "miniflare";
 
 import worker, { type WorkerBindings } from "../../apps/api-worker/src/index.ts";
 import { LiveCoordinator } from "../../apps/api-worker/src/live-do.ts";
+import { D1ChoiceRuntime } from "../../packages/storage-d1/src/choice-runtime.ts";
 
 const origin = "https://woodshed.example";
 const liveSecret = "test-live-command-secret";
 const sessionToken = "test-organizer-session";
 const sessionHash = createHash("sha256").update(sessionToken).digest("hex");
 const baseMigrationSql = Promise.all(["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"].map(name => readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8")));
+const ballotLifecycleMigrationSql = readFile(new URL("../../migrations/d1/008_ballot_lifecycle_guard.sql", import.meta.url), "utf8");
 const runtimeQuotaMigrationSql = readFile(new URL("../../migrations/d1/008_runtime_quota_indexes.sql", import.meta.url), "utf8");
 
 class MemoryDurableStorage {
@@ -237,6 +239,13 @@ describe("Cloudflare Worker runtime", () => {
       await fixture.DB.prepare("INSERT INTO event_eligible_songs(event_id,song_id,added_at) VALUES (?,?,?)").bind("event_public", "song_charlie", "2030-01-01T12:02:00Z").run();
       assert.deepEqual((await (await fixture.fetch("/api/events/event_public/ballot", { headers: { cookie } })).json() as { candidates: { id: string }[] }).candidates.map(({ id }) => id), [...rankings, "song_charlie"]);
 
+      await fixture.DB.prepare("UPDATE events SET state='completed' WHERE id='event_public'").run();
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: {cookie} })).status,409);
+      const replayAfterClose=await fixture.fetch("/api/events/event_public/ballot",{method:"PUT",headers:fixture.mutationHeaders(cookie),body:JSON.stringify({expectedRevision:0,rankings,operationId:"operation_ballot_one"})});
+      assert.equal(replayAfterClose.status,409);
+      assert.deepEqual(await replayAfterClose.json(),{error:"voting-closed"});
+      await fixture.DB.prepare("UPDATE events SET state='voting' WHERE id='event_public'").run();
+
       const joinedParticipation = await fixture.DB.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").bind("event_public", "join_ballot_roundtrip").first<{ participation_id: string }>();
       await fixture.DB.prepare("UPDATE ballots SET state='closed' WHERE event_id=? AND participation_id=?").bind("event_public", joinedParticipation!.participation_id).run();
       const closed = await fixture.fetch("/api/events/event_public/ballot", { method: "PUT", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ expectedRevision: 1, rankings, operationId: "operation_ballot_closed" }) });
@@ -267,6 +276,8 @@ describe("Cloudflare Worker runtime", () => {
       assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: fixture.authHeaders() })).status, 401);
     } finally { await fixture.close(); }
   });
+
+  it("rejects a ballot when voting closes after the preflight check but before the atomic write",async()=>{const fixture=await runtime();try{const choice=new D1ChoiceRuntime(fixture.DB,()=>new Date("2030-01-01T12:01:00.000Z"),async()=>{await fixture.DB.prepare("UPDATE events SET state='completed' WHERE id='event_public'").run();}),session=await choice.session(sessionToken);await assert.rejects(()=>choice.replaceBallot(session,{expectedRevision:0,rankings:["song_alpha","song_bravo"],operationId:"operation_close_race"}),(error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="voting-closed");assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM ballot_versions WHERE operation_id='operation_close_race'").first<{count:number}>())?.count,0);assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM idempotency_receipts WHERE operation_id='operation_close_race'").first<{count:number}>())?.count,0);}finally{await fixture.close();}});
 
   it("persists authenticated live commands, history, state, and confirmed authority handoff", async () => {
     const fixture = await runtime();
@@ -369,6 +380,7 @@ async function runtime(appOrigin = origin) {
   });
   const DB = await miniflare.getD1Database("DB");
   for (const sql of await baseMigrationSql) await DB.exec(sql);
+  await DB.exec(await ballotLifecycleMigrationSql);
   await DB.batch([
     DB.prepare("INSERT INTO communities(id,name) VALUES (?,?),(?,?)").bind("community_demo", "Demo", "community_other", "Other"),
     DB.prepare("INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES (?,?,?,'live','public','open'),(?,?,?,'live','private','invite'),(?,?,?,'live','private','open'),(?,?,?,'live','unlisted','open')").bind("event_public", "community_demo", "Singalong", "event_other", "community_other", "Other", "event_private_open", "community_demo", "Private Open", "event_unlisted_open", "community_demo", "Unlisted Open"),

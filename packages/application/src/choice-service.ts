@@ -14,7 +14,8 @@ export class ChoiceError extends Error {
 }
 
 export type Session = { id: string; participationId: string; communityId: string; eventId: string; role: string; assurance: "invite" | "open-public" };
-type Options = { now?: () => Date; random?: (bytes: number) => Buffer; maxOpenParticipantsPerEvent?: number };
+export type IssuedSession = Session & { recoveryCapability: string };
+type Options = { now?: () => Date; random?: (bytes: number) => Buffer; maxOpenParticipantsPerEvent?: number; beforeBallotMutation?:()=>void };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const migrations = () => fileURLToPath(new URL("../../../migrations/sqlite/", import.meta.url));
 
@@ -23,6 +24,7 @@ export class ChoiceService {
   private readonly now: () => Date;
   private readonly random: (bytes: number) => Buffer;
   private readonly maxOpenParticipantsPerEvent:number;
+  private readonly beforeBallotMutation:()=>void;
 
   constructor(filename = ":memory:", options: Options = {}) {
     this.database = new DatabaseSync(filename);
@@ -30,6 +32,7 @@ export class ChoiceService {
     this.now = options.now ?? (() => new Date());
     this.random = options.random ?? randomBytes;
     this.maxOpenParticipantsPerEvent=options.maxOpenParticipantsPerEvent??10_000;
+    this.beforeBallotMutation=options.beforeBallotMutation??(()=>{});
   }
   close() { this.database.close(); }
   migrate() {
@@ -68,6 +71,7 @@ export class ChoiceService {
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
   discoverEvents() { return this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE visibility='public' AND state <> 'draft' ORDER BY name").all(); }
+  private assertVotingOpen(eventId:string){const event=this.database.prepare("SELECT state FROM events WHERE id=?").get(eventId) as {state:string}|undefined;if(!event)throw new ChoiceError("not-found");if(!["voting","live"].includes(event.state))throw new ChoiceError("voting-closed");}
   eventEntry(eventId: string, capability: string | null) {
     const event = this.database.prepare("SELECT visibility,participation_policy FROM events WHERE id=?").get(eventId) as { visibility: string; participation_policy: string } | undefined;
     if (!event) return { outcome: "not-found" };
@@ -83,7 +87,7 @@ export class ChoiceService {
   }
   debugCapabilityStored(capability: string) { return Boolean(this.database.prepare("SELECT 1 FROM invite_capabilities WHERE token_hash=?").get(capability)); }
   revokeInvite(id: string) { this.database.prepare("UPDATE invite_capabilities SET revoked_at=? WHERE id=?").run(this.now().toISOString(),id); }
-  exchangeInvite(capability: string): Session {
+  exchangeInvite(capability: string): Session|IssuedSession {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const invite = this.database.prepare("SELECT i.*,e.community_id FROM invite_capabilities i JOIN events e ON e.id=i.event_id WHERE token_hash=?").get(hash(capability)) as Record<string, string | null> | undefined;
@@ -94,44 +98,55 @@ export class ChoiceService {
       this.database.exec("COMMIT"); return session;
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
-  openPublicSession(eventId: string, operationId: string, replaySessionId?: string): Session {
+  openPublicSession(eventId: string, operationId: string, replaySessionId?: string): Session|IssuedSession {
     const event = this.database.prepare("SELECT community_id,participation_policy FROM events WHERE id=?").get(eventId) as {community_id:string;participation_policy:string}|undefined;
     if (!event) throw new ChoiceError("not-found");
-    if (!operationId) throw new ChoiceError("invalid-request");
+    this.assertVotingOpen(eventId);
+    if (!operationId||operationId.length>128) throw new ChoiceError("invalid-request");
     // Synthetic preview permits this seam even when demo policy is invite; HTTP route enforces open policy.
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const receipt=this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").get(eventId,operationId) as {participation_id:string}|undefined;
+      const operationHash=hash(operationId),receipt=this.database.prepare("SELECT operation_id,participation_id,created_at FROM open_join_receipts WHERE event_id=? AND operation_id IN (?,?) ORDER BY operation_id=? DESC LIMIT 1").get(eventId,operationHash,operationId,operationHash) as {operation_id:string;participation_id:string;created_at:string}|undefined;
       if(receipt){
-        let session:Session|undefined;if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}if(!session)throw new ChoiceError("replay-session-required");
+        if(receipt.operation_id!==operationHash)this.database.prepare("UPDATE open_join_receipts SET operation_id=? WHERE event_id=? AND operation_id=?").run(operationHash,eventId,receipt.operation_id);
+        let session:Session|IssuedSession|undefined;if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}if(!session){const receiptAge=this.now().getTime()-Date.parse(receipt.created_at);if(!Number.isFinite(receiptAge)||receiptAge<0||receiptAge>10*60_000)throw new ChoiceError("unauthorized");const participation=this.database.prepare("SELECT p.community_id,p.event_id,p.revoked_at FROM guest_participations p WHERE p.id=?").get(receipt.participation_id) as {community_id:string;event_id:string;revoked_at:string|null}|undefined;if(!participation||participation.revoked_at||participation.event_id!==eventId)throw new ChoiceError("unauthorized");const recoveryCount=Number((this.database.prepare("SELECT count(*) count FROM participation_recovery WHERE participation_id=?").get(receipt.participation_id) as {count:number}).count);if(recoveryCount>=8)throw new ChoiceError("recovery-capacity");const replacement=this.createSessionForParticipation(receipt.participation_id,eventId,participation.community_id,"participant","open-public"),recoveryCapability=this.random(32).toString("base64url"),expiresAt=new Date(this.now().getTime()+30*86_400_000).toISOString();this.database.prepare("INSERT INTO participation_recovery(token_hash,participation_id,community_id,event_id,role,assurance,expires_at,revoked_at) VALUES (?,?,?,?,?,'open-public',?,NULL)").run(hash(recoveryCapability),receipt.participation_id,participation.community_id,eventId,"participant",expiresAt);session={...replacement,recoveryCapability};}
         this.database.exec("COMMIT");
         return session;
       }
       const count=Number((this.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id=? AND revoked_at IS NULL").get(eventId) as {count:number}).count);if(count>=this.maxOpenParticipantsPerEvent)throw new ChoiceError("open-participation-capacity");
       const session=this.createSession(eventId,event.community_id,"participant","open-public");
-      this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationId,session.participationId,this.now().toISOString());
+      this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationHash,session.participationId,this.now().toISOString());
       this.database.exec("COMMIT");
       return session;
     }catch(error){this.database.exec("ROLLBACK");throw error;}
   }
-  private createSession(eventId:string, communityId:string, role:string, assurance:Session["assurance"]): Session {
-    const participationId=`participation_${this.random(12).toString("hex")}`, id=this.random(32).toString("base64url");
+  private createSession(eventId:string, communityId:string, role:string, assurance:Session["assurance"]): Session|IssuedSession {
+    const participationId=`participation_${this.random(12).toString("hex")}`, id=this.random(32).toString("base64url"),recoveryCapability=this.random(32).toString("base64url");
     this.database.prepare("INSERT INTO guest_participations(id,community_id,event_id) VALUES (?,?,?)").run(participationId,communityId,eventId);
-    return this.createSessionForParticipation(participationId,eventId,communityId,role,assurance,id);
+    const session=this.createSessionForParticipation(participationId,eventId,communityId,role,assurance,id);
+    if(role!=="participant")return session;
+    this.database.prepare("INSERT INTO participation_recovery(token_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,?,?)").run(hash(recoveryCapability),participationId,communityId,eventId,role,assurance,new Date(this.now().getTime()+30*86_400_000).toISOString());
+    return {...session,recoveryCapability};
   }
   private createSessionForParticipation(participationId:string,eventId:string,communityId:string,role:string,assurance:Session["assurance"],id=this.random(32).toString("base64url")):Session{
     this.database.prepare("INSERT INTO participant_sessions(id_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,?,?)").run(hash(id),participationId,communityId,eventId,role,assurance,new Date(this.now().getTime()+86_400_000).toISOString());
+    this.database.prepare("DELETE FROM participant_sessions WHERE participation_id=? AND rowid NOT IN (SELECT rowid FROM participant_sessions WHERE participation_id=? ORDER BY rowid DESC LIMIT 8)").run(participationId,participationId);
     return {id,participationId,communityId,eventId,role,assurance};
   }
+  recoverSession(eventId:string,recoveryCapability:string,expectedAssurance?:Session["assurance"]):Session{this.database.exec("BEGIN IMMEDIATE");try{this.assertVotingOpen(eventId);const recovery=this.database.prepare("SELECT r.participation_id,r.community_id,r.event_id,r.role,r.assurance,r.expires_at,r.revoked_at,p.revoked_at participation_revoked_at,e.participation_policy FROM participation_recovery r JOIN guest_participations p ON p.id=r.participation_id JOIN events e ON e.id=r.event_id WHERE r.token_hash=?").get(hash(recoveryCapability)) as Record<string,string|null>|undefined;if(!recovery||recovery.revoked_at||recovery.participation_revoked_at||recovery.event_id!==eventId||(expectedAssurance&&recovery.assurance!==expectedAssurance)||(recovery.assurance==="open-public"&&recovery.participation_policy!=="open")||Date.parse(String(recovery.expires_at))<this.now().getTime())throw new ChoiceError("unauthorized");const session=this.createSessionForParticipation(String(recovery.participation_id),String(recovery.event_id),String(recovery.community_id),String(recovery.role),recovery.assurance as Session["assurance"]);this.database.exec("COMMIT");return session;}catch(error){this.database.exec("ROLLBACK");throw error;}}
+  recoverPublicSession(eventId:string,recoveryCapability:string):Session{return this.recoverSession(eventId,recoveryCapability,"open-public");}
+  revokeSession(sessionId:string){this.database.prepare("UPDATE participant_sessions SET revoked_at=? WHERE id_hash=? AND revoked_at IS NULL").run(this.now().toISOString(),hash(sessionId));}
+  revokeRecovery(recoveryCapability:string){const now=this.now().toISOString();this.database.exec("BEGIN IMMEDIATE");try{const recovery=this.database.prepare("SELECT participation_id FROM participation_recovery WHERE token_hash=? AND revoked_at IS NULL").get(hash(recoveryCapability)) as {participation_id:string}|undefined;if(recovery){this.database.prepare("UPDATE participation_recovery SET revoked_at=? WHERE participation_id=? AND revoked_at IS NULL").run(now,recovery.participation_id);this.database.prepare("UPDATE participant_sessions SET revoked_at=? WHERE participation_id=? AND revoked_at IS NULL").run(now,recovery.participation_id);}this.database.exec("COMMIT")}catch(error){this.database.exec("ROLLBACK");throw error;}}
+  recoveryEventContext(recoveryCapability:string){const recovery=this.database.prepare("SELECT e.id,e.name,e.state,e.visibility,e.participation_policy AS participationPolicy,r.assurance,r.expires_at,r.revoked_at,p.revoked_at participationRevokedAt FROM participation_recovery r JOIN guest_participations p ON p.id=r.participation_id JOIN events e ON e.id=r.event_id AND e.community_id=r.community_id WHERE r.token_hash=?").get(hash(recoveryCapability)) as Record<string,string|null>|undefined;if(!recovery||recovery.revoked_at||recovery.participationRevokedAt||!["voting","live"].includes(String(recovery.state))||(recovery.assurance==="open-public"&&recovery.participationPolicy!=="open")||Date.parse(String(recovery.expires_at))<this.now().getTime())throw new ChoiceError("unauthorized");return {id:String(recovery.id),name:String(recovery.name),state:String(recovery.state),visibility:String(recovery.visibility),participationPolicy:String(recovery.participationPolicy)};}
   session(id:string): Session {
-    const row=this.database.prepare("SELECT participation_id,community_id,event_id,role,assurance,expires_at,revoked_at FROM participant_sessions WHERE id_hash=?").get(hash(id)) as Record<string,string|null>|undefined;
-    if(!row||row.revoked_at||Date.parse(String(row.expires_at))<this.now().getTime()) throw new ChoiceError("unauthorized");
+    const row=this.database.prepare("SELECT s.participation_id,s.community_id,s.event_id,s.role,s.assurance,s.expires_at,s.revoked_at,p.revoked_at participation_revoked_at FROM participant_sessions s JOIN guest_participations p ON p.id=s.participation_id AND p.community_id=s.community_id AND p.event_id=s.event_id WHERE s.id_hash=?").get(hash(id)) as Record<string,string|null>|undefined;
+    if(!row||row.revoked_at||row.participation_revoked_at||Date.parse(String(row.expires_at))<this.now().getTime()) throw new ChoiceError("unauthorized");
     return {id,participationId:String(row.participation_id),communityId:String(row.community_id),eventId:String(row.event_id),role:String(row.role),assurance:row.assurance as Session["assurance"]};
   }
   assertEvent(sessionId:string,eventId:string){const session=this.session(sessionId);if(session.eventId!==eventId)throw new ChoiceError("denied");return session;}
   eventContext(session:Session){const event=this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE id=? AND community_id=?").get(session.eventId,session.communityId);if(!event)throw new ChoiceError("not-found");return event;}
   getBallot(sessionId:string){
-    const s=this.session(sessionId), prior=this.database.prepare("SELECT candidate_order_json,rankings_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;rankings_json:string;current_revision:number}|undefined;
+    const s=this.session(sessionId);this.assertVotingOpen(s.eventId);const prior=this.database.prepare("SELECT candidate_order_json,rankings_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;rankings_json:string;current_revision:number}|undefined;
     const ids=(this.database.prepare("SELECT song_id FROM event_eligible_songs WHERE event_id=? ORDER BY added_at,song_id").all(s.eventId) as {song_id:string}[]).map(r=>r.song_id);
     const priorOrder=prior?JSON.parse(prior.current_revision>0?prior.rankings_json:prior.candidate_order_json) as string[]:[];
     const order=stableCandidateOrder(s.participationId,ids,priorOrder);
@@ -142,19 +157,19 @@ export class ChoiceService {
     return {method:"ranked-choice" as const,revision:prior?.current_revision??0,candidates:order.map(id=>({id,title:titles.get(id)??id}))};
   }
   replaceBallot(sessionId:string,expectedRevision:number,rankings:string[],operationId:string){
-    const s=this.session(sessionId), receipt=this.database.prepare("SELECT request_hash,result_json FROM choice_receipts WHERE community_id=? AND operation_id=?").get(s.communityId,operationId) as {request_hash:string;result_json:string}|undefined;
+    const s=this.session(sessionId);this.assertVotingOpen(s.eventId);const receipt=this.database.prepare("SELECT request_hash,result_json FROM choice_receipts WHERE community_id=? AND operation_id=?").get(s.communityId,operationId) as {request_hash:string;result_json:string}|undefined;
     const requestHash=hash(JSON.stringify({participationId:s.participationId,expectedRevision,rankings})); if(receipt){if(receipt.request_hash!==requestHash)throw new ChoiceError("replay-mismatch");return JSON.parse(receipt.result_json);}
     const ballot=this.getBallot(sessionId), state=this.database.prepare("SELECT state FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {state:string};
     if(!["open","reopened"].includes(state.state))throw new ChoiceError("voting-closed"); if(ballot.revision!==expectedRevision)throw new ChoiceError("conflict");
     const eligible=new Set(ballot.candidates.map(c=>c.id));if(new Set(rankings).size!==rankings.length||rankings.some(id=>!eligible.has(id)))throw new ChoiceError("invalid-ballot");
-    const result={method:"ranked-choice",revision:expectedRevision+1,rankings}; this.database.exec("BEGIN IMMEDIATE");try{
+    const result={method:"ranked-choice",revision:expectedRevision+1,rankings};this.beforeBallotMutation();this.database.exec("BEGIN IMMEDIATE");try{
       const changed=this.database.prepare("UPDATE participant_ballots SET current_revision=?,rankings_json=? WHERE participation_id=? AND current_revision=?").run(result.revision,JSON.stringify(rankings),s.participationId,expectedRevision);if(changed.changes!==1)throw new ChoiceError("conflict");
       this.database.prepare("INSERT INTO choice_receipts(community_id,operation_id,request_hash,result_json,created_at) VALUES (?,?,?,?,?)").run(s.communityId,operationId,requestHash,JSON.stringify(result),this.now().toISOString());this.database.exec("COMMIT");return result;
-    }catch(error){this.database.exec("ROLLBACK");throw error;}
+    }catch(error){this.database.exec("ROLLBACK");if(error instanceof Error&&/voting-closed/.test(error.message))throw new ChoiceError("voting-closed");throw error;}
   }
   addEligibleSong(eventId:string,songId:string){const row=this.database.prepare("SELECT e.community_id,s.title FROM events e JOIN canonical_songs s ON s.community_id=e.community_id WHERE e.id=? AND s.id=?").get(eventId,songId) as {community_id:string;title:string}|undefined;if(!row)throw new ChoiceError("denied");this.database.exec("BEGIN IMMEDIATE");try{this.database.prepare("INSERT OR IGNORE INTO event_eligible_songs(event_id,song_id,added_at) VALUES (?,?,?)").run(eventId,songId,this.now().toISOString());this.database.prepare("INSERT OR IGNORE INTO event_song_decisions(id,community_id,event_id,song_id,revision,snapshot_json,created_at) VALUES (?,?,?,?,1,?,?)").run(`decision_${hash(`${eventId}:${songId}`).slice(0,24)}`,row.community_id,eventId,songId,JSON.stringify({title:row.title}),this.now().toISOString());this.database.exec("COMMIT");}catch(error){this.database.exec("ROLLBACK");throw error;}}
   setVotingState(eventId:string,state:"closed"|"reopened"){this.database.prepare("UPDATE participant_ballots SET state=? WHERE event_id=?").run(state,eventId);}
-  removeParticipant(id:string){this.database.prepare("UPDATE guest_participations SET revoked_at=? WHERE id=?").run(this.now().toISOString(),id);}
+  removeParticipant(id:string){const now=this.now().toISOString();this.database.exec("BEGIN IMMEDIATE");try{this.database.prepare("UPDATE guest_participations SET revoked_at=? WHERE id=?").run(now,id);this.database.prepare("UPDATE participation_recovery SET revoked_at=? WHERE participation_id=?").run(now,id);this.database.exec("COMMIT")}catch(error){this.database.exec("ROLLBACK");throw error;}}
   aggregate(eventId:string){
     const ballots=this.database.prepare("SELECT b.rankings_json FROM participant_ballots b JOIN guest_participations p ON p.id=b.participation_id WHERE b.event_id=? AND p.revoked_at IS NULL AND b.current_revision>0").all(eventId) as {rankings_json:string}[];
     if(ballots.length<3)return {cohortSize:ballots.length,redacted:true,totals:null};

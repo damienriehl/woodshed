@@ -147,6 +147,7 @@ export class SqliteKernel {
     } catch (error) {
       this.database.exec("ROLLBACK");
       if (error instanceof KernelError) throw error;
+      if (error instanceof Error && /voting-closed/i.test(error.message)) throw new KernelError("voting-closed", "voting closed during mutation", { cause: error });
       throw new KernelError("storage-failure", error instanceof Error ? error.message : "SQLite storage failure", { cause: error });
     }
   }

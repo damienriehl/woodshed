@@ -14,6 +14,7 @@ export const KERNEL_ERROR_CODES = [
   "expired",
   "not-yet-valid",
   "conflict",
+  "voting-closed",
   "replay-mismatch",
   "invalid-ballot",
   "storage-failure",

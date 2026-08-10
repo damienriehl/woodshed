@@ -13,8 +13,10 @@ export type Proposal = { id: string; title: string; state: "submitted" | "eligib
 
 export type WoodshedApi = {
   discover(): Promise<{ events: DiscoveredEvent[] }>;
+  activeEvents(): Promise<{ events: DiscoveredEvent[] }>;
   eventContext(eventId: string): Promise<{ event: DiscoveredEvent }>;
   joinOpen(eventId: string): Promise<{ assurance: "open-public" }>;
+  recover(eventId:string):Promise<{assurance:"open-public"|"invite"}>;
   ballot(eventId: string): Promise<Ballot>;
   saveBallot(eventId: string, input: { expectedRevision: number; rankings: string[]; operationId: string }): Promise<SavedBallot>;
   propose(eventId: string, input: { title: string; operationId: string }): Promise<Proposal>;
@@ -34,7 +36,7 @@ async function responseBody<T>(response:Response,signal:AbortSignal):Promise<{er
   const aborted=new Promise<never>((_resolve,reject)=>{rejectAbort=reject});
   const onAbort=()=>rejectAbort(signal.reason);
   if(signal.aborted)onAbort();else signal.addEventListener("abort",onAbort,{once:true});
-  try{return await Promise.race([response.json().catch(error=>{if(signal.aborted)throw signal.reason;return {};}),aborted]) as {error?:string}&T;}finally{signal.removeEventListener("abort",onAbort);}
+  try{if(response.status===204)return {} as {error?:string}&T;return await Promise.race([response.json(),aborted]) as {error?:string}&T;}finally{signal.removeEventListener("abort",onAbort);}
 }
 
 export function operationId(prefix: "ballot" | "proposal" | "join") {
@@ -48,12 +50,14 @@ export function createWoodshedApi(fetcher: typeof fetch = fetch, options: { time
   const request = async <T>(path: string, init?: RequestInit):Promise<T> => {
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(new Error("request-timeout")), timeoutMs);
     const signals=[controller.signal,options.signal,init?.signal].filter((signal):signal is AbortSignal=>Boolean(signal));const signal=signals.length===1?signals[0]!:AbortSignal.any(signals);
-    try { const response=await fetcher(path,{credentials:"same-origin",...init,signal});const body=await responseBody<T>(response,signal);if(!response.ok)throw new ApiError(response.status,body.error??"request-failed");return body; } finally { clearTimeout(timeout); }
+    try { const response=await fetcher(path,{credentials:"same-origin",...init,signal});let body:{error?:string}&T;try{body=await responseBody<T>(response,signal)}catch(error){if(response.ok||!(error instanceof SyntaxError))throw error;body={} as {error?:string}&T}if(!response.ok)throw new ApiError(response.status,body.error??"request-failed");return body; } finally { clearTimeout(timeout); }
   };
   return {
     discover: () => request("/api/discovery"),
+    activeEvents: () => request("/api/session/events"),
     eventContext: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/context`),
     joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await request<{assurance:"open-public"}>(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})});joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError&&error.status<500)joinRetries.delete(eventId);throw error;} },
+    recover:(eventId)=>request(`/api/events/${encodeURIComponent(eventId)}/recover`,{method:"POST",headers:mutationHeaders,body:"{}"}),
     ballot: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`),
     saveBallot: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) }),
     propose: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/proposals`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(input) }),

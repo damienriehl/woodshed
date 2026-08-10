@@ -149,6 +149,7 @@ export class D1Kernel {
     try { await this.database.batch(statements); }
     catch (error) {
       const message = error instanceof Error ? error.message : "";
+      if (/voting-closed/i.test(message)) throw new KernelError("voting-closed", "voting closed during mutation", { cause: error });
       if (/UNIQUE constraint failed: ballot_versions|UNIQUE constraint failed: ballots/i.test(message)) throw new KernelError("conflict", "stale revision during mutation", { cause: error });
       failStorage(error);
     }
