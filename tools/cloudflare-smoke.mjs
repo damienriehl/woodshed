@@ -55,7 +55,7 @@ try {
     scriptPath: bundle,
     modulesRoot: temporary,
     d1Databases: { [databaseBinding.binding]: "woodshed-smoke" },
-    durableObjects: { [durableObjectBinding.name]: durableObjectBinding.class_name },
+    durableObjects: { [durableObjectBinding.name]: { className: durableObjectBinding.class_name, useSQLite: true } },
     bindings: {
       APP_ORIGIN: origin,
       CLOCK_ISO: clock,
