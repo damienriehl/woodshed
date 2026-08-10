@@ -65,6 +65,8 @@ test("invite capability is hashed, single-exchange, expirable and revocable", ()
   app.close();
 });
 
+test("privileged invite sessions do not receive durable recovery",()=>{const app=service(),invite=app.issueInvite("event_public","organizer"),session=app.exchangeInvite(invite.capability);assert.equal(session.role,"organizer");assert.equal("recoveryCapability" in session,false);assert.equal(Number((app.database.prepare("SELECT count(*) count FROM participation_recovery WHERE participation_id=?").get(session.participationId) as {count:number}).count),0);app.close();});
+
 test("routine session expiry recovers the same open-event participation", () => {
   let now=new Date("2026-01-02T12:00:00Z");const app=new ChoiceService(":memory:",{now:()=>now});app.migrate();app.seedDemo({publicParticipationPolicy:"open"});
   const first=app.openPublicSession("event_public","join_before_expiry"),ballot=app.getBallot(first.id),rankings=ballot.candidates.map(({id})=>id);

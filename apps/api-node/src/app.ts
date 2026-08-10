@@ -55,7 +55,7 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
     const capability = context.req.query("capability"); if (!capability) throw new ChoiceError("invalid-capability");
     const session = service.exchangeInvite(capability);
     setCookie(context, eventSessionCookie(session.eventId), session.id, cookieOptions);
-    setCookie(context,eventRecoveryCookie(session.eventId),session.recoveryCapability,recoveryCookieOptions);
+    if("recoveryCapability" in session)setCookie(context,eventRecoveryCookie(session.eventId),session.recoveryCapability,recoveryCookieOptions);
     return context.redirect(`/events/${session.eventId}`, 303);
   });
   app.use("/api/events/:eventId/join-open",bodyLimit({maxSize:1024,onError:context=>context.json({error:"invalid-request"},413)}));

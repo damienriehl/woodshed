@@ -85,7 +85,7 @@ export class ChoiceService {
   }
   debugCapabilityStored(capability: string) { return Boolean(this.database.prepare("SELECT 1 FROM invite_capabilities WHERE token_hash=?").get(capability)); }
   revokeInvite(id: string) { this.database.prepare("UPDATE invite_capabilities SET revoked_at=? WHERE id=?").run(this.now().toISOString(),id); }
-  exchangeInvite(capability: string): IssuedSession {
+  exchangeInvite(capability: string): Session|IssuedSession {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const invite = this.database.prepare("SELECT i.*,e.community_id FROM invite_capabilities i JOIN events e ON e.id=i.event_id WHERE token_hash=?").get(hash(capability)) as Record<string, string | null> | undefined;
@@ -118,10 +118,11 @@ export class ChoiceService {
       return session;
     }catch(error){this.database.exec("ROLLBACK");throw error;}
   }
-  private createSession(eventId:string, communityId:string, role:string, assurance:Session["assurance"]): IssuedSession {
+  private createSession(eventId:string, communityId:string, role:string, assurance:Session["assurance"]): Session|IssuedSession {
     const participationId=`participation_${this.random(12).toString("hex")}`, id=this.random(32).toString("base64url"),recoveryCapability=this.random(32).toString("base64url");
     this.database.prepare("INSERT INTO guest_participations(id,community_id,event_id) VALUES (?,?,?)").run(participationId,communityId,eventId);
     const session=this.createSessionForParticipation(participationId,eventId,communityId,role,assurance,id);
+    if(role!=="participant")return session;
     this.database.prepare("INSERT INTO participation_recovery(token_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,?,?)").run(hash(recoveryCapability),participationId,communityId,eventId,role,assurance,new Date(this.now().getTime()+30*86_400_000).toISOString());
     return {...session,recoveryCapability};
   }
