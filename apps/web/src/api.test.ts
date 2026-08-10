@@ -18,6 +18,8 @@ describe("browser API client", () => {
     await expect(api.ballot("event_public")).rejects.toEqual(new ApiError(409, "voting-closed"));
   });
 
+  it("rejects malformed successful JSON instead of inventing a successful result",async()=>{const api=createWoodshedApi(async()=>new Response("{",{status:200,headers:{"content-type":"application/json"}}));await expect(api.saveBallot("event_public",{expectedRevision:1,rankings:["song_alpha"],operationId:"operation_malformed"})).rejects.toThrow();});
+
   it("bounds requests and aborts a fetch that never settles", async () => {
     let signal: AbortSignal | undefined;
     const fetcher: typeof fetch = async (_input, init) => {

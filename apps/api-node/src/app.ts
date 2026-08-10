@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { bodyLimit } from "hono/body-limit";
 import { createHash } from "node:crypto";
 
 import { ChoiceError, ChoiceService, type Session } from "../../../packages/application/src/choice-service.ts";
@@ -56,9 +57,10 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
     setCookie(context,eventRecoveryCookie(session.eventId),session.recoveryCapability,recoveryCookieOptions);
     return context.redirect(`/events/${session.eventId}`, 303);
   });
+  app.use("/api/events/:eventId/join-open",bodyLimit({maxSize:1024,onError:context=>context.json({error:"invalid-request"},413)}));
   app.post("/api/events/:eventId/join-open", async (context) => {
     const entry = service.eventEntry(context.req.param("eventId"), null); if (entry.outcome !== "eligible-open") throw new ChoiceError("denied");
-    const eventId=context.req.param("eventId"),body=await context.req.json<{operationId?:string}>();if(typeof body.operationId!=="string"||!body.operationId)throw new ChoiceError("invalid-request");const cookieName=eventSessionCookie(eventId),recovery=getCookie(context,eventRecoveryCookie(eventId));const session=recovery?service.recoverPublicSession(eventId,recovery):service.openPublicSession(eventId,body.operationId,getCookie(context,cookieName));setCookie(context,cookieName,session.id,cookieOptions);if("recoveryCapability" in session&&typeof session.recoveryCapability==="string")setCookie(context,eventRecoveryCookie(eventId),session.recoveryCapability,recoveryCookieOptions);return context.json({assurance:session.assurance});
+    const eventId=context.req.param("eventId"),body=await context.req.json<{operationId?:string}>();if(typeof body.operationId!=="string"||!body.operationId||body.operationId.length>128)throw new ChoiceError("invalid-request");const cookieName=eventSessionCookie(eventId),recovery=getCookie(context,eventRecoveryCookie(eventId));const session=recovery?service.recoverPublicSession(eventId,recovery):service.openPublicSession(eventId,body.operationId,getCookie(context,cookieName));setCookie(context,cookieName,session.id,cookieOptions);if("recoveryCapability" in session&&typeof session.recoveryCapability==="string")setCookie(context,eventRecoveryCookie(eventId),session.recoveryCapability,recoveryCookieOptions);return context.json({assurance:session.assurance});
   });
   app.get("/api/session/events",context=>{const events=[];for(const [name,id] of Object.entries(getCookie(context))){if(!name.startsWith(`${SESSION_COOKIE}_`))continue;try{events.push(service.eventContext(service.session(String(id))))}catch{/* Ignore expired, revoked, or malformed session cookies. */}}return context.json({events});});
   app.use("/api/events/:eventId/*", async (context, next) => {

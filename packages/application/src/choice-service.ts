@@ -98,19 +98,19 @@ export class ChoiceService {
   openPublicSession(eventId: string, operationId: string, replaySessionId?: string): Session|IssuedSession {
     const event = this.database.prepare("SELECT community_id,participation_policy FROM events WHERE id=?").get(eventId) as {community_id:string;participation_policy:string}|undefined;
     if (!event) throw new ChoiceError("not-found");
-    if (!operationId) throw new ChoiceError("invalid-request");
+    if (!operationId||operationId.length>128) throw new ChoiceError("invalid-request");
     // Synthetic preview permits this seam even when demo policy is invite; HTTP route enforces open policy.
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const receipt=this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").get(eventId,operationId) as {participation_id:string}|undefined;
+      const operationHash=hash(operationId),receipt=this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").get(eventId,operationHash) as {participation_id:string}|undefined;
       if(receipt){
-        let session:Session|undefined;if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}if(!session)throw new ChoiceError("replay-session-required");
+        let session:Session|undefined;if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}if(!session){const participation=this.database.prepare("SELECT p.community_id,p.event_id,p.revoked_at FROM guest_participations p WHERE p.id=?").get(receipt.participation_id) as {community_id:string;event_id:string;revoked_at:string|null}|undefined;if(!participation||participation.revoked_at||participation.event_id!==eventId)throw new ChoiceError("unauthorized");session=this.createSessionForParticipation(receipt.participation_id,eventId,participation.community_id,"participant","open-public");}
         this.database.exec("COMMIT");
         return session;
       }
       const count=Number((this.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id=? AND revoked_at IS NULL").get(eventId) as {count:number}).count);if(count>=this.maxOpenParticipantsPerEvent)throw new ChoiceError("open-participation-capacity");
       const session=this.createSession(eventId,event.community_id,"participant","open-public");
-      this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationId,session.participationId,this.now().toISOString());
+      this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationHash,session.participationId,this.now().toISOString());
       this.database.exec("COMMIT");
       return session;
     }catch(error){this.database.exec("ROLLBACK");throw error;}

@@ -35,7 +35,7 @@ async function responseBody<T>(response:Response,signal:AbortSignal):Promise<{er
   const aborted=new Promise<never>((_resolve,reject)=>{rejectAbort=reject});
   const onAbort=()=>rejectAbort(signal.reason);
   if(signal.aborted)onAbort();else signal.addEventListener("abort",onAbort,{once:true});
-  try{return await Promise.race([response.json().catch(error=>{if(signal.aborted)throw signal.reason;return {};}),aborted]) as {error?:string}&T;}finally{signal.removeEventListener("abort",onAbort);}
+  try{if(response.status===204)return {} as {error?:string}&T;return await Promise.race([response.json(),aborted]) as {error?:string}&T;}finally{signal.removeEventListener("abort",onAbort);}
 }
 
 export function operationId(prefix: "ballot" | "proposal" | "join") {
