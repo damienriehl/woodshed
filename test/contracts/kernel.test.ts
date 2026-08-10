@@ -138,7 +138,7 @@ test("invariant linkage cannot borrow another ballot's same-revision audit", asy
   await withKernel((kernel) => {
     kernel.replaceBallot(command(), [IDS.songA], new Date("2030-01-01T12:01:00.000Z"));
     kernel.database.prepare("INSERT INTO guest_participations(id, community_id, event_id) VALUES (?, ?, ?)").run("participation_demo_second", IDS.community, IDS.event);
-    kernel.database.prepare("INSERT INTO ballots(id, community_id, event_id, participation_id, current_revision) VALUES (?, ?, ?, ?, 1)").run("ballot_demo_orphan", IDS.community, IDS.event, "participation_demo_second");
+    kernel.database.prepare("INSERT INTO ballots(id, community_id, event_id, participation_id, current_revision, state) VALUES (?, ?, ?, ?, 1, 'open')").run("ballot_demo_orphan", IDS.community, IDS.event, "participation_demo_second");
     kernel.database.prepare("INSERT INTO ballot_versions(ballot_id, community_id, event_id, revision, operation_id, rankings_json, created_at) VALUES (?, ?, ?, 1, ?, '[]', ?)").run("ballot_demo_orphan", IDS.community, IDS.event, "operation_demo_orphan", "2030-01-01T12:01:00.000Z");
     assert.deepEqual(queryInvariants(kernel.database), [{ invariant: "mutation-has-audit-and-receipt", count: 1 }]);
   });

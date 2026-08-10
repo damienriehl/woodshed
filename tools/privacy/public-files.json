@@ -108,6 +108,7 @@
     "migrations/sqlite/007_open_join_receipts.sql",
     "migrations/sqlite/007_participation_recovery.sql",
     "migrations/sqlite/008_multiple_recovery_credentials.sql",
+    "migrations/sqlite/009_ballot_lifecycle_guard.sql",
     "packages/application/src/choice-port.ts",
     "packages/application/src/choice-service.ts",
     "packages/application/src/coordination-service.ts",
