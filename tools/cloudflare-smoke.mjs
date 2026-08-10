@@ -74,9 +74,15 @@ try {
     "005_coordination_repository.sql",
     "006_worker_runtime.sql",
     "007_open_join_receipts.sql",
+    "007_participation_recovery.sql",
+    "008_ballot_lifecycle_guard.sql",
     "008_runtime_quota_indexes.sql",
+    "009_multiple_recovery_credentials.sql",
   ]);
-  for (const migration of migrations) await database.exec(await readFile(path.join(migrationsDirectory, migration), "utf8"));
+  for (const migration of migrations) {
+    const sql = (await readFile(path.join(migrationsDirectory, migration), "utf8")).replace(/\s*\r?\n\s*/g, " ");
+    await database.exec(sql);
+  }
 
   await database.batch([
     database.prepare("INSERT INTO communities(id,name) VALUES (?,?)").bind("community_smoke", "Synthetic Smoke Community"),
