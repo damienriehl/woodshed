@@ -102,6 +102,7 @@
     "migrations/d1/007_participation_recovery.sql",
     "migrations/d1/008_ballot_lifecycle_guard.sql",
     "migrations/d1/009_multiple_recovery_credentials.sql",
+    "migrations/d1/008_runtime_quota_indexes.sql",
     "migrations/sqlite/003_participant_choice.sql",
     "migrations/sqlite/004_rehearsal_coordination.sql",
     "migrations/sqlite/005_live_performance.sql",
