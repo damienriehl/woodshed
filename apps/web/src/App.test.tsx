@@ -13,6 +13,7 @@ function connectedApi(overrides: Partial<WoodshedApi> = {}): WoodshedApi {
     ballot: async () => ({ method: "ranked-choice", revision: 2, candidates: [{ id: "song_alpha", title: "North Star" }, { id: "song_bravo", title: "Open Road" }] }),
     saveBallot: async (_eventId, input) => ({ method: "ranked-choice", revision: input.expectedRevision + 1, rankings: input.rankings }),
     propose: async (_eventId, input) => ({ id: "proposal_demo", title: input.title, state: "submitted" }),
+    logout: async () => {},
     ...overrides,
   };
 }

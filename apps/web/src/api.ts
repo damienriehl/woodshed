@@ -18,6 +18,7 @@ export type WoodshedApi = {
   ballot(eventId: string): Promise<Ballot>;
   saveBallot(eventId: string, input: { expectedRevision: number; rankings: string[]; operationId: string }): Promise<SavedBallot>;
   propose(eventId: string, input: { title: string; operationId: string }): Promise<Proposal>;
+  logout(): Promise<void>;
 };
 
 export class ApiError extends Error {
@@ -35,19 +36,26 @@ async function json<T>(request: Promise<Response>): Promise<T> {
 
 const mutationHeaders = { "content-type": "application/json", "x-csrf-token": "same-origin" };
 
-export function operationId(prefix: "ballot" | "proposal") {
+export function operationId(prefix: "ballot" | "proposal" | "join") {
   const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${prefix}_${suffix}`;
 }
 
-export function createWoodshedApi(fetcher: typeof fetch = fetch): WoodshedApi {
-  const request = (path: string, init?: RequestInit) => fetcher(path, { credentials: "same-origin", ...init });
+export function createWoodshedApi(fetcher: typeof fetch = fetch, options: { timeoutMs?: number; signal?: AbortSignal } = {}): WoodshedApi {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const joinRetries = new Map<string, string>();
+  const request = async (path: string, init?: RequestInit) => {
+    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(new Error("request-timeout")), timeoutMs);
+    const signals=[controller.signal,options.signal,init?.signal].filter((signal):signal is AbortSignal=>Boolean(signal));const signal=signals.length===1?signals[0]:AbortSignal.any(signals);
+    try { return await fetcher(path, { credentials: "same-origin", ...init, signal }); } finally { clearTimeout(timeout); }
+  };
   return {
     discover: () => json(request("/api/discovery")),
     eventContext: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/context`)),
-    joinOpen: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/join-open`, { method: "POST", headers: mutationHeaders })),
+    joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await json<{assurance:"open-public"}>(request(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})}));joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError)joinRetries.delete(eventId);throw error;} },
     ballot: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`)),
     saveBallot: (eventId, input) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) })),
     propose: (eventId, input) => json(request(`/api/events/${encodeURIComponent(eventId)}/proposals`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(input) })),
+    logout: async () => { await json(request("/api/logout", { method: "POST", headers: mutationHeaders, body: "{}" })); },
   };
 }

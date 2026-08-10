@@ -1,12 +1,14 @@
 import { Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { createHash } from "node:crypto";
 
-import { ChoiceError, ChoiceService } from "../../../packages/application/src/choice-service.ts";
+import { ChoiceError, ChoiceService, type Session } from "../../../packages/application/src/choice-service.ts";
 import { CoordinationError, CoordinationService } from "../../../packages/application/src/coordination-service.ts";
+import { authorize } from "../../../packages/application/src/authorization.ts";
 
-type Variables = { sessionId: string };
+type Variables = { sessionId: string; session: Session };
 const SESSION_COOKIE = "woodshed_session";
-const sessionCookie = (eventId: string) => `${SESSION_COOKIE}_${eventId}`;
+const eventSessionCookie = (eventId: string) => `${SESSION_COOKIE}_${createHash("sha256").update(eventId).digest("hex").slice(0,16)}`;
 const sessionCookieOptions = (origin: string) => ({ httpOnly: true, sameSite: "Lax", secure: origin.startsWith("https://"), path: "/", maxAge: 86_400 } as const);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const ERROR_STATUS = {
@@ -45,22 +47,22 @@ export function createApi(service: ChoiceService, options: { origin: string; coo
   app.get("/api/session/exchange", (context) => {
     const capability = context.req.query("capability"); if (!capability) throw new ChoiceError("invalid-capability");
     const session = service.exchangeInvite(capability);
-    setCookie(context, sessionCookie(session.eventId), session.id, cookieOptions);
+    setCookie(context, eventSessionCookie(session.eventId), session.id, cookieOptions);
     return context.redirect(`/events/${session.eventId}`, 303);
   });
-  app.post("/api/events/:eventId/join-open", (context) => {
+  app.post("/api/events/:eventId/join-open", async (context) => {
     const entry = service.eventEntry(context.req.param("eventId"), null); if (entry.outcome !== "eligible-open") throw new ChoiceError("denied");
-    const eventId=context.req.param("eventId");const session = service.openPublicSession(eventId); setCookie(context,sessionCookie(eventId),session.id,cookieOptions); return context.json({assurance:session.assurance});
+    const eventId=context.req.param("eventId"),body=await context.req.json<{operationId?:string}>();if(typeof body.operationId!=="string"||!body.operationId)throw new ChoiceError("invalid-request");const cookieName=eventSessionCookie(eventId);const session=service.openPublicSession(eventId,body.operationId,getCookie(context,cookieName));setCookie(context,cookieName,session.id,cookieOptions);return context.json({assurance:session.assurance});
   });
   app.use("/api/events/:eventId/*", async (context, next) => {
-    const eventId=context.req.param("eventId");const cookies=getCookie(context);const sessionId=cookies[sessionCookie(eventId)]??cookies[SESSION_COOKIE]??Object.entries(cookies).find(([name])=>name.startsWith(`${SESSION_COOKIE}_`))?.[1];if(!sessionId)throw new ChoiceError("unauthorized");service.assertEvent(sessionId,eventId);context.set("sessionId",sessionId);
+    const sessionId=getCookie(context,eventSessionCookie(context.req.param("eventId")))??getCookie(context,SESSION_COOKIE);if(!sessionId)throw new ChoiceError("unauthorized");const session=service.assertEvent(sessionId,context.req.param("eventId"));context.set("sessionId",sessionId);context.set("session",session);
     await next();
   });
   app.get("/api/events/:eventId/ballot", (context) => context.json(service.getBallot(context.get("sessionId"))));
-  app.get("/api/events/:eventId/context", (context) => context.json({event:service.eventContext(context.get("sessionId"))}));
+  app.get("/api/events/:eventId/context", (context) => context.json({event:service.eventContext(context.get("session"))}));
   app.put("/api/events/:eventId/ballot", async (context) => { const body=await context.req.json<{expectedRevision:number;rankings:string[];operationId:string}>(); return context.json(service.replaceBallot(context.get("sessionId"),body.expectedRevision,body.rankings,body.operationId)); });
   app.post("/api/events/:eventId/proposals", async (context) => { const body=await context.req.json<{title:string;operationId:string}>(); return context.json(service.propose(context.get("sessionId"),body.title,body.operationId),201); });
-  app.get("/api/events/:eventId/draft", (context) => context.json(service.draft(context.req.param("eventId"))));
+  app.get("/api/events/:eventId/draft", (context) => {const session=context.get("session");if(!authorize({roles:[session.role],actorCommunityId:session.communityId,resourceCommunityId:session.communityId,capability:"event:moderate"}).allowed)throw new ChoiceError("denied");return context.json(service.draft(session.eventId));});
   const coordinationCommand=(sessionId:string,body:Record<string,unknown>)=>{const session=service.session(sessionId);if(typeof body.operationId!=="string"||typeof body.expectedRevision!=="number")throw new CoordinationError("invalid-request");return {communityId:session.communityId,eventId:session.eventId,actorId:session.participationId,roles:[session.role],operationId:body.operationId,expectedRevision:body.expectedRevision};};
   app.post("/api/events/:eventId/arrangements", async context => {
     const body=await context.req.json<Record<string,unknown>>();

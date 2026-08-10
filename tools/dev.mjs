@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { terminateProcessTree } from "./process-tree.mjs";
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const apiPort = process.env.WOODSHED_API_PORT ?? "3100";
@@ -13,10 +14,7 @@ let stopping = false;
 function stop(signal = "SIGTERM") {
   if (stopping) return;
   stopping = true;
-  for (const child of children) if (!child.killed && child.pid) {
-    if (process.platform === "win32") child.kill(signal);
-    else { try { process.kill(-child.pid, signal); } catch (error) { if (error?.code !== "ESRCH") throw error; } }
-  }
+  for (const child of children) terminateProcessTree(child, signal);
 }
 
 let requestedSignal = null;

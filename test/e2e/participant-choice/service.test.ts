@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { ChoiceService, ChoiceError } from "../../../packages/application/src/choice-service.ts";
 
 function service() { const value = new ChoiceService(":memory:", { now: () => new Date("2026-01-02T12:00:00Z") }); value.migrate(); value.seedDemo(); return value; }
+
+test("open join receipt replays one participation across independent database connections", () => {
+  const directory=mkdtempSync(path.join(tmpdir(),"woodshed-open-join-")),filename=path.join(directory,"choice.sqlite");
+  const first=new ChoiceService(filename),second=new ChoiceService(filename);
+  try{first.migrate();first.seedDemo({publicParticipationPolicy:"open"});const original=first.openPublicSession("event_public","join_shared");const replay=second.openPublicSession("event_public","join_shared");assert.equal(replay.participationId,original.participationId);assert.notEqual(replay.id,original.id);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id='event_public'").get() as {count:number}).count),1);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM participant_sessions WHERE participation_id=?").get(original.participationId) as {count:number}).count),2);}finally{second.close();first.close();rmSync(directory,{recursive:true});}
+});
 
 test("discovery keeps visibility separate from eligibility", () => {
   const app = service();
@@ -42,7 +51,7 @@ test("invite capability is hashed, single-exchange, expirable and revocable", ()
 
 test("ballot CAS, replay, append, close/reopen, removal and secrecy", () => {
   const app = service();
-  const session = app.openPublicSession("event_public");
+  const session = app.openPublicSession("event_public","join_ballot");
   const ballot = app.getBallot(session.id);
   const rankings = ballot.candidates.map((candidate) => candidate.id).reverse();
   const operationId = "operation_first";
@@ -65,7 +74,7 @@ test("ballot CAS, replay, append, close/reopen, removal and secrecy", () => {
 
 test("proposal policy supports immediate/editorial, quotas, and replay", () => {
   const app = service();
-  const session = app.openPublicSession("event_public");
+  const session = app.openPublicSession("event_public","join_proposal");
   const first = app.propose(session.id, "New Tune", "proposal_operation_one");
   assert.equal(first.state, "eligible");
   assert.deepEqual(app.propose(session.id, "New Tune", "proposal_operation_one"), first);
@@ -81,12 +90,12 @@ test("legacy flat ballots remain flat while new ballots are ranked", () => {
   const app = service();
   assert.equal(app.interpretImportedBallot({ method: "flat", choices: ["song_alpha"] }).method, "flat");
   assert.equal(app.interpretImportedBallot({ choices: ["song_alpha"] }).method, "flat");
-  assert.equal(app.getBallot(app.openPublicSession("event_public").id).method, "ranked-choice");
+  assert.equal(app.getBallot(app.openPublicSession("event_public","join_ranked").id).method, "ranked-choice");
   app.close();
 });
 
 test("account claim stays attached to the original guest participation", () => {
-  const app=service(),session=app.openPublicSession("event_public");
+  const app=service(),session=app.openPublicSession("event_public","join_claim");
   const first=app.claimParticipation(session.id,"account_alpha","proof_alpha");
   assert.deepEqual(app.claimParticipation(session.id,"account_alpha","proof_alpha"),first);
   assert.equal(first.participationId,session.participationId);

@@ -13,7 +13,7 @@ export class ChoiceError extends Error {
   constructor(code: string, message = code) { super(message); this.code = code; }
 }
 
-type Session = { id: string; participationId: string; communityId: string; eventId: string; role: string; assurance: "invite" | "open-public" };
+export type Session = { id: string; participationId: string; communityId: string; eventId: string; role: string; assurance: "invite" | "open-public" };
 type Options = { now?: () => Date; random?: (bytes: number) => Buffer };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const migrations = () => fileURLToPath(new URL("../../../migrations/sqlite/", import.meta.url));
@@ -92,15 +92,33 @@ export class ChoiceService {
       this.database.exec("COMMIT"); return session;
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
-  openPublicSession(eventId: string): Session {
+  openPublicSession(eventId: string, operationId: string, replaySessionId?: string): Session {
     const event = this.database.prepare("SELECT community_id,participation_policy FROM events WHERE id=?").get(eventId) as {community_id:string;participation_policy:string}|undefined;
     if (!event) throw new ChoiceError("not-found");
+    if (!operationId) throw new ChoiceError("invalid-request");
     // Synthetic preview permits this seam even when demo policy is invite; HTTP route enforces open policy.
-    return this.createSession(eventId,event.community_id,"participant","open-public");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const receipt=this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").get(eventId,operationId) as {participation_id:string}|undefined;
+      if(receipt){
+        let session:Session|undefined;
+        if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}
+        session??=this.createSessionForParticipation(receipt.participation_id,eventId,event.community_id,"participant","open-public");
+        this.database.exec("COMMIT");
+        return session;
+      }
+      const session=this.createSession(eventId,event.community_id,"participant","open-public");
+      this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationId,session.participationId,this.now().toISOString());
+      this.database.exec("COMMIT");
+      return session;
+    }catch(error){this.database.exec("ROLLBACK");throw error;}
   }
   private createSession(eventId:string, communityId:string, role:string, assurance:Session["assurance"]): Session {
     const participationId=`participation_${this.random(12).toString("hex")}`, id=this.random(32).toString("base64url");
     this.database.prepare("INSERT INTO guest_participations(id,community_id,event_id) VALUES (?,?,?)").run(participationId,communityId,eventId);
+    return this.createSessionForParticipation(participationId,eventId,communityId,role,assurance,id);
+  }
+  private createSessionForParticipation(participationId:string,eventId:string,communityId:string,role:string,assurance:Session["assurance"],id=this.random(32).toString("base64url")):Session{
     this.database.prepare("INSERT INTO participant_sessions(id_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,?,?)").run(hash(id),participationId,communityId,eventId,role,assurance,new Date(this.now().getTime()+86_400_000).toISOString());
     return {id,participationId,communityId,eventId,role,assurance};
   }
@@ -110,7 +128,7 @@ export class ChoiceService {
     return {id,participationId:String(row.participation_id),communityId:String(row.community_id),eventId:String(row.event_id),role:String(row.role),assurance:row.assurance as Session["assurance"]};
   }
   assertEvent(sessionId:string,eventId:string){const session=this.session(sessionId);if(session.eventId!==eventId)throw new ChoiceError("denied");return session;}
-  eventContext(sessionId:string){const session=this.session(sessionId);const event=this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE id=? AND community_id=?").get(session.eventId,session.communityId);if(!event)throw new ChoiceError("not-found");return event;}
+  eventContext(session:Session){const event=this.database.prepare("SELECT id,name,state,visibility,participation_policy AS participationPolicy FROM events WHERE id=? AND community_id=?").get(session.eventId,session.communityId);if(!event)throw new ChoiceError("not-found");return event;}
   getBallot(sessionId:string){
     const s=this.session(sessionId), prior=this.database.prepare("SELECT candidate_order_json,rankings_json,current_revision FROM participant_ballots WHERE participation_id=?").get(s.participationId) as {candidate_order_json:string;rankings_json:string;current_revision:number}|undefined;
     const ids=(this.database.prepare("SELECT song_id FROM event_eligible_songs WHERE event_id=? ORDER BY added_at,song_id").all(s.eventId) as {song_id:string}[]).map(r=>r.song_id);
