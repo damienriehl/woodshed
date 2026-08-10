@@ -27,14 +27,15 @@ export class ApiError extends Error {
   constructor(status: number, code: string) { super(code); this.status = status; this.code = code; }
 }
 
-async function json<T>(request: Promise<Response>): Promise<T> {
-  const response = await request;
-  const body = await response.json().catch(() => ({})) as { error?: string } & T;
-  if (!response.ok) throw new ApiError(response.status, body.error ?? "request-failed");
-  return body;
-}
-
 const mutationHeaders = { "content-type": "application/json", "x-csrf-token": "same-origin" };
+
+async function responseBody<T>(response:Response,signal:AbortSignal):Promise<{error?:string}&T>{
+  let rejectAbort:(reason?:unknown)=>void=()=>{};
+  const aborted=new Promise<never>((_resolve,reject)=>{rejectAbort=reject});
+  const onAbort=()=>rejectAbort(signal.reason);
+  if(signal.aborted)onAbort();else signal.addEventListener("abort",onAbort,{once:true});
+  try{return await Promise.race([response.json().catch(error=>{if(signal.aborted)throw signal.reason;return {};}),aborted]) as {error?:string}&T;}finally{signal.removeEventListener("abort",onAbort);}
+}
 
 export function operationId(prefix: "ballot" | "proposal" | "join") {
   const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -44,18 +45,18 @@ export function operationId(prefix: "ballot" | "proposal" | "join") {
 export function createWoodshedApi(fetcher: typeof fetch = fetch, options: { timeoutMs?: number; signal?: AbortSignal } = {}): WoodshedApi {
   const timeoutMs = options.timeoutMs ?? 10_000;
   const joinRetries = new Map<string, string>();
-  const request = async (path: string, init?: RequestInit) => {
+  const request = async <T>(path: string, init?: RequestInit):Promise<T> => {
     const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(new Error("request-timeout")), timeoutMs);
-    const signals=[controller.signal,options.signal,init?.signal].filter((signal):signal is AbortSignal=>Boolean(signal));const signal=signals.length===1?signals[0]:AbortSignal.any(signals);
-    try { return await fetcher(path, { credentials: "same-origin", ...init, signal }); } finally { clearTimeout(timeout); }
+    const signals=[controller.signal,options.signal,init?.signal].filter((signal):signal is AbortSignal=>Boolean(signal));const signal=signals.length===1?signals[0]!:AbortSignal.any(signals);
+    try { const response=await fetcher(path,{credentials:"same-origin",...init,signal});const body=await responseBody<T>(response,signal);if(!response.ok)throw new ApiError(response.status,body.error??"request-failed");return body; } finally { clearTimeout(timeout); }
   };
   return {
-    discover: () => json(request("/api/discovery")),
-    eventContext: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/context`)),
-    joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await json<{assurance:"open-public"}>(request(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})}));joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError)joinRetries.delete(eventId);throw error;} },
-    ballot: (eventId) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`)),
-    saveBallot: (eventId, input) => json(request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) })),
-    propose: (eventId, input) => json(request(`/api/events/${encodeURIComponent(eventId)}/proposals`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(input) })),
-    logout: async () => { await json(request("/api/logout", { method: "POST", headers: mutationHeaders, body: "{}" })); },
+    discover: () => request("/api/discovery"),
+    eventContext: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/context`),
+    joinOpen: async (eventId) => { let retained=joinRetries.get(eventId);if(!retained){if(joinRetries.size>=32)joinRetries.delete(joinRetries.keys().next().value!);retained=operationId("join");joinRetries.set(eventId,retained);}try{const result=await request<{assurance:"open-public"}>(`/api/events/${encodeURIComponent(eventId)}/join-open`,{method:"POST",headers:mutationHeaders,body:JSON.stringify({operationId:retained})});joinRetries.delete(eventId);return result;}catch(error){if(error instanceof ApiError&&error.status<500)joinRetries.delete(eventId);throw error;} },
+    ballot: (eventId) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`),
+    saveBallot: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/ballot`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify(input) }),
+    propose: (eventId, input) => request(`/api/events/${encodeURIComponent(eventId)}/proposals`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(input) }),
+    logout: async () => { await request("/api/logout", { method: "POST", headers: mutationHeaders, body: "{}" }); },
   };
 }

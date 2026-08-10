@@ -44,6 +44,21 @@ describe("browser API client", () => {
     expect(requests[2]).toMatchObject({ method: "POST", headers: { "content-type": "application/json", "x-csrf-token": "same-origin" } });
   });
 
+  it("retains a join operation id across a 500 response", async () => {
+    const operationIds:string[]=[];let attempts=0;const api=createWoodshedApi(async(_input,init)=>{operationIds.push(JSON.parse(String(init?.body)).operationId);attempts+=1;return attempts===1?new Response(JSON.stringify({error:"internal-error"}),{status:500}):new Response(JSON.stringify({assurance:"open-public"}),{status:200});});
+    await expect(api.joinOpen("event_public")).rejects.toEqual(new ApiError(500,"internal-error"));await api.joinOpen("event_public");expect(operationIds[1]).toBe(operationIds[0]);
+  });
+
+  it("keeps the timeout active while the response body is stalled", async () => {
+    const body=new ReadableStream({start(){}});const api=createWoodshedApi(async()=>new Response(body,{status:200,headers:{"content-type":"application/json"}}),{timeoutMs:5});
+    await expect(api.discover()).rejects.toThrow("request-timeout");
+  });
+
+  it("cleans up the timeout after a completed response body",async()=>{
+    let requestSignal:AbortSignal|undefined,abortEvents=0;const api=createWoodshedApi(async(_input,init)=>{requestSignal=init?.signal as AbortSignal;requestSignal.addEventListener("abort",()=>{abortEvents+=1});return new Response(JSON.stringify({events:[]}),{status:200,headers:{"content-type":"application/json"}});},{timeoutMs:5});
+    await expect(api.discover()).resolves.toEqual({events:[]});await new Promise(resolve=>setTimeout(resolve,15));expect(requestSignal?.aborted).toBe(false);expect(abortEvents).toBe(0);
+  });
+
   it("clears a retained join operation after a definitive HTTP failure", async () => {
     const operationIds:string[]=[];let attempts=0;const api=createWoodshedApi(async(_input,init)=>{operationIds.push(JSON.parse(String(init?.body)).operationId);attempts+=1;return attempts===1?new Response(JSON.stringify({error:"denied"}),{status:403}):new Response(JSON.stringify({assurance:"open-public"}),{status:200});});
     await expect(api.joinOpen("event_public")).rejects.toEqual(new ApiError(403,"denied"));await api.joinOpen("event_public");expect(operationIds[1]).not.toBe(operationIds[0]);

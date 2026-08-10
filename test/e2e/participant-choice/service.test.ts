@@ -8,11 +8,15 @@ import { ChoiceService, ChoiceError } from "../../../packages/application/src/ch
 
 function service() { const value = new ChoiceService(":memory:", { now: () => new Date("2026-01-02T12:00:00Z") }); value.migrate(); value.seedDemo(); return value; }
 
-test("open join receipt replays one participation across independent database connections", () => {
+test("open join receipt requires the matching replay session", () => {
   const directory=mkdtempSync(path.join(tmpdir(),"woodshed-open-join-")),filename=path.join(directory,"choice.sqlite");
   const first=new ChoiceService(filename),second=new ChoiceService(filename);
-  try{first.migrate();first.seedDemo({publicParticipationPolicy:"open"});const original=first.openPublicSession("event_public","join_shared");const replay=second.openPublicSession("event_public","join_shared");assert.equal(replay.participationId,original.participationId);assert.notEqual(replay.id,original.id);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id='event_public'").get() as {count:number}).count),1);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM participant_sessions WHERE participation_id=?").get(original.participationId) as {count:number}).count),2);}finally{second.close();first.close();rmSync(directory,{recursive:true});}
+  try{first.migrate();first.seedDemo({publicParticipationPolicy:"open"});const original=first.openPublicSession("event_public","join_shared");assert.throws(()=>second.openPublicSession("event_public","join_shared"),(error:unknown)=>error instanceof ChoiceError&&error.code==="replay-session-required");const replay=second.openPublicSession("event_public","join_shared",original.id);assert.equal(replay.id,original.id);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id='event_public'").get() as {count:number}).count),1);assert.equal(Number((first.database.prepare("SELECT count(*) count FROM participant_sessions WHERE participation_id=?").get(original.participationId) as {count:number}).count),1);}finally{second.close();first.close();rmSync(directory,{recursive:true});}
 });
+
+test("open join receipt rejects a different or expired replay session",()=>{const app=new ChoiceService(":memory:");app.migrate();app.seedDemo({publicParticipationPolicy:"open"});const victim=app.openPublicSession("event_public","join_victim"),other=app.openPublicSession("event_public","join_other");assert.throws(()=>app.openPublicSession("event_public","join_victim",other.id),(error:unknown)=>error instanceof ChoiceError&&error.code==="replay-session-required");app.database.prepare("UPDATE participant_sessions SET expires_at='2000-01-01T00:00:00Z' WHERE participation_id=?").run(victim.participationId);assert.throws(()=>app.openPublicSession("event_public","join_victim",victim.id),(error:unknown)=>error instanceof ChoiceError&&error.code==="replay-session-required");app.close();});
+
+test("open participation is bounded per event",()=>{const app=new ChoiceService(":memory:",{maxOpenParticipantsPerEvent:1});app.migrate();app.seedDemo({publicParticipationPolicy:"open"});app.openPublicSession("event_public","join_one");assert.throws(()=>app.openPublicSession("event_public","join_two"),(error:unknown)=>error instanceof ChoiceError&&error.code==="open-participation-capacity");app.close();});
 
 test("discovery keeps visibility separate from eligibility", () => {
   const app = service();

@@ -14,7 +14,7 @@ export class ChoiceError extends Error {
 }
 
 export type Session = { id: string; participationId: string; communityId: string; eventId: string; role: string; assurance: "invite" | "open-public" };
-type Options = { now?: () => Date; random?: (bytes: number) => Buffer };
+type Options = { now?: () => Date; random?: (bytes: number) => Buffer; maxOpenParticipantsPerEvent?: number };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const migrations = () => fileURLToPath(new URL("../../../migrations/sqlite/", import.meta.url));
 
@@ -22,12 +22,14 @@ export class ChoiceService {
   readonly database: DatabaseSync;
   private readonly now: () => Date;
   private readonly random: (bytes: number) => Buffer;
+  private readonly maxOpenParticipantsPerEvent:number;
 
   constructor(filename = ":memory:", options: Options = {}) {
     this.database = new DatabaseSync(filename);
     this.database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.now = options.now ?? (() => new Date());
     this.random = options.random ?? randomBytes;
+    this.maxOpenParticipantsPerEvent=options.maxOpenParticipantsPerEvent??10_000;
   }
   close() { this.database.close(); }
   migrate() {
@@ -101,12 +103,11 @@ export class ChoiceService {
     try {
       const receipt=this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").get(eventId,operationId) as {participation_id:string}|undefined;
       if(receipt){
-        let session:Session|undefined;
-        if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}
-        session??=this.createSessionForParticipation(receipt.participation_id,eventId,event.community_id,"participant","open-public");
+        let session:Session|undefined;if(replaySessionId)try{const replay=this.assertEvent(replaySessionId,eventId);if(replay.participationId===receipt.participation_id)session=replay;}catch(error){if(!(error instanceof ChoiceError))throw error;}if(!session)throw new ChoiceError("replay-session-required");
         this.database.exec("COMMIT");
         return session;
       }
+      const count=Number((this.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id=? AND revoked_at IS NULL").get(eventId) as {count:number}).count);if(count>=this.maxOpenParticipantsPerEvent)throw new ChoiceError("open-participation-capacity");
       const session=this.createSession(eventId,event.community_id,"participant","open-public");
       this.database.prepare("INSERT INTO open_join_receipts(event_id,operation_id,participation_id,created_at) VALUES (?,?,?,?)").run(eventId,operationId,session.participationId,this.now().toISOString());
       this.database.exec("COMMIT");

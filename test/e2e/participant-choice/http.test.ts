@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createApi } from "../../../apps/api-node/src/app.ts";
@@ -26,6 +27,8 @@ test("HTTP choice-to-draft integration enforces session, origin, tenant, privacy
   const organizerInvite=service.issueInvite("event_public","organizer");const organizerExchange=await app.request(`/api/session/exchange?capability=${encodeURIComponent(organizerInvite.capability)}`);const organizerCookie=(organizerExchange.headers.get("set-cookie")??"").split(";")[0]??"";const organizerDraft=await app.request("/api/events/event_public/draft",{headers:{cookie:organizerCookie}});assert.equal(organizerDraft.status,200);assert.equal(JSON.stringify(await organizerDraft.json()).includes("rankings"),false);
   const idor = await app.request("/api/events/event_other/ballot", { headers: { cookie } });
   assert.equal(idor.status, 401);
+  const wrongEventCookie=cookie.replace(/^woodshed_session_[^=]+/,`woodshed_session_${createHash("sha256").update("event_other").digest("hex").slice(0,16)}`);
+  const wrongEvent=await app.request("/api/events/event_other/ballot",{headers:{cookie:wrongEventCookie}});assert.equal(wrongEvent.status,403);
   service.close();
 });
 
@@ -79,13 +82,15 @@ test("event-scoped cookies resume the original ballot after switching away and b
 test("open joins replay safely and event-scoped cookies preserve identity across event switches", async () => {
   const origin="http://127.0.0.1:5173";const service=new ChoiceService(":memory:");service.migrate();service.seedDemo({publicParticipationPolicy:"open"});service.createEvent({id:"event_second",communityId:"community_demo",name:"Second",visibility:"public",participationPolicy:"open",proposalPolicy:"editorial"});service.database.prepare("UPDATE events SET state='voting' WHERE id='event_second'").run();const app=createApi(service,{origin});
   const join=async(eventId:string,operationId:string,cookie="")=>app.request(`/api/events/${eventId}/join-open`,{method:"POST",headers:{origin,"x-csrf-token":"same-origin","content-type":"application/json",...(cookie?{cookie}:{})},body:JSON.stringify({operationId})});
-  const first=await join("event_public","join_a");const cookieA=(first.headers.get("set-cookie")??"").split(";")[0]??"";service.database.prepare("UPDATE participant_sessions SET expires_at='2000-01-01T00:00:00Z' WHERE event_id='event_public'").run();const replay=await join("event_public","join_a",cookieA);assert.equal(replay.status,200);const replayCookie=(replay.headers.get("set-cookie")??"").split(";")[0]??"";assert.equal((await app.request("/api/events/event_public/ballot",{headers:{cookie:replayCookie}})).status,200);assert.equal(Number((service.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id='event_public'").get() as {count:number}).count),1);
+  const first=await join("event_public","join_a");const cookieA=(first.headers.get("set-cookie")??"").split(";")[0]??"";assert.equal((await join("event_public","join_a")).status,409);const replay=await join("event_public","join_a",cookieA);assert.equal(replay.status,200);const replayCookie=(replay.headers.get("set-cookie")??"").split(";")[0]??"";assert.equal(replayCookie,cookieA);assert.equal((await app.request("/api/events/event_public/ballot",{headers:{cookie:replayCookie}})).status,200);assert.equal(Number((service.database.prepare("SELECT count(*) count FROM guest_participations WHERE event_id='event_public'").get() as {count:number}).count),1);
   const second=await join("event_second","join_b",cookieA);const cookieB=(second.headers.get("set-cookie")??"").split(";")[0]??"";const both=`${replayCookie}; ${cookieB}`;assert.equal((await app.request("/api/events/event_public/ballot",{headers:{cookie:both}})).status,200);assert.equal((await app.request("/api/events/event_second/ballot",{headers:{cookie:both}})).status,200);service.close();
 });
 
 test("out-of-order open joins cannot overwrite another event's session", async () => {
   const origin="http://127.0.0.1:5173";const service=new ChoiceService(":memory:");service.migrate();service.seedDemo({publicParticipationPolicy:"open"});service.createEvent({id:"event_second",communityId:"community_demo",name:"Second",visibility:"public",participationPolicy:"open",proposalPolicy:"editorial"});service.database.prepare("UPDATE events SET state='voting' WHERE id='event_second'").run();const app=createApi(service,{origin});const headers={origin,"x-csrf-token":"same-origin","content-type":"application/json"};const a=await app.request("/api/events/event_public/join-open",{method:"POST",headers,body:JSON.stringify({operationId:"late_a"})});const b=await app.request("/api/events/event_second/join-open",{method:"POST",headers,body:JSON.stringify({operationId:"early_b"})});assert.notEqual((a.headers.get("set-cookie")??"").split("=")[0],(b.headers.get("set-cookie")??"").split("=")[0]);service.close();
 });
+
+test("logout clears every event-scoped session cookie",async()=>{const origin="http://127.0.0.1:5173",service=new ChoiceService(":memory:");service.migrate();service.seedDemo({publicParticipationPolicy:"open"});service.createEvent({id:"event_second",communityId:"community_demo",name:"Second",visibility:"public",participationPolicy:"open",proposalPolicy:"editorial"});service.database.prepare("UPDATE events SET state='voting' WHERE id='event_second'").run();const app=createApi(service,{origin}),headers={origin,"x-csrf-token":"same-origin","content-type":"application/json"};const a=await app.request("/api/events/event_public/join-open",{method:"POST",headers,body:JSON.stringify({operationId:"logout_a"})}),b=await app.request("/api/events/event_second/join-open",{method:"POST",headers,body:JSON.stringify({operationId:"logout_b"})});const cookies=`${(a.headers.get("set-cookie")??"").split(";")[0]}; ${(b.headers.get("set-cookie")??"").split(";")[0]}`;const logout=await app.request("/api/logout",{method:"POST",headers:{...headers,cookie:cookies},body:"{}"});assert.equal((logout.headers.getSetCookie?.()??[]).filter(value=>value.includes("Max-Age=0")).length,2);service.close();});
 
 test("browser client joins, persists a ranked ballot and proposal, then reloads them through HTTP", async () => {
   const origin = "http://127.0.0.1:5173";

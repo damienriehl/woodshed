@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createTeardownController, signalExitCode } from "./dev-lifecycle.mjs";
 import { terminateProcessTree } from "./process-tree.mjs";
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -10,16 +11,10 @@ const children = [
   spawn(npm, ["run", "dev", "-w", "@woodshed/web"], spawnOptions({ ...process.env, WOODSHED_API_PORT: apiPort, WOODSHED_WEB_PORT: webPort })),
 ];
 
-let stopping = false;
-function stop(signal = "SIGTERM") {
-  if (stopping) return;
-  stopping = true;
-  for (const child of children) terminateProcessTree(child, signal);
+const teardown = createTeardownController({ children, terminate: terminateProcessTree });
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.on(signal, () => teardown.handleSignal(signal));
 }
-
-let requestedSignal = null;
-process.on("SIGINT", () => { requestedSignal = "SIGINT"; stop("SIGINT"); });
-process.on("SIGTERM", () => { requestedSignal = "SIGTERM"; stop("SIGTERM"); });
 
 const exits = children.map((child) => new Promise((resolve, reject) => {
   child.once("error", reject);
@@ -27,11 +22,13 @@ const exits = children.map((child) => new Promise((resolve, reject) => {
 }));
 try {
   const first = await Promise.race(exits);
-  if (first.code !== 0) process.exitCode = first.code ?? (first.signal === "SIGINT" ? 130 : first.signal === "SIGTERM" ? 143 : 1);
+  if (teardown.requestedSignal) process.exitCode = signalExitCode(teardown.requestedSignal);
+  else if (first.code !== 0) process.exitCode = first.code ?? signalExitCode(first.signal);
 } catch (error) {
   console.error("Woodshed development launcher failed:", error instanceof Error ? error.message : "unknown child-process error");
   process.exitCode = 1;
 } finally {
-  stop(requestedSignal ?? "SIGTERM");
+  teardown.stop(teardown.requestedSignal ?? "SIGTERM");
   await Promise.allSettled(exits);
+  teardown.settled();
 }
