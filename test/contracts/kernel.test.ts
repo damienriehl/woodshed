@@ -172,6 +172,8 @@ test("expired commands, stale revisions and cross-community resources fail close
   });
 });
 
+test("SQLite kernel reports a lifecycle trigger as voting-closed",async()=>{await withKernel(kernel=>{kernel.database.prepare("UPDATE events SET state='completed' WHERE id=?").run(IDS.event);assert.throws(()=>kernel.replaceBallot(command(),[IDS.songA],new Date("2030-01-01T12:01:00.000Z")),(error:unknown)=>typeof error==="object"&&error!==null&&"code" in error&&error.code==="voting-closed");});});
+
 test("ballot commands reject capability, aggregate type, and aggregate identity confusion", async () => {
   await withKernel((kernel) => {
     const now = new Date("2030-01-01T12:01:00.000Z");

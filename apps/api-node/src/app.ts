@@ -22,6 +22,7 @@ const ERROR_STATUS = {
   "voting-closed": 409,
   "replay-session-required": 409,
   "open-participation-capacity": 429,
+  "recovery-capacity": 429,
 } as const;
 
 export function createApi(service: ChoiceService, options: { origin: string; coordination?: CoordinationService }) {
