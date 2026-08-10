@@ -55,6 +55,7 @@
     "tools/privacy/scanner.mjs",
     "tools/release/verify.mjs",
     "tools/verify-foundation.mjs",
+    "tools/cloudflare-smoke.mjs",
     "tools/dev.mjs",
     "tools/dev-lifecycle.mjs",
     "tools/process-tree.mjs",
