@@ -14,7 +14,8 @@ const origin = "https://woodshed.example";
 const liveSecret = "test-live-command-secret";
 const sessionToken = "test-organizer-session";
 const sessionHash = createHash("sha256").update(sessionToken).digest("hex");
-const migrationSql = Promise.all(["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql", "008_runtime_quota_indexes.sql"].map(name => readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8")));
+const baseMigrationSql = Promise.all(["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"].map(name => readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8")));
+const runtimeQuotaMigrationSql = readFile(new URL("../../migrations/d1/008_runtime_quota_indexes.sql", import.meta.url), "utf8");
 
 class MemoryDurableStorage {
   private readonly values = new Map<string, unknown>();
@@ -367,17 +368,18 @@ async function runtime(appOrigin = origin) {
     d1Databases: { DB: "woodshed-worker" }, d1Persist: persist,
   });
   const DB = await miniflare.getD1Database("DB");
-  for (const sql of await migrationSql) await DB.exec(sql);
+  for (const sql of await baseMigrationSql) await DB.exec(sql);
   await DB.batch([
     DB.prepare("INSERT INTO communities(id,name) VALUES (?,?),(?,?)").bind("community_demo", "Demo", "community_other", "Other"),
     DB.prepare("INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES (?,?,?,'live','public','open'),(?,?,?,'live','private','invite'),(?,?,?,'live','private','open'),(?,?,?,'live','unlisted','open')").bind("event_public", "community_demo", "Singalong", "event_other", "community_other", "Other", "event_private_open", "community_demo", "Private Open", "event_unlisted_open", "community_demo", "Unlisted Open"),
-    DB.prepare("INSERT INTO event_choice_config(event_id,proposal_policy) VALUES (?,'editorial'),(?,'immediate')").bind("event_public", "event_other"),
     DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?),(?,?,?),(?,?,?)").bind("song_alpha", "community_demo", "North Star", "song_bravo", "community_demo", "Open Road", "song_charlie", "community_demo", "Not Eligible"),
     DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?)").bind("song_other", "community_other", "Wrong Tenant"),
     DB.prepare("INSERT INTO event_eligible_songs(event_id,song_id,added_at) VALUES (?,?,?),(?,?,?)").bind("event_public", "song_alpha", "2026-01-01T00:00:00Z", "event_public", "song_bravo", "2026-01-01T00:00:00Z"),
     DB.prepare("INSERT INTO guest_participations(id,community_id,event_id) VALUES (?,?,?)").bind("participation_host", "community_demo", "event_public"),
     DB.prepare("INSERT INTO participant_sessions(id_hash,participation_id,community_id,event_id,role,assurance,expires_at) VALUES (?,?,?,?,?,'invite',?)").bind(sessionHash, "participation_host", "community_demo", "event_public", "community-admin", "2031-01-01T00:00:00Z"),
   ]);
+  await DB.exec(await runtimeQuotaMigrationSql);
+  await DB.prepare("UPDATE event_choice_config SET proposal_policy='editorial' WHERE event_id=?").bind("event_public").run();
   const env: WorkerBindings = { DB, LIVE_COORDINATOR: authorityNamespace(), APP_ORIGIN: appOrigin, LIVE_COMMAND_SECRET: liveSecret, CLOCK_ISO: "2030-01-01T12:01:00.000Z" };
   return {
     DB,
