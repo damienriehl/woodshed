@@ -14,6 +14,7 @@ const origin = "https://woodshed.example";
 const liveSecret = "test-live-command-secret";
 const sessionToken = "test-organizer-session";
 const sessionHash = createHash("sha256").update(sessionToken).digest("hex");
+const migrationSql = Promise.all(["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"].map(name => readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8")));
 
 class MemoryDurableStorage {
   private readonly values = new Map<string, unknown>();
@@ -66,6 +67,80 @@ async function signedCommand(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Cloudflare Worker runtime", () => {
+  it("completes the accountless participant first loop with event-scoped sessions", async () => {
+    const fixture = await runtime();
+    try {
+      const joined = await fixture.fetch("/api/events/event_public/join-open", {
+        method: "POST",
+        headers: fixture.mutationHeaders(),
+        body: JSON.stringify({ operationId: "join_worker_first_loop" }),
+      });
+      assert.equal(joined.status, 200);
+      assert.deepEqual(await joined.json(), { assurance: "open-public" });
+      const cookie = joined.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+      assert.match(cookie, /^woodshed_session_[0-9a-f]{16}=/);
+      assert.match(joined.headers.get("set-cookie") ?? "", /HttpOnly; Secure; SameSite=Lax/);
+
+      const context = await fixture.fetch("/api/events/event_public/context", { headers: { cookie } });
+      assert.equal(context.status, 200);
+      assert.deepEqual(await context.json(), { event: { id: "event_public", name: "Singalong", state: "live", visibility: "public", participationPolicy: "open" } });
+      assert.equal((await fixture.fetch("/api/events/event_other/context", { headers: { cookie } })).status, 401);
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie: "woodshed_session_bad=%E0%A4%A" } })).status, 401);
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: { cookie } })).status, 200);
+
+      const proposed = await fixture.fetch("/api/events/event_public/proposals", {
+        method: "POST",
+        headers: fixture.mutationHeaders(cookie),
+        body: JSON.stringify({ title: "Lantern Song", operationId: "proposal_worker_one" }),
+      });
+      assert.equal(proposed.status, 201);
+      const proposal = await proposed.json();
+      assert.deepEqual(await (await fixture.fetch("/api/events/event_public/proposals", {
+        method: "POST", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ title: "Lantern Song", operationId: "proposal_worker_one" }),
+      })).json(), proposal);
+      const mismatch = await fixture.fetch("/api/events/event_public/proposals", {
+        method: "POST", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ title: "Changed Song", operationId: "proposal_worker_one" }),
+      });
+      assert.equal(mismatch.status, 409);
+      assert.deepEqual(await mismatch.json(), { error: "replay-mismatch" });
+      assert.equal((await fixture.fetch("/api/events/event_public/proposals", { method: "POST", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ title: "Second Song", operationId: "proposal_worker_two" }) })).status, 201);
+      const quotaRace = await Promise.all([["proposal_worker_three", "Third Song"], ["proposal_worker_four", "Fourth Song"]].map(([operationId, title]) => fixture.fetch("/api/events/event_public/proposals", { method: "POST", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ title, operationId }) })));
+      assert.deepEqual(quotaRace.map(response => response.status).sort(), [201, 400]);
+      const overQuota = quotaRace.find(response => response.status === 400)!;
+      assert.deepEqual(await overQuota.json(), { error: "quota-exceeded" });
+      assert.equal((await fixture.DB.prepare("SELECT count(*) AS count FROM choice_proposals WHERE event_id=? AND participation_id=(SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?)").bind("event_public", "event_public", "join_worker_first_loop").first<{ count: number }>())?.count, 3);
+
+      assert.equal((await fixture.fetch("/api/events/event_public/join-open", {
+        method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId: "join_worker_first_loop" }),
+      })).status, 409);
+      const replay = await fixture.fetch("/api/events/event_public/join-open", {
+        method: "POST", headers: fixture.mutationHeaders(cookie), body: JSON.stringify({ operationId: "join_worker_first_loop" }),
+      });
+      assert.equal(replay.status, 200);
+      assert.equal(replay.headers.get("set-cookie")?.split(";", 1)[0], cookie);
+
+      const logout = await fixture.fetch("/api/logout", { method: "POST", headers: fixture.mutationHeaders(`${cookie}; woodshed_session_deadbeefdeadbeef=another`) });
+      assert.equal(logout.status, 204);
+      assert.equal(logout.headers.getSetCookie().filter(value => /Max-Age=0/.test(value)).length, 2);
+
+      const participation = await fixture.DB.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").bind("event_public", "join_worker_first_loop").first<{ participation_id: string }>();
+      await fixture.DB.prepare("UPDATE guest_participations SET revoked_at=? WHERE id=?").bind("2030-01-01T12:02:00.000Z", participation!.participation_id).run();
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie } })).status, 401);
+    } finally { await fixture.close(); }
+  });
+
+  it("atomically bounds concurrent open joins at the per-event capacity", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.exec("WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM sequence WHERE value<9998) INSERT INTO guest_participations(id,community_id,event_id) SELECT 'participation_fill_' || value,'community_demo','event_public' FROM sequence");
+      const attempts = await Promise.all(["capacity_a", "capacity_b"].map(operationId => fixture.fetch("/api/events/event_public/join-open", {
+        method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId }),
+      })));
+      assert.deepEqual(attempts.map(response => response.status).sort(), [200, 429]);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) AS count FROM guest_participations WHERE event_id='event_public' AND revoked_at IS NULL").first<{ count: number }>())?.count, 10_000);
+    } finally { await fixture.close(); }
+  });
+
   it("serves D1 discovery and authenticated ballot replacement without an injected application", async () => {
     const fixture = await runtime();
     try {
@@ -217,12 +292,11 @@ async function runtime() {
     d1Databases: { DB: "woodshed-worker" }, d1Persist: persist,
   });
   const DB = await miniflare.getD1Database("DB");
-  for (const name of ["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"]) {
-    await DB.exec(await readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8"));
-  }
+  for (const sql of await migrationSql) await DB.exec(sql);
   await DB.batch([
     DB.prepare("INSERT INTO communities(id,name) VALUES (?,?),(?,?)").bind("community_demo", "Demo", "community_other", "Other"),
-    DB.prepare("INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES (?,?,?,'live','public','invite'),(?,?,?,'live','private','invite')").bind("event_public", "community_demo", "Singalong", "event_other", "community_other", "Other"),
+    DB.prepare("INSERT INTO events(id,community_id,name,state,visibility,participation_policy) VALUES (?,?,?,'live','public','open'),(?,?,?,'live','private','invite')").bind("event_public", "community_demo", "Singalong", "event_other", "community_other", "Other"),
+    DB.prepare("INSERT INTO event_choice_config(event_id,proposal_policy) VALUES (?,'editorial'),(?,'immediate')").bind("event_public", "event_other"),
     DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?),(?,?,?),(?,?,?)").bind("song_alpha", "community_demo", "North Star", "song_bravo", "community_demo", "Open Road", "song_charlie", "community_demo", "Not Eligible"),
     DB.prepare("INSERT INTO canonical_songs(id,community_id,title) VALUES (?,?,?)").bind("song_other", "community_other", "Wrong Tenant"),
     DB.prepare("INSERT INTO event_eligible_songs(event_id,song_id,added_at) VALUES (?,?,?),(?,?,?)").bind("event_public", "song_alpha", "2026-01-01T00:00:00Z", "event_public", "song_bravo", "2026-01-01T00:00:00Z"),
@@ -234,6 +308,7 @@ async function runtime() {
     DB,
     fetch(pathname: string, init?: RequestInit) { return worker.fetch(new Request(`${origin}${pathname}`, init), env); },
     authHeaders(mutating = false) { return { authorization: `Bearer ${sessionToken}`, ...(mutating ? { origin, "x-csrf-token": "same-origin", "content-type": "application/json" } : {}) }; },
+    mutationHeaders(cookie = "") { return { origin, "x-csrf-token": "same-origin", "content-type": "application/json", ...(cookie ? { cookie } : {}) }; },
     async close() { await miniflare.dispose(); await rm(persist, { recursive: true, force: true }); },
   };
 }
