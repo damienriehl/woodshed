@@ -32,6 +32,12 @@ export function createTeardownController({
     exit(signalExitCode(requestedSignal));
   }
 
+  function startGraceTimer() {
+    if (graceTimer !== null) return;
+    graceTimer = setTimer(forceExit, graceMs);
+    graceTimer?.unref?.();
+  }
+
   return {
     get requestedSignal() { return requestedSignal; },
     get requestedExitCode() { return requestedSignal ? signalExitCode(requestedSignal) : null; },
@@ -44,11 +50,11 @@ export function createTeardownController({
 
       requestedSignal = signal;
       terminateAll(signal);
-      graceTimer = setTimer(forceExit, graceMs);
-      graceTimer?.unref?.();
+      startGraceTimer();
     },
     stop(signal = "SIGTERM") {
       terminateAll(signal);
+      startGraceTimer();
     },
     settled() {
       if (graceTimer !== null) clearTimer(graceTimer);

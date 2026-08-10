@@ -29,7 +29,13 @@ async function waitForExit(child, timeout = 1_000) {
 async function assertProcessGone(pid, timeout = 1_000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    try { process.kill(pid, 0); }
+    try {
+      process.kill(pid, 0);
+      if (process.platform === "linux") {
+        try { const stat=await readFile(`/proc/${pid}/stat`,"utf8");if(stat.slice(stat.lastIndexOf(") ")+2,stat.lastIndexOf(") ")+3)==="Z")return; }
+        catch (error) { if (error.code === "ENOENT") return; }
+      }
+    }
     catch (error) {
       assert.equal(error.code, "ESRCH");
       return;
@@ -111,6 +117,14 @@ test("first-signal grace expiry force-stops children and exits", () => {
     { pid: 1, signal: "SIGKILL" },
     { exit: 143 },
   ]);
+});
+
+test("unexpected child exit starts the same bounded teardown grace period", () => {
+  const calls=[];let expire;const controller=createTeardownController({children:[{pid:1},{pid:2}],terminate(child,signal){calls.push({pid:child.pid,signal})},setTimer(callback,delay){expire=callback;calls.push({delay});return 15},clearTimer(){},exit(code){calls.push({exit:code})},graceMs:250});
+  controller.stop();
+  assert.deepEqual(calls,[{pid:1,signal:"SIGTERM"},{pid:2,signal:"SIGTERM"},{delay:250}]);
+  expire();
+  assert.deepEqual(calls.slice(-3),[{pid:1,signal:"SIGKILL"},{pid:2,signal:"SIGKILL"},{exit:1}]);
 });
 
 test("forced exit is not suppressed when one child teardown throws", () => {
