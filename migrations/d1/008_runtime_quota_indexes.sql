@@ -1,0 +1,2 @@
+CREATE INDEX guest_participations_active_event_idx ON guest_participations(event_id) WHERE revoked_at IS NULL;
+CREATE INDEX choice_proposals_event_participation_idx ON choice_proposals(event_id,participation_id);

@@ -40,9 +40,9 @@ export class D1ChoiceRuntime {
 
   async joinOpen(eventId: string, operationId: string, replayToken?: string): Promise<IssuedRuntimeSession> {
     if (!operationId) throw new RuntimeError("invalid-request");
-    const event = await this.database.prepare("SELECT community_id,participation_policy,state FROM events WHERE id=?").bind(eventId).first<{ community_id: string; participation_policy: string; state: string }>();
+    const event = await this.database.prepare("SELECT community_id,participation_policy,state,visibility FROM events WHERE id=?").bind(eventId).first<{ community_id: string; participation_policy: string; state: string; visibility: string }>();
     if (!event) throw new RuntimeError("not-found");
-    if (event.participation_policy !== "open" || event.state === "draft") throw new RuntimeError("denied");
+    if (event.visibility !== "public" || event.participation_policy !== "open" || event.state === "draft") throw new RuntimeError("denied");
     const receipt = await this.database.prepare("SELECT participation_id FROM open_join_receipts WHERE event_id=? AND operation_id=?").bind(eventId, operationId).first<{ participation_id: string }>();
     if (receipt) {
       if (!replayToken) throw new RuntimeError("replay-session-required");
@@ -51,7 +51,8 @@ export class D1ChoiceRuntime {
         if (replay.eventId !== eventId || replay.participationId !== receipt.participation_id) throw new RuntimeError("replay-session-required");
         return { ...replay, token: replayToken, assurance: "open-public" };
       } catch (error) {
-        if (error instanceof RuntimeError && error.code === "replay-session-required") throw error;
+        if (!(error instanceof RuntimeError)) throw error;
+        if (error.code === "replay-session-required") throw error;
         throw new RuntimeError("replay-session-required");
       }
     }
@@ -93,8 +94,18 @@ export class D1ChoiceRuntime {
     const songs = await this.database.prepare("SELECT s.id,s.title FROM canonical_songs s JOIN event_eligible_songs e ON e.song_id=s.id WHERE e.event_id=? AND s.community_id=? ORDER BY s.id").bind(session.eventId, session.communityId).all<{ id: string; title: string }>();
     const scored = await Promise.all(songs.results.map(async (song) => ({ ...song, score: await webSha256(`${session.participationId}\0${song.id}`) })));
     scored.sort((a, b) => a.score.localeCompare(b.score) || a.id.localeCompare(b.id));
-    const current = await this.database.prepare("SELECT current_revision FROM ballots WHERE community_id=? AND event_id=? AND participation_id=?").bind(session.communityId, session.eventId, session.participationId).first<{ current_revision: number }>();
-    return { method: "ranked-choice" as const, revision: Number(current?.current_revision ?? 0), candidates: scored.map(({ id, title }) => ({ id, title })) };
+    const current = await this.database.prepare("SELECT id,current_revision FROM ballots WHERE community_id=? AND event_id=? AND participation_id=?").bind(session.communityId, session.eventId, session.participationId).first<{ id: string; current_revision: number }>();
+    const revision = Number(current?.current_revision ?? 0);
+    let ordered = scored;
+    if (current && revision > 0) {
+      const version = await this.database.prepare("SELECT rankings_json FROM ballot_versions WHERE ballot_id=? AND revision=?").bind(current.id, revision).first<{ rankings_json: string }>();
+      const persisted = version ? JSON.parse(version.rankings_json) as unknown : [];
+      const savedIds = Array.isArray(persisted) ? persisted.filter((id): id is string => typeof id === "string") : [];
+      const byId = new Map(scored.map(song => [song.id, song]));
+      const retained = savedIds.flatMap(id => { const song=byId.get(id);if(!song)return [];byId.delete(id);return [song]; });
+      ordered = [...retained, ...scored.filter(song => byId.has(song.id))];
+    }
+    return { method: "ranked-choice" as const, revision, candidates: ordered.map(({ id, title }) => ({ id, title })) };
   }
 
   async replaceBallot(session: RuntimeSession, value: unknown) {
