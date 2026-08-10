@@ -69,10 +69,10 @@ test("event-scoped cookies resume the original ballot after switching away and b
     const headers=new Headers(init.headers);headers.set("origin","https://woodshed.example");headers.set("x-csrf-token","same-origin");headers.set("cookie",[...cookies].map(([name,value])=>`${name}=${value}`).join("; "));
     const response=await app.request(path,{...init,headers});const set=response.headers.get("set-cookie")?.split(";",1)[0]?.split("=");if(set?.[0]&&set[1])cookies.set(set[0],set[1]);return response;
   };
-  await request("/api/events/event_public/join-open",{method:"POST"});
+  await request("/api/events/event_public/join-open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:"join_resume_public"})});
   const first=await (await request("/api/events/event_public/ballot")).json() as {revision:number;candidates:{id:string}[]};
   await request("/api/events/event_public/ballot",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({expectedRevision:first.revision,rankings:first.candidates.map(({id})=>id),operationId:"operation_first_event"})});
-  await request("/api/events/event_second/join-open",{method:"POST"});
+  await request("/api/events/event_second/join-open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:"join_resume_second"})});
   const resumed=await (await request("/api/events/event_public/ballot")).json() as {revision:number};
   assert.equal(resumed.revision,first.revision+1);
   assert.equal(cookies.size,2);
