@@ -20,9 +20,11 @@ export interface ArchiveDestinationPort {
 
 export class SqliteArchiveDestination implements ArchiveDestinationPort {
   private readonly db: DatabaseSync;
+  private readonly now:()=>Date;
 
-  constructor(filename = ":memory:") {
+  constructor(filename = ":memory:", now=()=>new Date()) {
     this.db = new DatabaseSync(filename);
+    this.now=now;
     this.db.exec("PRAGMA foreign_keys=ON");
   }
 
@@ -31,7 +33,7 @@ export class SqliteArchiveDestination implements ArchiveDestinationPort {
   }
 
   stage(archive: CommunityArchive) {
-    const validated = validateCommunityArchive(archive);
+    const validated = validateCommunityArchive(archive,this.now());
     this.db.prepare("INSERT INTO archive_staging(archive_id,payload_json) VALUES(?,?) ON CONFLICT(archive_id) DO UPDATE SET payload_json=excluded.payload_json")
       .run(validated.archiveId, canonicalJson(validated));
   }
@@ -41,7 +43,7 @@ export class SqliteArchiveDestination implements ArchiveDestinationPort {
     try {
       const row = this.db.prepare("SELECT payload_json FROM archive_staging WHERE archive_id=?").get(archiveId) as { payload_json: string } | undefined;
       if (!row) throw new Error("archive not staged");
-      const archive = validateCommunityArchive(JSON.parse(row.payload_json) as CommunityArchive);
+      const archive = validateCommunityArchive(JSON.parse(row.payload_json) as CommunityArchive,this.now());
       if (archive.destinationCommunityId !== destinationCommunityId) throw new Error("archive destination mismatch");
       this.db.prepare("INSERT INTO community_archive_pointers(community_id,archive_id,payload_json) VALUES(?,?,?) ON CONFLICT(community_id) DO UPDATE SET archive_id=excluded.archive_id,payload_json=excluded.payload_json")
         .run(destinationCommunityId, archiveId, row.payload_json);
@@ -74,9 +76,11 @@ export class SqliteArchiveDestination implements ArchiveDestinationPort {
 
 export class D1ArchiveDestination implements ArchiveDestinationPort {
   private readonly db: D1Database;
+  private readonly now:()=>Date;
 
-  constructor(db: D1Database) {
+  constructor(db: D1Database,now=()=>new Date()) {
     this.db = db;
+    this.now=now;
   }
 
   async migrate() {
@@ -84,7 +88,7 @@ export class D1ArchiveDestination implements ArchiveDestinationPort {
   }
 
   async stage(archive: CommunityArchive) {
-    const validated = validateCommunityArchive(archive);
+    const validated = validateCommunityArchive(archive,this.now());
     await this.db.prepare("INSERT INTO archive_staging(archive_id,payload_json) VALUES(?,?) ON CONFLICT(archive_id) DO UPDATE SET payload_json=excluded.payload_json")
       .bind(validated.archiveId, canonicalJson(validated)).run();
   }
@@ -93,7 +97,7 @@ export class D1ArchiveDestination implements ArchiveDestinationPort {
     const row = await this.db.prepare("SELECT payload_json FROM archive_staging WHERE archive_id=?")
       .bind(archiveId).first<{ payload_json: string }>();
     if (!row) throw new Error("archive not staged");
-    const archive = validateCommunityArchive(JSON.parse(row.payload_json) as CommunityArchive);
+    const archive = validateCommunityArchive(JSON.parse(row.payload_json) as CommunityArchive,this.now());
     if (archive.destinationCommunityId !== destinationCommunityId) throw new Error("archive destination mismatch");
     await this.db.batch([
       this.db.prepare("INSERT INTO community_archive_pointers(community_id,archive_id,payload_json) VALUES(?,?,?) ON CONFLICT(community_id) DO UPDATE SET archive_id=excluded.archive_id,payload_json=excluded.payload_json")

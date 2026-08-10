@@ -69,6 +69,7 @@ describe("Cloudflare Worker runtime", () => {
   it("serves D1 discovery and authenticated ballot replacement without an injected application", async () => {
     const fixture = await runtime();
     try {
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM sqlite_master WHERE type='table' AND name='open_join_receipts'").first<{count:number}>())?.count,1);
       const discovery = await fixture.fetch("/api/discovery");
       assert.equal(discovery.status, 200);
       assert.deepEqual((await discovery.json() as { events: { id: string }[] }).events.map(({ id }) => id), ["event_public"]);
@@ -216,7 +217,7 @@ async function runtime() {
     d1Databases: { DB: "woodshed-worker" }, d1Persist: persist,
   });
   const DB = await miniflare.getD1Database("DB");
-  for (const name of ["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql"]) {
+  for (const name of ["001_first_loop.sql", "002_participant_choice.sql", "003_rehearsal_coordination.sql", "004_live_performance.sql", "005_coordination_repository.sql", "006_worker_runtime.sql", "007_open_join_receipts.sql"]) {
     await DB.exec(await readFile(new URL(`../../migrations/d1/${name}`, import.meta.url), "utf8"));
   }
   await DB.batch([

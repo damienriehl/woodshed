@@ -17,21 +17,21 @@ Install the exact reviewed dependency graph:
 npm ci
 ```
 
-Start the interactive synthetic-data prototype:
+Start the connected participant preview with its local API and synthetic database:
 
 ```sh
 npm run dev
 ```
 
-Vite prints the local browser URL. The prototype demonstrates the participant, rehearsal, and stage-lead interaction model, but it is intentionally not connected to the API yet; changes reset on refresh.
+Open the printed `http://127.0.0.1:4174` URL. Event discovery, open accountless joining, ranked-ballot saves, and song proposals persist through the local Node/SQLite API on port 3100. Override those defaults with `WOODSHED_WEB_PORT` and `WOODSHED_API_PORT`. Synthetic development state lives in the operating system’s temporary directory, outside the repository and its public-release boundary. Rehearsal and stage-lead controls are still explicitly labeled simulations.
 
-To run the Node/SQLite API reference in a second terminal:
+To run only the Node/SQLite API reference in a second terminal:
 
 ```sh
-npm run dev -w @woodshed/api-node
+npm run dev -w @woodshed/api-node -- --demo
 ```
 
-The API creates `woodshed.sqlite` in the working directory unless `WOODSHED_DB` names another path. API integration instructions and a real organizer onboarding flow remain release work; do not treat the synthetic browser prototype as a production deployment.
+Without `--demo`, the API creates `woodshed.sqlite` in the working directory unless `WOODSHED_DB` names another path and does not seed any data. The connected preview is a development workflow, not a production deployment.
 
 ## Verify the foundation
 

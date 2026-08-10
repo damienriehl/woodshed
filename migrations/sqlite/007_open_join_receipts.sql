@@ -1,0 +1,1 @@
+CREATE TABLE open_join_receipts (event_id TEXT NOT NULL REFERENCES events(id), operation_id TEXT NOT NULL, participation_id TEXT NOT NULL REFERENCES guest_participations(id), created_at TEXT NOT NULL, PRIMARY KEY(event_id, operation_id)) STRICT;
