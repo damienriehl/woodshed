@@ -41,6 +41,7 @@ export class D1ChoiceRuntime {
   }
 
   async ballot(session: RuntimeSession) {
+    await this.assertVotingOpen(session);
     const songs = await this.database.prepare("SELECT s.id,s.title FROM canonical_songs s JOIN event_eligible_songs e ON e.song_id=s.id WHERE e.event_id=? AND s.community_id=? ORDER BY s.id").bind(session.eventId, session.communityId).all<{ id: string; title: string }>();
     const scored = await Promise.all(songs.results.map(async (song) => ({ ...song, score: await webSha256(`${session.participationId}\0${song.id}`) })));
     scored.sort((a, b) => a.score.localeCompare(b.score) || a.id.localeCompare(b.id));
@@ -49,6 +50,7 @@ export class D1ChoiceRuntime {
   }
 
   async replaceBallot(session: RuntimeSession, value: unknown) {
+    await this.assertVotingOpen(session);
     const body = record(value);
     if (!Number.isSafeInteger(body.expectedRevision) || (body.expectedRevision as number) < 0 || !Array.isArray(body.rankings) || !body.rankings.every((item) => typeof item === "string") || typeof body.operationId !== "string" || body.operationId.length === 0) throw new RuntimeError("invalid-command");
     const state = await this.database.prepare("SELECT state FROM ballots WHERE community_id=? AND event_id=? AND participation_id=?").bind(session.communityId, session.eventId, session.participationId).first<{ state: string }>();
@@ -61,6 +63,8 @@ export class D1ChoiceRuntime {
     };
     return new D1Kernel(this.database, []).replaceBallot(envelope, body.rankings as string[], now);
   }
+
+  private async assertVotingOpen(session:RuntimeSession){const event=await this.database.prepare("SELECT state FROM events WHERE id=? AND community_id=?").bind(session.eventId,session.communityId).first<{state:string}>();if(!event)throw new RuntimeError("denied");if(!["voting","live"].includes(event.state))throw new RuntimeError("voting-closed");}
 }
 
 export function record(value: unknown): Record<string, unknown> {

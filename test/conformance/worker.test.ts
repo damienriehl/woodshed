@@ -87,6 +87,13 @@ describe("Cloudflare Worker runtime", () => {
       assert.equal(saved.status, 200);
       assert.equal((await saved.json() as { revision: number }).revision, 1);
 
+      await fixture.DB.prepare("UPDATE events SET state='completed' WHERE id='event_public'").run();
+      assert.equal((await fixture.fetch("/api/events/event_public/ballot", { headers: fixture.authHeaders() })).status,409);
+      const replayAfterClose=await fixture.fetch("/api/events/event_public/ballot",{method:"PUT",headers:fixture.authHeaders(true),body:JSON.stringify({expectedRevision:0,rankings:current.candidates.map(({id})=>id),operationId:"operation_ballot_one"})});
+      assert.equal(replayAfterClose.status,409);
+      assert.deepEqual(await replayAfterClose.json(),{error:"voting-closed"});
+      await fixture.DB.prepare("UPDATE events SET state='voting' WHERE id='event_public'").run();
+
       await fixture.DB.prepare("UPDATE ballots SET state='closed' WHERE event_id=? AND participation_id=?").bind("event_public", "participation_host").run();
       const closed = await fixture.fetch("/api/events/event_public/ballot", { method: "PUT", headers: fixture.authHeaders(true), body: JSON.stringify({ expectedRevision: 1, rankings: current.candidates.map(({ id }) => id), operationId: "operation_ballot_closed" }) });
       assert.equal(closed.status, 409);

@@ -19,6 +19,7 @@ const ERROR_STATUS = {
   denied: 403,
   "not-found": 404,
   conflict: 409,
+  "voting-closed": 409,
   "replay-session-required": 409,
   "open-participation-capacity": 429,
 } as const;

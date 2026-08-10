@@ -67,6 +67,7 @@ test("event-scoped cookies resume the original ballot after switching away and b
   const service = new ChoiceService(":memory:"); service.migrate(); service.seedDemo({ publicParticipationPolicy: "open" });
   const secondEvent = { id:"event_second",communityId:"community_demo",name:"Second Event",state:"voting",visibility:"public",participationPolicy:"open",proposalPolicy:"editorial" } as const;
   service.createEvent(secondEvent);
+  service.database.prepare("UPDATE events SET state='voting' WHERE id='event_second'").run();
   const app = createApi(service, { origin: "https://woodshed.example" });
   const cookies = new Map<string,string>();
   const request = async (path:string, init:RequestInit={}) => {
@@ -76,7 +77,7 @@ test("event-scoped cookies resume the original ballot after switching away and b
   await request("/api/events/event_public/join-open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:"join_resume_public"})});
   const first=await (await request("/api/events/event_public/ballot")).json() as {revision:number;candidates:{id:string}[]};
   await request("/api/events/event_public/ballot",{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({expectedRevision:first.revision,rankings:first.candidates.map(({id})=>id),operationId:"operation_first_event"})});
-  await request("/api/events/event_second/join-open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:"join_resume_second"})});
+  assert.equal((await request("/api/events/event_second/join-open",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({operationId:"join_resume_second"})})).status,200);
   const resumed=await (await request("/api/events/event_public/ballot")).json() as {revision:number};
   assert.equal(resumed.revision,first.revision+1);
   assert.equal(cookies.size,2);
