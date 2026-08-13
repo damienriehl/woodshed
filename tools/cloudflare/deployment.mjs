@@ -92,9 +92,10 @@ export function createWranglerAdapter({ root, token, spawn, timeoutMs = 60_000, 
       const result = await invoke([...args, ...structuredArgs]);
       return parseJson(result.stdout);
     },
-    async secretPut(name, value) {
+    async secretPut(name, value, { workerName } = {}) {
       if (name !== "LIVE_COMMAND_SECRET" || typeof value !== "string" || value.length < 32) throw new Error("valid root secret is required");
-      return invoke(["secret", "put", name], { input: value });
+      if (typeof workerName !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(workerName) || !workerName.includes("staging")) throw new Error("safe staging Worker name is required");
+      return invoke(["secret", "put", name, "--name", workerName], { input: value });
     },
   });
 }
