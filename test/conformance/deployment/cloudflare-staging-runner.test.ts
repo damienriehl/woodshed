@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,8 +10,9 @@ import { executeStep, runStagingOperation } from "../../../tools/cloudflare-stag
 
 const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
 
-test("a journal is atomic, owner-bound, and corrupt state authorizes no teardown", async () => {
+test("a journal is atomic, owner-bound, and corrupt state authorizes no teardown", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "woodshed-journal-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const file = path.join(directory, "run.json");
   const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
   await saveJournal(file, journal);
@@ -21,8 +22,9 @@ test("a journal is atomic, owner-bound, and corrupt state authorizes no teardown
   await assert.rejects(runStagingOperation({ operation: "teardown", journalPath: file, runId: "run-a", owner: "owner-a", boundaries: { mutate: async () => assert.fail("must not mutate") } }), /invalid journal/);
 });
 
-test("concurrent journal saves use unique temporary files and leave no residue", async () => {
+test("concurrent journal saves use unique temporary files and leave no residue", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "woodshed-journal-concurrent-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const file = path.join(directory, "run.json");
   const value = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
   await Promise.all([saveJournal(file, value), saveJournal(file, value)]);

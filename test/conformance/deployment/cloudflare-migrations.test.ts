@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -21,10 +21,11 @@ test("the content-addressed D1 manifest contains the exact ordered chain", async
   await verifyMigrationDirectory(path.resolve("migrations/d1"));
 });
 
-test("migration verification rejects missing, added, reordered, changed, and duplicate entries", async () => {
+test("migration verification rejects missing, added, reordered, changed, and duplicate entries", async (t) => {
   const source = path.resolve("migrations/d1");
   async function fixture(names = expected) {
     const directory = await mkdtemp(path.join(tmpdir(), "woodshed-migrations-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
     for (const name of names) await writeFile(path.join(directory, name), await readFile(path.join(source, name)));
     return directory;
   }
