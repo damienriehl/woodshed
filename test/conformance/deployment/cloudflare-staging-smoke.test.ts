@@ -31,6 +31,7 @@ test("deployed acceptance drives participant, security, authority, live, and log
   journal.phase = "worker-deployed";
   const plan = await createSyntheticFixturePlan({ runId: journal.runId, organizerToken: "organizer-secret-value", preFixtureBookmark: "bookmark-b" });
   let seeded = false;
+  let loggedOut = false;
   const requests: Array<{ path: string; init: RequestInit }> = [];
   const participantCookie = "woodshed_session_1234567890abcdef=participant-secret";
   const response = (status: number, body: unknown = {}, headers?: HeadersInit) => new Response(status === 204 ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json", ...Object.fromEntries(new Headers(headers)) } });
@@ -44,7 +45,7 @@ test("deployed acceptance drives participant, security, authority, live, and log
     if (path.endsWith("/join-open")) return response(200, { assurance: "open-public" }, { "set-cookie": `${participantCookie}; Max-Age=86400; Path=/; HttpOnly; Secure; SameSite=Lax` });
     const cookie = headers.get("cookie");
     const bearer = headers.get("authorization");
-    if (path.endsWith("/context")) return cookie === participantCookie ? response(200, { event: { id: plan.eventId } }) : cookie ? response(403, { error: "denied" }) : response(401, { error: "unauthorized" });
+    if (path.endsWith("/context")) return cookie === participantCookie && !loggedOut ? response(200, { event: { id: plan.eventId } }) : response(401, { error: "unauthorized" });
     if (path.endsWith("/ballot") && method === "GET") {
       const written = requests.some(({ path: priorPath, init: priorInit }) => priorPath.endsWith("/ballot") && priorInit.method === "PUT");
       return cookie === participantCookie ? response(200, { revision: written ? 1 : 0, candidates: (written ? [...plan.songIds].reverse() : plan.songIds).map((id) => ({ id })) }) : response(401, { error: "unauthorized" });
@@ -54,7 +55,7 @@ test("deployed acceptance drives participant, security, authority, live, and log
     if (path.endsWith("/authority/acquire")) return bearer === `${"Bear"}er organizer-secret-value` ? response(200, { epoch: 1, commandCredential: "device-credential-secret", deviceInstallationId: plan.deviceInstallationId }) : cookie ? response(403, { error: "denied" }) : response(401, { error: "unauthorized" });
     if (path.endsWith("/live/commands")) return bearer === `${"Bear"}er organizer-secret-value` ? response(200, { status: "applied", revision: 1, entry: { state: "queued" } }) : response(403, { error: "denied" });
     if (path.endsWith("/live/state")) return response(200, { revision: 1, entries: [{ state: "queued" }] });
-    if (path === "/api/logout") return response(204, undefined, { "set-cookie": "woodshed_session_1234567890abcdef=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax" });
+    if (path === "/api/logout") { loggedOut = true; return response(204, undefined, { "set-cookie": "woodshed_session_1234567890abcdef=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax" }); }
     return response(404, { error: "not-found" });
   };
 
@@ -71,7 +72,8 @@ test("deployed acceptance drives participant, security, authority, live, and log
   assert.equal(evidence.counts.fixtureRows, plan.rows.length);
   assert.equal(evidence.counts.choiceRevision, 1);
   assert.equal(evidence.counts.liveRevision, 1);
-  assert.deepEqual(evidence.outcomes.security, { wrongOrigin: true, missingCsrf: true, missingSession: true, participantOrganizer: true });
+  assert.deepEqual(evidence.outcomes.security, { wrongOrigin: true, missingCsrf: true, missingSession: true, retiredSessionReplay: true, participantOrganizer: true });
+  assert.equal(requests.filter(({ path, init }) => path.endsWith("/context") && new Headers(init.headers).get("cookie") === participantCookie).length, 2);
   const serialized = JSON.stringify(evidence);
   assert.doesNotMatch(serialized, /participant-secret|organizer-secret|device-credential|signed-command|tokenHash|candidate|body/i);
   assert.ok(requests.filter(({ init }) => init.method && init.method !== "GET").every(({ init }) => new Headers(init.headers).get("origin") === identity.origin || new Headers(init.headers).get("origin") === "https://wrong-origin.invalid"));

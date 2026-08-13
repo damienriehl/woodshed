@@ -36,10 +36,20 @@ export async function runQuarantinedD1Recovery(options) {
   if (snapshot.originWritable) { await quarantineOrigin(); snapshot = await inspectSnapshot(); }
   if (snapshot.originWritable) throw new Error("D1 recovery requires a quarantined origin");
   if (!sameLastWrite(snapshot, lease.revision)) throw new Error("last-write identity changed");
-  await restoreD1(journal.recovery.bookmark);
+  let restoreError;
+  try {
+    await restoreD1(journal.recovery.bookmark);
+  } catch (error) {
+    restoreError = error;
+  }
   const verification = await verifyD1();
-  for (const field of ["ledger", "schema", "foreignKeys", "aggregates", "behavior"]) if (verification?.[field] !== true) throw new Error(`D1 recovery ${field} verification failed`);
-  return { restored: true, durableObjectRestored: false, verification };
+  for (const field of ["ledger", "schema", "foreignKeys", "aggregates", "behavior"]) {
+    if (verification?.[field] !== true) {
+      if (restoreError) throw restoreError;
+      throw new Error(`D1 recovery ${field} verification failed`);
+    }
+  }
+  return { restored: true, reconciled: Boolean(restoreError), durableObjectRestored: false, verification };
 }
 
 function ownedResource(resource, journal) {
@@ -58,23 +68,25 @@ export async function runStackTeardown(options) {
     return resource;
   });
   for (const domain of ["route", "credential", "secret", "worker", "durable-object", "d1", "token"]) if (!resources.some((resource) => resource.domain === domain)) throw new Error("missing " + domain + " teardown authority");
+  const resourceKeys = resources.map(({ domain, id }) => domain + ":" + id);
+  if (new Set(resourceKeys).size !== resourceKeys.length) throw new Error("duplicate teardown resource identity");
   const absence = {};
   for (const domain of RESOURCE_ORDER) {
-    const resource = resources.find((candidate) => candidate.domain === domain);
-    if (!resource) continue;
-    if (await inspectRevision() !== expectedRevision) throw new Error("last-write identity changed");
-    const dependents = await listDependents(resource);
-    if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
-    if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
-    const before = await inspectResource(resource);
-    if (before?.exists) {
-      if (before.runId !== journal.runId || before.owner !== journal.owner) throw new Error("remote resource identity mismatch");
-      await removeResource(resource);
+    for (const resource of resources.filter((candidate) => candidate.domain === domain)) {
+      if (await inspectRevision() !== expectedRevision) throw new Error("last-write identity changed");
+      const dependents = await listDependents(resource);
+      if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
+      if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
+      const before = await inspectResource(resource);
+      if (before?.exists) {
+        if (before.runId !== journal.runId || before.owner !== journal.owner) throw new Error("remote resource identity mismatch");
+        await removeResource(resource);
+      }
+      const after = await inspectResource(resource);
+      const absenceKey = resource.domain + ":" + resource.id;
+      absence[absenceKey] = after?.exists === false;
+      if (!absence[absenceKey]) throw new Error(resource.domain + " absence proof failed");
     }
-    const after = await inspectResource(resource);
-    const absenceKey = resource.domain + ":" + resource.id;
-    absence[absenceKey] = after?.exists === false;
-    if (!absence[absenceKey]) throw new Error(resource.domain + " absence proof failed");
   }
   if (resources.some(({ domain }) => domain === "token") && await verifyTokenInactive() !== true) throw new Error("deployment token remains active");
   return { complete: Object.values(absence).every(Boolean), absence, durableObjectStateRemovedWithNamespace: Object.entries(absence).some(([key, absent]) => key.startsWith("durable-object:") && absent) };

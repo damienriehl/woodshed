@@ -9,23 +9,55 @@ function parseJson(value, label = "Cloudflare structured output") {
   catch { throw new Error(`${label} is malformed`); }
 }
 
-function defaultSpawn(file, args, options) {
+const ALLOWED_JSON_COMMANDS = new Set(["d1 list", "deployments list", "secret list", "versions list"]);
+
+export function runBoundedSubprocess(file, args, options) {
+  const {
+    cwd, env, input, timeoutMs,
+    killGraceMs = 5_000,
+    maxOutputBytes = 1_048_576,
+    spawn = nodeSpawn,
+  } = options;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(killGraceMs) || killGraceMs <= 0 || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
+    throw new Error("bounded subprocess limits must be positive integers");
+  }
   return new Promise((resolve, reject) => {
-    const child = nodeSpawn(file, args, {
-      cwd: options.cwd, env: options.env, shell: false,
-      stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    const child = spawn(file, args, {
+      cwd, env, shell: false,
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
-    let stdout = ""; let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), options.timeoutMs);
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("close", (exitCode) => { clearTimeout(timer); resolve({ exitCode, stdout, stderr }); });
-    if (options.input !== undefined) child.stdin.end(options.input); 
+    let stdout = ""; let stderr = ""; let outputBytes = 0;
+    let failure; let killTimer; let settled = false;
+    const stop = (error) => {
+      if (failure) return;
+      failure = error;
+      try { child.kill("SIGTERM"); } catch {}
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+        settle(failure);
+      }, killGraceMs);
+    };
+    const collect = (stream, target) => stream.on("data", (chunk) => {
+      if (failure) return;
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += value.byteLength;
+      if (outputBytes > maxOutputBytes) return stop(new Error("subprocess output limit exceeded"));
+      if (target === "stdout") stdout += value.toString(); else stderr += value.toString();
+    });
+    collect(child.stdout, "stdout"); collect(child.stderr, "stderr");
+    const timeout = setTimeout(() => stop(new Error("subprocess timed out")), timeoutMs);
+    const settle = (error, result) => {
+      if (settled) return;
+      settled = true; clearTimeout(timeout); clearTimeout(killTimer);
+      if (error) reject(error); else resolve(result);
+    };
+    child.once("error", (error) => settle(failure ?? error));
+    child.once("close", (exitCode, signal) => settle(failure, { exitCode, signal, stdout, stderr }));
+    if (input !== undefined) child.stdin.end(input);
   });
 }
 
-export function createWranglerAdapter({ root, token, spawn = defaultSpawn, timeoutMs = 60_000 }) {
+export function createWranglerAdapter({ root, token, spawn, timeoutMs = 60_000, killGraceMs = 5_000, maxOutputBytes = 1_048_576 }) {
   if (!root || !token) throw new Error("repository root and process-scoped Cloudflare token are required");
   const binary = path.join(root, "node_modules", ".bin", "wrangler");
   const config = path.join(root, "deploy", "cloudflare", "wrangler.jsonc");
@@ -33,16 +65,19 @@ export function createWranglerAdapter({ root, token, spawn = defaultSpawn, timeo
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) throw new Error("Wrangler arguments must be strings");
     if (args.some((arg) => /(?:route|domain|dns)/i.test(arg))) throw new Error("route mutation commands are not supported");
     const completeArgs = [...args, "--config", config, "--env", "staging"];
-    const result = await spawn(binary, completeArgs, {
+    const executionOptions = {
       cwd: root, env: { ...process.env, CLOUDFLARE_API_TOKEN: token },
-      input, timeoutMs, shell: false,
-    });
+      input, timeoutMs, killGraceMs, maxOutputBytes, shell: false,
+    };
+    const result = spawn
+      ? await spawn(binary, completeArgs, executionOptions)
+      : await runBoundedSubprocess(binary, completeArgs, executionOptions);
     if (!result || result.exitCode !== 0) throw new Error("Wrangler command failed");
     return result;
   }
   return Object.freeze({
-    invoke,
     async json(args) {
+      if (!ALLOWED_JSON_COMMANDS.has(args.join(" "))) throw new Error("Wrangler command is not allowlisted");
       const result = await invoke([...args, "--json"]);
       return parseJson(result.stdout);
     },
@@ -60,11 +95,27 @@ export function assertCredentialedPreflight(inventory, remote, { localSecretAvai
   }
   const serializedTargets = JSON.stringify({ databases: remote.databases, workers: remote.workers, routes: remote.routes }).toLowerCase();
   if (/hootenanny|production|(?:^|[^a-z])prod(?:[^a-z]|$)/i.test(serializedTargets)) throw new Error("dedicated staging account contains a protected target");
-  if (remote.databases.some((item) => item?.id === inventory.staging.databaseId) || remote.workers.some((item) => item?.name === inventory.staging.workerName)) {
+  const databaseCollision = remote.databases.some((item) =>
+    item?.name === inventory.staging.databaseName ||
+    (inventory.staging.databaseId && item?.id === inventory.staging.databaseId));
+  if (databaseCollision || remote.workers.some((item) => item?.name === inventory.staging.workerName)) {
     throw new Error("disposable target already exists and is not journal-owned");
   }
   if (!localSecretAvailable) throw new Error("local root secret continuity is required before apply");
   return { accountScope: "dedicated-staging", targetAbsent: true, secretInventoryReadable: true };
+}
+
+export async function persistAssignedDatabaseIdentity({ journal, database, persistJournal }) {
+  if (!database || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(database.id) || database.name !== journal.identity.databaseName) {
+    throw new Error("created database identity is invalid");
+  }
+  if (journal.identity.databaseId && journal.identity.databaseId !== database.id) throw new Error("created database identity changed");
+  journal.identity.databaseId = database.id.toLowerCase();
+  if (!journal.resources.some((item) => item?.domain === "d1" && item?.id === journal.identity.databaseId)) {
+    journal.resources.push({ domain: "d1", id: journal.identity.databaseId, runId: journal.runId, owner: journal.owner });
+  }
+  await persistJournal(journal);
+  return journal.identity.databaseId;
 }
 
 function ledgerNames(remote) {
@@ -121,12 +172,23 @@ export async function runMigrationFirstDeployment(options) {
   const {
     journal, lease, manifest, expectedSnapshot, inspectSnapshot, inspectLedger,
     persistJournal, applyMigration, verifyMigration, verifyFinalSchema,
-    deployWorker, verifyDeployment,
+    deployWorker, inspectDeployment, verifyDeployment,
   } = options;
   if (!lease?.active || lease.runId !== journal.runId || lease.owner !== journal.owner) throw new Error("active ownership lease is required");
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before mutation");
 
   const reconciliation = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
+  for (const filename of reconciliation.applied) {
+    const attestation = journal.migrations.find((item) => item.filename === filename);
+    if (attestation.status === "pending") {
+      const migration = manifest.find((item) => item.filename === filename);
+      if (!await verifyMigration(migration)) throw new Error("reconciled migration postcondition failed");
+      attestation.status = "applied";
+      await persistJournal(journal);
+    } else if (attestation.status !== "applied") {
+      throw new Error("migration journal status is invalid");
+    }
+  }
   for (const migration of reconciliation.pending) {
     if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before mutation");
     attestMigration(journal, { ...migration, sourceSha: journal.sourceSha });
@@ -149,8 +211,35 @@ export async function runMigrationFirstDeployment(options) {
   reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
   await verifyFinalSchema();
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before deploy");
-  const deployment = await deployWorker();
-  await verifyDeployment(deployment);
+  let intent = journal.mutations.find((item) => item?.kind === "worker-deploy");
+  if (journal.mutations.filter((item) => item?.kind === "worker-deploy").length > 1) throw new Error("deployment journal contains duplicate intents");
+  let deployment;
+  if (intent) {
+    if (!["pending", "applied"].includes(intent.status) || intent.sourceSha !== journal.sourceSha || typeof inspectDeployment !== "function") {
+      throw new Error("deployment intent cannot be reconciled");
+    }
+    deployment = await inspectDeployment();
+    if (!deployment) throw new Error("deployment outcome is uncertain; no replay authorized");
+    await verifyDeployment(deployment);
+    if (intent.status === "pending") {
+      intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
+      await persistJournal(journal);
+    }
+  } else {
+    intent = { kind: "worker-deploy", status: "pending", sourceSha: journal.sourceSha };
+    journal.mutations.push(intent);
+    await persistJournal(journal);
+    try {
+      deployment = await deployWorker();
+    } catch (error) {
+      if (typeof inspectDeployment !== "function") throw new Error("deployment outcome is uncertain; no replay authorized", { cause: error });
+      deployment = await inspectDeployment();
+      if (!deployment) throw new Error("deployment outcome is uncertain; no replay authorized", { cause: error });
+    }
+    await verifyDeployment(deployment);
+    intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
+    await persistJournal(journal);
+  }
   journal.phase = "worker-deployed";
   await persistJournal(journal);
   return { journal, deployment, rollback: "forward-fix-only", lifecycle: "legacy-sqlite-v1" };

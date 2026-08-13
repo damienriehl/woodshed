@@ -1,5 +1,5 @@
 const TOP_LEVEL_FIELDS = ["environment", "expectedSourceSha", "forbidden", "staging"];
-const STAGING_FIELDS = ["accountId", "databaseId", "origin", "workerName"];
+const STAGING_FIELDS = ["accountId", "databaseId", "databaseName", "origin", "workerName"];
 const FORBIDDEN_FIELDS = ["accountIds", "databaseIds", "origins", "workerNames"];
 const FULL_SHA = /^[a-f0-9]{40,64}$/i;
 const ACCOUNT_ID = /^[a-f0-9]{32}$/i;
@@ -24,11 +24,18 @@ function requiredString(value, field) {
   return value;
 }
 
-function stringArray(value, field) {
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item)) {
-    throw new Error(`${field} must be an array of non-empty strings`);
+function nonemptyStringArray(value, field) {
+  if (!Array.isArray(value) || value.length === 0 || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+    throw new Error(`${field} must be a non-empty array of non-empty strings`);
   }
   return value;
+}
+
+function optionalDatabaseId(value, field) {
+  if (value === undefined) return undefined;
+  const databaseId = requiredString(value, field).toLowerCase();
+  if (!DATABASE_ID.test(databaseId)) throw new Error(`${field} has an invalid shape`);
+  return databaseId;
 }
 
 function normalizedOrigin(value, field) {
@@ -60,29 +67,34 @@ export function validateStagingInventory(input, sourceState) {
   if (!sourceState?.worktreeClean) throw new Error("staging requires a clean worktree");
   if (expectedSourceSha.toLowerCase() !== actualSourceSha.toLowerCase()) throw new Error("expected source SHA must match the checked-out source SHA");
 
-  const accountId = requiredString(staging.accountId, "staging.accountId");
-  const databaseId = requiredString(staging.databaseId, "staging.databaseId");
+  const accountId = requiredString(staging.accountId, "staging.accountId").toLowerCase();
+  const databaseId = optionalDatabaseId(staging.databaseId, "staging.databaseId");
+  const databaseName = requiredString(staging.databaseName, "staging.databaseName").toLowerCase();
   const origin = normalizedOrigin(staging.origin, "staging.origin");
   const workerName = requiredString(staging.workerName, "staging.workerName");
   if (!ACCOUNT_ID.test(accountId)) throw new Error("staging.accountId has an invalid shape");
-  if (!DATABASE_ID.test(databaseId)) throw new Error("staging.databaseId has an invalid shape");
+  if (!WORKER_NAME.test(databaseName) || !databaseName.includes("staging")) throw new Error("staging.databaseName must be a safe name containing staging");
   if (!WORKER_NAME.test(workerName) || !workerName.includes("staging")) throw new Error("staging.workerName must be a safe name containing staging");
   assertNotProtected(workerName, "staging.workerName");
+  assertNotProtected(databaseName, "staging.databaseName");
   assertNotProtected(origin, "staging.origin");
   if (!origin.includes("staging") && !origin.endsWith(".workers.dev")) throw new Error("staging.origin must be unmistakably staging or workers.dev");
 
-  const forbiddenAccountIds = stringArray(forbidden.accountIds, "forbidden.accountIds");
-  const forbiddenDatabaseIds = stringArray(forbidden.databaseIds, "forbidden.databaseIds");
-  const forbiddenOrigins = stringArray(forbidden.origins, "forbidden.origins").map((value) => normalizedOrigin(value, "forbidden.origins"));
-  const forbiddenWorkerNames = stringArray(forbidden.workerNames, "forbidden.workerNames");
+  const forbiddenAccountIds = nonemptyStringArray(forbidden.accountIds, "forbidden.accountIds").map((value) => value.toLowerCase());
+  const forbiddenDatabaseIds = nonemptyStringArray(forbidden.databaseIds, "forbidden.databaseIds").map((value) => value.toLowerCase());
+  const forbiddenOrigins = nonemptyStringArray(forbidden.origins, "forbidden.origins").map((value) => normalizedOrigin(value, "forbidden.origins"));
+  const forbiddenWorkerNames = nonemptyStringArray(forbidden.workerNames, "forbidden.workerNames").map((value) => value.toLowerCase());
+  if (forbiddenAccountIds.some((value) => !ACCOUNT_ID.test(value))) throw new Error("forbidden.accountIds contains an invalid account ID");
+  if (forbiddenDatabaseIds.some((value) => !DATABASE_ID.test(value))) throw new Error("forbidden.databaseIds contains an invalid database ID");
+  if (forbiddenWorkerNames.some((value) => !WORKER_NAME.test(value))) throw new Error("forbidden.workerNames contains an invalid Worker name");
   if (forbiddenAccountIds.includes(accountId)) throw new Error("staging account is forbidden");
-  if (forbiddenDatabaseIds.includes(databaseId)) throw new Error("staging database is forbidden");
+  if (databaseId && forbiddenDatabaseIds.includes(databaseId)) throw new Error("staging database is forbidden");
   if (forbiddenOrigins.includes(origin)) throw new Error("staging origin is forbidden");
   if (forbiddenWorkerNames.includes(workerName)) throw new Error("staging Worker is forbidden");
 
   return Object.freeze({
     environment: "staging", expectedSourceSha,
-    staging: Object.freeze({ accountId, databaseId, origin, workerName }),
+    staging: Object.freeze({ accountId, databaseId, databaseName, origin, workerName }),
     forbidden: Object.freeze({
       accountIds: Object.freeze([...forbiddenAccountIds]), databaseIds: Object.freeze([...forbiddenDatabaseIds]),
       origins: Object.freeze([...forbiddenOrigins]), workerNames: Object.freeze([...forbiddenWorkerNames]),

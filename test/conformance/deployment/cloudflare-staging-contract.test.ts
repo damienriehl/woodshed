@@ -13,6 +13,7 @@ function validInventory() {
     staging: {
       accountId: "1".repeat(32),
       databaseId: "11111111-2222-4333-8444-555555555555",
+      databaseName: "woodshed-staging-synthetic-db",
       origin: "https://woodshed-staging-synthetic.workers.dev",
       workerName: "woodshed-staging-synthetic",
     },
@@ -38,7 +39,7 @@ test("validates a synthetic, explicit staging inventory without exposing values"
   assert.deepEqual(description, {
     environment: "configured",
     expectedSourceSha: "configured",
-    staging: ["accountId", "databaseId", "origin", "workerName"],
+    staging: ["accountId", "databaseId", "databaseName", "origin", "workerName"],
     forbidden: ["accountIds", "databaseIds", "origins", "workerNames"],
   });
   assert.doesNotMatch(JSON.stringify(description), /11111111|woodshed-staging-synthetic|a{40}/);
@@ -47,7 +48,7 @@ test("validates a synthetic, explicit staging inventory without exposing values"
 test("fails closed for missing, placeholder, unsafe, default, or production targets", () => {
   const cases: Array<[string, (inventory: ReturnType<typeof validInventory>) => void, RegExp]> = [
     ["missing account", (value) => delete (value.staging as Partial<typeof value.staging>).accountId, /accountId.*required/i],
-    ["missing database", (value) => delete (value.staging as Partial<typeof value.staging>).databaseId, /databaseId.*required/i],
+    ["missing database name", (value) => delete (value.staging as Partial<typeof value.staging>).databaseName, /databaseName.*required/i],
     ["missing origin", (value) => delete (value.staging as Partial<typeof value.staging>).origin, /origin.*required/i],
     ["placeholder", (value) => { value.staging.databaseId = "replace-during-install"; }, /placeholder/i],
     ["unsafe worker", (value) => { value.staging.workerName = "woodshed-production"; }, /staging/i],
@@ -65,6 +66,26 @@ test("fails closed for missing, placeholder, unsafe, default, or production targ
       name,
     );
   }
+});
+
+test("accepts an approved fresh D1 name before Cloudflare assigns its UUID", () => {
+  const inventory = validInventory();
+  delete (inventory.staging as Partial<typeof inventory.staging>).databaseId;
+  const result = validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true });
+  assert.equal(result.staging.databaseName, "woodshed-staging-synthetic-db");
+  assert.equal(result.staging.databaseId, undefined);
+});
+
+test("requires complete forbidden sets and compares normalized identifiers", () => {
+  for (const field of ["accountIds", "databaseIds", "origins", "workerNames"] as const) {
+    const inventory = validInventory();
+    inventory.forbidden[field] = [];
+    assert.throws(() => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }), /non-empty array/i);
+  }
+  const inventory = validInventory();
+  inventory.staging.accountId = "A".repeat(32);
+  inventory.forbidden.accountIds = ["a".repeat(32)];
+  assert.throws(() => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }), /account is forbidden/i);
 });
 
 test("rejects unknown fields, a dirty tree, and a mismatched full source SHA", () => {

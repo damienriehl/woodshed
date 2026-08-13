@@ -40,6 +40,24 @@ test("D1 recovery quarantines first and refuses drift or a writable origin", asy
   await assert.rejects(runQuarantinedD1Recovery({ ...base, inspectSnapshot: async () => ({ revision: "8", originWritable: false }) }), /last-write identity changed/);
 });
 
+test("D1 recovery reconciles a lost restore response only after full verification", async () => {
+  const verification = { ledger: true, schema: true, foreignKeys: true, aggregates: true, behavior: true };
+  const base = {
+    journal: { runId: "run-a", owner: "owner-a", recovery: { bookmark: "bookmark" } },
+    lease: { active: true, runId: "run-a", owner: "owner-a", revision: "7" },
+    expectedSnapshot: { revision: "7", originWritable: false },
+    inspectSnapshot: async () => ({ revision: "7", originWritable: false }),
+    quarantineOrigin: async () => assert.fail("already quarantined"),
+    restoreD1: async () => { throw new Error("response lost"); },
+  };
+  const result = await runQuarantinedD1Recovery({ ...base, verifyD1: async () => verification });
+  assert.equal(result.reconciled, true);
+  await assert.rejects(
+    runQuarantinedD1Recovery({ ...base, verifyD1: async () => ({ ...verification, ledger: false }) }),
+    /response lost/,
+  );
+});
+
 test("teardown is run-owned, dependency ordered, re-entrant, and proves every domain absent", async () => {
   const calls: string[] = [];
   const state = new Map([
@@ -72,6 +90,44 @@ test("teardown is run-owned, dependency ordered, re-entrant, and proves every do
     removeResource: async ({ domain }: { domain: string }) => { calls.push(domain); }, verifyTokenInactive: async () => true,
   })).complete, true);
   assert.deepEqual(calls, []);
+});
+
+test("teardown removes every duplicate-domain resource and an applicable hostname", async () => {
+  const resourceSpecs = [
+    ["route", "route-a"], ["route", "route-b"], ["hostname", "host-a"],
+    ["credential", "credential-a"], ["secret", "secret-a"], ["worker", "worker-a"],
+    ["durable-object", "do-a"], ["d1", "d1-a"], ["token", "token-a"],
+  ];
+  const state = new Map(resourceSpecs.map(([, id]) => [id, true]));
+  const journal = {
+    runId: "run-a", owner: "owner-a", phase: "quarantined", identity: {},
+    resources: resourceSpecs.map(([domain, id]) => ({ domain, id, runId: "run-a", owner: "owner-a" })),
+  };
+  const removed: string[] = [];
+  const result = await runStackTeardown({
+    journal, lease: { active: true, runId: "run-a", owner: "owner-a", revision: "7" }, expectedRevision: "7",
+    inspectRevision: async () => "7", listDependents: async () => [],
+    inspectResource: async ({ id }: { id: string }) => ({ exists: state.get(id), runId: "run-a", owner: "owner-a" }),
+    removeResource: async ({ id }: { id: string }) => { removed.push(id); state.set(id, false); },
+    verifyTokenInactive: async () => true,
+  });
+  assert.deepEqual(removed, resourceSpecs.map(([, id]) => id));
+  assert.equal(Object.keys(result.absence).length, resourceSpecs.length);
+  assert.equal(result.complete, true);
+});
+
+test("teardown rejects duplicate identities before removing anything", async () => {
+  const domains = ["route", "credential", "secret", "worker", "durable-object", "d1", "token"];
+  const resources = domains.map((domain) => ({ domain, id: domain + "-a", runId: "run-a", owner: "owner-a" }));
+  resources.push({ ...{ ...resources[0]! } });
+  let removals = 0;
+  await assert.rejects(runStackTeardown({
+    journal: { runId: "run-a", owner: "owner-a", phase: "quarantined", resources },
+    lease: { active: true, runId: "run-a", owner: "owner-a", revision: "7" }, expectedRevision: "7",
+    inspectRevision: async () => "7", listDependents: async () => [], inspectResource: async () => ({ exists: true, runId: "run-a", owner: "owner-a" }),
+    removeResource: async () => { removals += 1; }, verifyTokenInactive: async () => true,
+  }), /duplicate teardown resource identity/);
+  assert.equal(removals, 0);
 });
 
 test("teardown fails closed on identity mismatch or unexpected dependents", async () => {

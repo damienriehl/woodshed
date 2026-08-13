@@ -50,9 +50,9 @@ export async function runDeployedAcceptance(options) {
     const logout = await request("/api/logout", { method: "POST", headers: jsonHeaders(origin, { cookie }) });
     await parsed(logout, [204], "logout");
     if (!/Max-Age=0/.test(logout.headers.get("set-cookie") ?? "")) throw new Error("logout did not clear Woodshed cookies");
-    const afterLogout = await request(`/api/events/${plan.eventId}/context`);
+    const afterLogout = await request(`/api/events/${plan.eventId}/context`, { headers: { cookie } });
 
-    const security = { wrongOrigin: wrongOrigin.status === 403, missingCsrf: missingCsrf.status === 403, missingSession: missingSession.status === 401 && afterLogout.status === 401, participantOrganizer: participantOrganizer.status === 403 };
+    const security = { wrongOrigin: wrongOrigin.status === 403, missingCsrf: missingCsrf.status === 403, missingSession: missingSession.status === 401, retiredSessionReplay: afterLogout.status === 401, participantOrganizer: participantOrganizer.status === 403 };
     if (Object.values(security).some((passed) => !passed)) throw new Error("deployed security matrix failed");
     if (!Number.isSafeInteger(liveResult?.revision) || !Number.isSafeInteger(liveState?.revision)) throw new Error("live response contract failed");
     journal.phase = "quarantined";

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
@@ -6,7 +8,9 @@ import {
   assertCredentialedPreflight,
   assertSchemaInvariants,
   createWranglerAdapter,
+  persistAssignedDatabaseIdentity,
   reconcileMigrationLedger,
+  runBoundedSubprocess,
   runMigrationFirstDeployment,
 } from "../../../tools/cloudflare/deployment.mjs";
 import { createJournal } from "../../../tools/cloudflare/journal.mjs";
@@ -16,6 +20,7 @@ const sourceSha = "a".repeat(40);
 const identity = {
   accountId: "b".repeat(32),
   databaseId: "11111111-1111-4111-8111-111111111111",
+  databaseName: "woodshed-staging-run-a",
   workerName: "woodshed-staging-run-a",
   origin: "https://woodshed-staging.invalid",
 };
@@ -43,6 +48,31 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.equal((calls[0].options as any).env.CLOUDFLARE_API_TOKEN, "private-token");
   assert.equal((calls[1].options as any).input, "r".repeat(32));
   assert.doesNotMatch(JSON.stringify(calls.map(({ file, args }) => ({ file, args }))), /private-token|rrrrrrrr/);
+  assert.equal((adapter as any).invoke, undefined);
+  await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
+});
+
+test("bounded subprocess output and timeout terminate reliably without double settlement", async () => {
+  function childProcess() {
+    const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill: (signal: string) => boolean };
+    child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+    child.kill = () => true;
+    return child;
+  }
+
+  const overflowing = childProcess();
+  const overflow = runBoundedSubprocess("wrangler", [], { cwd: "/repo", env: {}, timeoutMs: 100, maxOutputBytes: 8, spawn: () => overflowing });
+  overflowing.stdout.write("123456789");
+  overflowing.emit("close", null, "SIGTERM");
+  await assert.rejects(overflow, /output limit/);
+
+  const timedOut = childProcess();
+  const signals: string[] = [];
+  timedOut.kill = (signal) => { signals.push(signal); return true; };
+  await assert.rejects(runBoundedSubprocess("wrangler", [], {
+    cwd: "/repo", env: {}, timeoutMs: 5, killGraceMs: 5, spawn: () => timedOut,
+  }), /timed out/);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("structured output and exact filename-only ledger fail closed without private digest provenance", () => {
@@ -60,7 +90,23 @@ test("dedicated-account preflight blocks unreadable inventories, protected sibli
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, secretNames: null }, { localSecretAvailable: true }), /unreadable/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "hootenanny" }] }, { localSecretAvailable: true }), /protected/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: identity.workerName }] }, { localSecretAvailable: true }), /already exists/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: identity.databaseName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, empty), /secret continuity/);
+});
+
+test("assigned D1 UUID is journaled with ownership before provisioning continues", async () => {
+  const state = journal();
+  delete (state.identity as any).databaseId;
+  let persisted = false;
+  const assigned = await persistAssignedDatabaseIdentity({
+    journal: state,
+    database: { id: identity.databaseId, name: identity.databaseName },
+    persistJournal: async () => { persisted = true; },
+  });
+  assert.equal(assigned, identity.databaseId);
+  assert.equal(state.identity.databaseId, identity.databaseId);
+  assert.deepEqual(state.resources.at(-1), { domain: "d1", id: identity.databaseId, runId: state.runId, owner: state.owner });
+  assert.equal(persisted, true);
 });
 
 test("schema verification covers foreign keys, integrity, strict objects, choice seed, and migration 009 preservation", () => {
@@ -109,7 +155,7 @@ test("migration-first apply persists provenance, reconciles response loss, block
     verifyDeployment: async () => { events.push("verify-deploy"); },
   });
   assert.equal(result.deployment.deploymentId, "version-1");
-  assert.deepEqual(events, ["persist", "migrate", "verify-migration", "persist", "verify-schema", "deploy", "verify-deploy", "persist"]);
+  assert.deepEqual(events, ["persist", "migrate", "verify-migration", "persist", "verify-schema", "persist", "deploy", "verify-deploy", "persist", "persist"]);
   assert.equal(state.migrations[0]!.status, "applied");
   assert.equal(state.phase, "worker-deployed");
 
@@ -127,4 +173,48 @@ test("migration-first apply persists provenance, reconciles response loss, block
     verifyDeployment: async () => {},
   }), /inventory changed/);
   assert.equal(mutations, 0);
+});
+
+test("restart reconciles pending migration and deployment intents from remote state without replay", async () => {
+  const first = D1_MIGRATIONS[0]!;
+  const state = journal();
+  state.migrations.push({ filename: first.filename, sha256: first.sha256, sourceSha, status: "pending" });
+  state.mutations.push({ kind: "worker-deploy", status: "pending", sourceSha });
+  let migrations = 0; let deployments = 0; let persists = 0;
+  const deployed = { deploymentId: "version-recovered" };
+  const result = await runMigrationFirstDeployment({
+    journal: state, lease, manifest: [first], expectedSnapshot: { revision: "same" },
+    inspectSnapshot: async () => ({ revision: "same" }),
+    inspectLedger: async () => [{ name: first.filename }],
+    persistJournal: async () => { persists += 1; },
+    applyMigration: async () => { migrations += 1; },
+    verifyMigration: async () => true,
+    verifyFinalSchema: async () => {},
+    deployWorker: async () => { deployments += 1; throw new Error("must not replay"); },
+    inspectDeployment: async () => deployed,
+    verifyDeployment: async (actual: unknown) => assert.equal(actual, deployed),
+  });
+  assert.equal(migrations, 0);
+  assert.equal(deployments, 0);
+  assert.equal(state.migrations[0]!.status, "applied");
+  assert.equal((state.mutations[0] as any).status, "applied");
+  assert.equal(result.deployment, deployed);
+  assert.ok(persists >= 2);
+});
+
+test("deployment response loss is reconciled only after durable intent and remote verification", async () => {
+  const state = journal();
+  const events: string[] = [];
+  const deployed = { deploymentId: "version-after-loss" };
+  const result = await runMigrationFirstDeployment({
+    journal: state, lease, manifest: [], expectedSnapshot: { revision: "same" },
+    inspectSnapshot: async () => ({ revision: "same" }), inspectLedger: async () => [],
+    persistJournal: async () => { events.push(`persist:${(state.mutations.at(-1) as any)?.status ?? "none"}`); },
+    applyMigration: async () => {}, verifyMigration: async () => true, verifyFinalSchema: async () => {},
+    deployWorker: async () => { events.push("deploy"); throw new Error("response lost"); },
+    inspectDeployment: async () => { events.push("inspect-deployment"); return deployed; },
+    verifyDeployment: async () => { events.push("verify-deployment"); },
+  });
+  assert.equal(result.deployment, deployed);
+  assert.deepEqual(events, ["persist:pending", "deploy", "inspect-deployment", "verify-deployment", "persist:applied", "persist:applied"]);
 });

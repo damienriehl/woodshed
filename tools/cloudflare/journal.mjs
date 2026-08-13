@@ -1,4 +1,5 @@
-import { chmod, open, readFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PHASES = new Set(["pre-write", "resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"]);
@@ -18,6 +19,11 @@ export function validateJournal(value) {
   if (!value.identity || typeof value.identity !== "object") throw new Error("invalid journal: identity");
   for (const field of REQUIRED_IDENTITY) requiredString(value.identity[field], `identity.${field}`);
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
+  for (const migration of value.migrations) {
+    if (!migration || typeof migration !== "object" || typeof migration.filename !== "string" || !/^[a-f0-9]{64}$/.test(migration.sha256) || migration.sourceSha !== value.sourceSha || !["pending", "applied"].includes(migration.status)) {
+      throw new Error("invalid journal: migration attestation");
+    }
+  }
   if (value.acceptance !== undefined) {
     if (!value.acceptance || typeof value.acceptance !== "object" || typeof value.acceptance.status !== "string" || typeof value.acceptance.cleanupComplete !== "boolean") throw new Error("invalid journal: acceptance state");
     const fixture = value.acceptance.fixturePlan;
@@ -41,11 +47,25 @@ export function attestMigration(journal, migration) {
 export async function saveJournal(file, value) {
   const journal = validateJournal(structuredClone(value));
   journal.updatedAt = new Date().toISOString();
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.tmp`);
+  const directory = path.dirname(file);
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
   const handle = await open(temporary, "wx", 0o600);
-  try { await handle.writeFile(`${JSON.stringify(journal, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); }
-  await rename(temporary, file);
-  await chmod(file, 0o600);
+  let renamed = false;
+  try {
+    try {
+      await handle.writeFile(`${JSON.stringify(journal, null, 2)}\n`);
+      await handle.chmod(0o600);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, file);
+    renamed = true;
+    const directoryHandle = await open(directory, "r");
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  } finally {
+    if (!renamed) await rm(temporary, { force: true });
+  }
   return journal;
 }
 
