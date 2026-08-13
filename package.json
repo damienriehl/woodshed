@@ -24,6 +24,7 @@
     "test:snapshot": "node --test test/snapshot/*.test.ts",
     "test:conformance": "node --test test/conformance/*.test.ts test/conformance/*.test.mjs",
     "smoke:cloudflare": "node tools/cloudflare-smoke.mjs",
+    "cloudflare:staging:version": "wrangler --config deploy/cloudflare/wrangler.jsonc --env staging --version",
     "test:rehearsal": "node --test test/e2e/rehearsal/*.test.ts",
     "test:live": "node --test test/e2e/live/*.test.ts",
     "privacy": "node tools/privacy/scan.mjs --worktree",
@@ -31,13 +32,14 @@
     "verify:release": "node tools/release/verify.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20250718.0",
+    "@cloudflare/workers-types": "4.20250803.0",
     "@types/node": "24.13.3",
     "@types/react": "19.1.17",
     "@types/react-dom": "19.1.11",
     "esbuild": "0.28.2",
     "miniflare": "3.20250718.3",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "wrangler": "4.28.1"
   },
   "overrides": {
     "undici": "6.28.0",

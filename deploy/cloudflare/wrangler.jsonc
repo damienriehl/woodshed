@@ -4,8 +4,16 @@
   "main": "../../apps/api-worker/src/index.ts",
   "compatibility_date": "2025-07-18",
   "compatibility_flags": ["nodejs_compat"],
-  "d1_databases": [{ "binding": "DB", "database_name": "woodshed-community", "database_id": "replace-during-install", "migrations_dir": "../../migrations/d1" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "woodshed-local", "database_id": "local", "migrations_dir": "../../migrations/d1" }],
   "durable_objects": { "bindings": [{ "name": "LIVE_COORDINATOR", "class_name": "LiveCoordinator" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LiveCoordinator"] }],
-  "vars": { "WOODSHED_PRIVATE_CONTENT": "disabled", "WOODSHED_DESTINATION": "cloudflare", "APP_ORIGIN": "https://replace-during-install.example" }
+  "vars": { "WOODSHED_PRIVATE_CONTENT": "disabled", "WOODSHED_DESTINATION": "cloudflare", "APP_ORIGIN": "https://local.woodshed.invalid" },
+  "env": {
+    "staging": {
+      "name": "woodshed-staging-contract",
+      "d1_databases": [{ "binding": "DB", "database_name": "woodshed-staging-contract", "database_id": "private-inventory", "migrations_dir": "../../migrations/d1" }],
+      "durable_objects": { "bindings": [{ "name": "LIVE_COORDINATOR", "class_name": "LiveCoordinator" }] },
+      "vars": { "WOODSHED_PRIVATE_CONTENT": "disabled", "WOODSHED_DESTINATION": "cloudflare", "APP_ORIGIN": "https://staging.woodshed.invalid" }
+    }
+  }
 }
