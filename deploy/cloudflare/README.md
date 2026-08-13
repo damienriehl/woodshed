@@ -40,3 +40,8 @@ This local gate does not deploy, create D1 databases, write secrets, change DNS,
 ### Deployed synthetic acceptance
 
 The programmatic `runDeployedAcceptance` boundary requires an immutable deployed journal. It journals the deterministic synthetic fixture graph before the first write, then exercises the exact HTTPS origin through participant, security-denial, authority, live-command, and logout checks. Public evidence contains statuses, counts, and revisions only. A passing smoke remains `quarantined`; only whole-stack teardown may mark cleanup complete.
+### Recovery and teardown
+
+Recovery treats Worker code, D1, and Durable Object state as separate domains. Worker rollback is allowed only to a verified version with the same legacy Durable Object lifecycle and compatible D1 schema, Durable Object value shape, bindings, and secrets. D1 Time Travel requires a quarantined, non-writable origin plus an unchanged exclusive-owner/last-write check and never claims to restore Durable Object state.
+
+Teardown removes only the run journal identities, in dependency order, and proves route/hostname, credentials/secret, Worker/version, Durable Object namespace/state, D1, and the time-bounded deployment token absent. Durable Object deletion stays on the existing legacy migration-array mechanism with an explicit run-owned deleted_classes lifecycle tag. A corrupt journal, identity drift, or unexpected dependent authorizes no deletion. Retain the private journal through the +24-hour absence/audit check. See docs/operations/cloudflare-staging.md for the operator contract.
