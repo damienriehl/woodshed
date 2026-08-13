@@ -41,15 +41,18 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
     },
   });
   assert.deepEqual(await adapter.json(["d1", "list"]), [{ id: "safe" }]);
+  assert.deepEqual(await adapter.json(["secret", "list"], { workerName: "woodshed-staging-run-a" }), [{ id: "safe" }]);
   await adapter.secretPut("LIVE_COMMAND_SECRET", "r".repeat(32));
   assert.equal(calls[0].file, "/repo/node_modules/.bin/wrangler");
   assert.deepEqual(calls[0].args.slice(-4), ["--config", "/repo/deploy/cloudflare/wrangler.jsonc", "--env", "staging"]);
   assert.equal(calls[0].options.shell, false);
   assert.equal((calls[0].options as any).env.CLOUDFLARE_API_TOKEN, "private-token");
-  assert.equal((calls[1].options as any).input, "r".repeat(32));
+  assert.deepEqual(calls[1].args.slice(0, 6), ["secret", "list", "--name", "woodshed-staging-run-a", "--format", "json"]);
+  assert.equal((calls[2].options as any).input, "r".repeat(32));
   assert.doesNotMatch(JSON.stringify(calls.map(({ file, args }) => ({ file, args }))), /private-token|rrrrrrrr/);
   assert.equal((adapter as any).invoke, undefined);
   await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
+  await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
 });
 
 test("bounded subprocess output and timeout terminate reliably without double settlement", async () => {

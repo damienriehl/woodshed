@@ -9,7 +9,12 @@ function parseJson(value, label = "Cloudflare structured output") {
   catch { throw new Error(`${label} is malformed`); }
 }
 
-const ALLOWED_JSON_COMMANDS = new Set(["d1 list", "deployments list", "secret list", "versions list"]);
+const GLOBAL_JSON_COMMANDS = new Map([["d1 list", ["--json"]]]);
+const WORKER_JSON_COMMANDS = new Map([
+  ["deployments list", ["--json"]],
+  ["versions list", ["--json"]],
+  ["secret list", ["--format", "json"]],
+]);
 
 export function runBoundedSubprocess(file, args, options) {
   const {
@@ -76,9 +81,15 @@ export function createWranglerAdapter({ root, token, spawn, timeoutMs = 60_000, 
     return result;
   }
   return Object.freeze({
-    async json(args) {
-      if (!ALLOWED_JSON_COMMANDS.has(args.join(" "))) throw new Error("Wrangler command is not allowlisted");
-      const result = await invoke([...args, "--json"]);
+    async json(args, { workerName } = {}) {
+      const key = args.join(" ");
+      let structuredArgs = GLOBAL_JSON_COMMANDS.get(key);
+      if (WORKER_JSON_COMMANDS.has(key)) {
+        if (typeof workerName !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(workerName) || !workerName.includes("staging")) throw new Error("safe staging Worker name is required");
+        structuredArgs = ["--name", workerName, ...WORKER_JSON_COMMANDS.get(key)];
+      }
+      if (!structuredArgs) throw new Error("Wrangler command is not allowlisted");
+      const result = await invoke([...args, ...structuredArgs]);
       return parseJson(result.stdout);
     },
     async secretPut(name, value) {

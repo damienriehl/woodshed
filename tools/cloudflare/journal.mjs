@@ -3,7 +3,7 @@ import { open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PHASES = new Set(["pre-write", "resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"]);
-const REQUIRED_IDENTITY = ["accountId", "databaseId", "workerName", "origin"];
+const REQUIRED_IDENTITY = ["accountId", "databaseName", "workerName", "origin"];
 
 function requiredString(value, name) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`invalid journal: ${name} is required`);
@@ -18,6 +18,8 @@ export function validateJournal(value) {
   if (!PHASES.has(value.phase)) throw new Error("invalid journal: phase");
   if (!value.identity || typeof value.identity !== "object") throw new Error("invalid journal: identity");
   for (const field of REQUIRED_IDENTITY) requiredString(value.identity[field], `identity.${field}`);
+  if (value.identity.databaseId !== undefined && (typeof value.identity.databaseId !== "string" || value.identity.databaseId.length === 0)) throw new Error("invalid journal: identity.databaseId");
+  if (value.phase !== "pre-write" && !value.identity.databaseId) throw new Error("invalid journal: identity.databaseId is required after provisioning");
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
   for (const migration of value.migrations) {
     if (!migration || typeof migration !== "object" || typeof migration.filename !== "string" || !/^[a-f0-9]{64}$/.test(migration.sha256) || migration.sourceSha !== value.sourceSha || !["pending", "applied"].includes(migration.status)) {

@@ -5,10 +5,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { createEvidenceEnvelope, redactEvidence } from "../../../tools/cloudflare/evidence.mjs";
-import { createJournal, loadJournal, saveJournal } from "../../../tools/cloudflare/journal.mjs";
+import { createJournal, loadJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { executeStep, runStagingOperation } from "../../../tools/cloudflare-staging.mjs";
 
-const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
+const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", databaseName: "woodshed-staging-run-a", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
 
 test("a journal is atomic, owner-bound, and corrupt state authorizes no teardown", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "woodshed-journal-"));
@@ -30,6 +30,15 @@ test("concurrent journal saves use unique temporary files and leave no residue",
   await Promise.all([saveJournal(file, value), saveJournal(file, value)]);
   assert.deepEqual(await readdir(directory), ["run.json"]);
   assert.equal((await loadJournal(file)).runId, "run-a");
+});
+
+test("fresh D1 journal accepts an approved name before UUID assignment and requires UUID afterward", () => {
+  const freshIdentity = { ...identity };
+  delete (freshIdentity as Partial<typeof freshIdentity>).databaseId;
+  const fresh = createJournal({ runId: "run-fresh", owner: "owner-a", sourceSha: "a".repeat(40), identity: freshIdentity });
+  assert.equal(fresh.identity.databaseId, undefined);
+  fresh.phase = "resources-ready";
+  assert.throws(() => validateJournal(fresh), /databaseId is required after provisioning/);
 });
 
 test("preflight uncertainty, absent lease, and identity drift cause zero mutations", async () => {

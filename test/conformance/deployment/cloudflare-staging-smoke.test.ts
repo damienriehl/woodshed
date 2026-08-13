@@ -5,7 +5,7 @@ import { createJournal } from "../../../tools/cloudflare/journal.mjs";
 import { createSyntheticFixturePlan, seedSyntheticFixtures } from "../../../tools/cloudflare/staging-fixtures.mjs";
 import { runDeployedAcceptance } from "../../../tools/cloudflare/staging-smoke.mjs";
 
-const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
+const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", databaseName: "woodshed-staging-run-a", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
 
 test("fixture ownership is durable before writes and response loss reconciles without replay", async () => {
   const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
