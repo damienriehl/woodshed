@@ -126,7 +126,7 @@ export async function runMigrationFirstDeployment(options) {
   if (!lease?.active || lease.runId !== journal.runId || lease.owner !== journal.owner) throw new Error("active ownership lease is required");
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before mutation");
 
-  let reconciliation = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
+  const reconciliation = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
   for (const migration of reconciliation.pending) {
     if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before mutation");
     attestMigration(journal, { ...migration, sourceSha: journal.sourceSha });
@@ -135,8 +135,8 @@ export async function runMigrationFirstDeployment(options) {
     try {
       await applyMigration(migration);
     } catch (error) {
-      reconciliation = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
-      if (!reconciliation.applied.includes(migration.filename) || !await verifyMigration(migration)) {
+      const recovered = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
+      if (!recovered.applied.includes(migration.filename) || !await verifyMigration(migration)) {
         throw new Error("migration outcome is uncertain; no replay authorized", { cause: error });
       }
       postconditionVerified = true;

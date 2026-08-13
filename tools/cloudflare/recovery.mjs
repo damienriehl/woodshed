@@ -58,16 +58,14 @@ export async function runStackTeardown(options) {
     return resource;
   });
   for (const domain of ["route", "credential", "secret", "worker", "durable-object", "d1", "token"]) if (!resources.some((resource) => resource.domain === domain)) throw new Error("missing " + domain + " teardown authority");
-  for (const resource of resources) {
-    const dependents = await listDependents(resource);
-    if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
-    if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
-  }
   const absence = {};
   for (const domain of RESOURCE_ORDER) {
     const resource = resources.find((candidate) => candidate.domain === domain);
     if (!resource) continue;
     if (await inspectRevision() !== expectedRevision) throw new Error("last-write identity changed");
+    const dependents = await listDependents(resource);
+    if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
+    if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
     const before = await inspectResource(resource);
     if (before?.exists) {
       if (before.runId !== journal.runId || before.owner !== journal.owner) throw new Error("remote resource identity mismatch");

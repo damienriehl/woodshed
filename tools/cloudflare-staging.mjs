@@ -47,8 +47,7 @@ export async function runStagingOperation(options) {
 
 async function main(argv) {
   const operation = argv[0];
-  if (!OPERATIONS.has(operation)) throw new Error(`usage: cloudflare-staging <${[...OPERATIONS].join("|")}>`);
-  if (!["status", "teardown"].includes(operation)) throw new Error(`${operation} requires the programmatic validated-inventory boundary`);
+  if (operation !== "status") throw new Error("usage: cloudflare-staging status <journal>");
   const journal = await runStagingOperation({ operation: "status", journalPath: argv[1] });
   process.stdout.write(`${JSON.stringify({ runId: journal.runId, phase: journal.phase })}\n`);
 }

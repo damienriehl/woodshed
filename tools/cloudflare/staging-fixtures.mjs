@@ -5,7 +5,7 @@ function safeRunId(runId) {
   return createHash("sha256").update(runId).digest("hex").slice(0, 16);
 }
 
-export async function createSyntheticFixturePlan({ runId, organizerToken, preFixtureBookmark }) {
+export function createSyntheticFixturePlan({ runId, organizerToken, preFixtureBookmark }) {
   if (typeof organizerToken !== "string" || organizerToken.length < 8) throw new Error("organizer token is required");
   if (typeof preFixtureBookmark !== "string" || !preFixtureBookmark) throw new Error("pre-fixture bookmark is required");
   const suffix = safeRunId(runId);
