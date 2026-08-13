@@ -18,6 +18,11 @@ export function validateJournal(value) {
   if (!value.identity || typeof value.identity !== "object") throw new Error("invalid journal: identity");
   for (const field of REQUIRED_IDENTITY) requiredString(value.identity[field], `identity.${field}`);
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
+  if (value.acceptance !== undefined) {
+    if (!value.acceptance || typeof value.acceptance !== "object" || typeof value.acceptance.status !== "string" || typeof value.acceptance.cleanupComplete !== "boolean") throw new Error("invalid journal: acceptance state");
+    const fixture = value.acceptance.fixturePlan;
+    if (fixture !== undefined && (!fixture || typeof fixture !== "object" || !Array.isArray(fixture.rows) || !Array.isArray(fixture.parentChildTables) || typeof fixture.durableObjectIdentity !== "string" || typeof fixture.tokenHash !== "string" || !/^[a-f0-9]{64}/.test(fixture.tokenHash))) throw new Error("invalid journal: acceptance fixture ownership");
+  }
   return value;
 }
 

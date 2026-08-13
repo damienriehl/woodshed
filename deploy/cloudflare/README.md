@@ -36,3 +36,7 @@ npm run smoke:cloudflare
 The gate bundles the actual Worker entry point and runs it with genuine local workerd D1 and Durable Object bindings through pinned Miniflare. It applies the ordered D1 migration chain before seeding synthetic events, then exercises public join, event-scoped cookies, context, ballot persistence, proposals, logout, and authority acquisition. It also verifies that a quota query uses migration 008's index and that the event trigger seeds choice configuration.
 
 This local gate does not deploy, create D1 databases, write secrets, change DNS, or route traffic. A real staging rehearsal still requires reviewed target-specific values for `database_id`, `APP_ORIGIN`, and `LIVE_COMMAND_SECRET`; apply migrations before Worker code and record rollback evidence before changing an alias.
+
+### Deployed synthetic acceptance
+
+The programmatic `runDeployedAcceptance` boundary requires an immutable deployed journal. It journals the deterministic synthetic fixture graph before the first write, then exercises the exact HTTPS origin through participant, security-denial, authority, live-command, and logout checks. Public evidence contains statuses, counts, and revisions only. A passing smoke remains `quarantined`; only whole-stack teardown may mark cleanup complete.

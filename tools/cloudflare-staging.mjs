@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+export { createSyntheticFixturePlan, seedSyntheticFixtures } from "./cloudflare/staging-fixtures.mjs";
+export { runDeployedAcceptance } from "./cloudflare/staging-smoke.mjs";
 import { pathToFileURL } from "node:url";
 import { loadJournal } from "./cloudflare/journal.mjs";
 
