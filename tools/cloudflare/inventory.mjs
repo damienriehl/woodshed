@@ -90,6 +90,14 @@ export function validateStagingInventory(input, sourceState) {
   });
 }
 
+export function parseStructuredInventory(output, { commandSucceeded = true } = {}) {
+  if (!commandSucceeded) throw new Error("Cloudflare inventory command failed");
+  let parsed;
+  try { parsed = typeof output === "string" ? JSON.parse(output) : output; } catch { throw new Error("Cloudflare inventory output is malformed"); }
+  if (!Array.isArray(parsed)) throw new Error("Cloudflare inventory output must be an array");
+  return parsed;
+}
+
 export function describeInventoryFields() {
   return {
     environment: "configured", expectedSourceSha: "configured",

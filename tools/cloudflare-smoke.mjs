@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { parseConfigFileTextToJson } from "typescript";
+import { D1_MIGRATIONS, verifyMigrationDirectory } from "./cloudflare/migrations.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = await mkdtemp(path.join(tmpdir(), "woodshed-cloudflare-smoke-"));
@@ -65,20 +66,8 @@ try {
 
   const database = await miniflare.getD1Database("DB");
   const migrationsDirectory = path.join(root, "migrations/d1");
-  const migrations = (await readdir(migrationsDirectory)).filter((name) => name.endsWith(".sql")).sort();
-  assert.deepEqual(migrations, [
-    "001_first_loop.sql",
-    "002_participant_choice.sql",
-    "003_rehearsal_coordination.sql",
-    "004_live_performance.sql",
-    "005_coordination_repository.sql",
-    "006_worker_runtime.sql",
-    "007_open_join_receipts.sql",
-    "007_participation_recovery.sql",
-    "008_ballot_lifecycle_guard.sql",
-    "008_runtime_quota_indexes.sql",
-    "009_multiple_recovery_credentials.sql",
-  ]);
+  await verifyMigrationDirectory(migrationsDirectory);
+  const migrations = D1_MIGRATIONS.map(({ filename }) => filename);
   for (const migration of migrations) {
     const sql = (await readFile(path.join(migrationsDirectory, migration), "utf8")).replace(/\s*\r?\n\s*/g, " ");
     await database.exec(sql);
