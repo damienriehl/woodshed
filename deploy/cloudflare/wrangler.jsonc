@@ -13,6 +13,7 @@
       "name": "woodshed-staging-contract",
       "d1_databases": [{ "binding": "DB", "database_name": "woodshed-staging-contract", "database_id": "private-inventory", "migrations_dir": "../../migrations/d1" }],
       "durable_objects": { "bindings": [{ "name": "LIVE_COORDINATOR", "class_name": "LiveCoordinator" }] },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LiveCoordinator"] }],
       "vars": { "WOODSHED_PRIVATE_CONTENT": "disabled", "WOODSHED_DESTINATION": "cloudflare", "APP_ORIGIN": "https://staging.woodshed.invalid" }
     }
   }
