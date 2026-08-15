@@ -68,6 +68,33 @@ test("fails closed for missing, placeholder, unsafe, default, or production targ
   }
 });
 
+test("treats hostname separators as protected prod-label boundaries", () => {
+  const protectedOrigins = [
+    "https://prod.staging",
+    "https://staging-prod.acme",
+  ];
+
+  for (const origin of protectedOrigins) {
+    const inventory = validInventory();
+    inventory.staging.origin = origin;
+    assert.throws(
+      () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+      /production or Hootenanny target/i,
+      origin,
+    );
+  }
+
+  for (const origin of ["https://product-staging.acme", "https://staging-product.acme"]) {
+    const inventory = validInventory();
+    inventory.staging.origin = origin;
+    assert.equal(
+      validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }).staging.origin,
+      origin,
+      origin,
+    );
+  }
+});
+
 test("accepts an approved fresh D1 name before Cloudflare assigns its UUID", () => {
   const inventory = validInventory();
   delete (inventory.staging as Partial<typeof inventory.staging>).databaseId;
