@@ -95,6 +95,10 @@ test("redacted evidence cannot retain configured sensitive values or sensitive-s
   const serialized = JSON.stringify(output);
   assert.doesNotMatch(serialized, /top-secret|device-1|private/);
   assert.equal(output.nested.safeCount, 2);
+  const cookieOutput = redactEvidence({ message: "request failed; Cookie: woodshed_session_event=private-session; Path=/" });
+  assert.doesNotMatch(JSON.stringify(cookieOutput), /private-session|woodshed_session_event/);
+  const setCookieOutput = redactEvidence({ message: "response failed; Set-Cookie: woodshed_session_event=private-session; HttpOnly" });
+  assert.doesNotMatch(JSON.stringify(setCookieOutput), /private-session|woodshed_session_event/);
 });
 
 

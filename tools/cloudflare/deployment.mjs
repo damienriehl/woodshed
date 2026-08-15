@@ -107,6 +107,18 @@ export function assertCredentialedPreflight(inventory, remote, { localSecretAvai
   }
   const serializedTargets = JSON.stringify({ databases: remote.databases, workers: remote.workers, routes: remote.routes }).toLowerCase();
   if (/hootenanny|production|(?:^|[^a-z])prod(?:[^a-z]|$)/i.test(serializedTargets)) throw new Error("dedicated staging account contains a protected target");
+  const forbiddenDatabaseIds = new Set(inventory.forbidden.databaseIds.map((value) => value.toLowerCase()));
+  const forbiddenWorkerNames = new Set(inventory.forbidden.workerNames.map((value) => value.toLowerCase()));
+  const forbiddenOrigins = new Set(inventory.forbidden.origins.map((value) => new URL(value).origin.toLowerCase()));
+  if (remote.databases.some((item) => typeof item?.id === "string" && forbiddenDatabaseIds.has(item.id.toLowerCase()))
+    || remote.workers.some((item) => typeof item?.name === "string" && forbiddenWorkerNames.has(item.name.toLowerCase()))
+    || remote.routes.some((item) => {
+      const candidate = item?.origin ?? item?.url ?? item?.pattern;
+      if (typeof candidate !== "string") return false;
+      try { return forbiddenOrigins.has(new URL(candidate).origin.toLowerCase()); } catch { return false; }
+    })) {
+    throw new Error("dedicated staging account contains an explicitly forbidden target");
+  }
   const databaseCollision = remote.databases.some((item) =>
     item?.name === inventory.staging.databaseName ||
     (inventory.staging.databaseId && item?.id === inventory.staging.databaseId));

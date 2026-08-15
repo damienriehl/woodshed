@@ -52,7 +52,10 @@ export function redactEvidence(value, configuredSecrets = []) {
     if (Array.isArray(item)) return item.map((entry) => visit(entry));
     if (item && typeof item === "object") return Object.fromEntries(Object.entries(item).map(([name, entry]) => [name, visit(entry, name)]));
     if (typeof item !== "string") return item;
-    let output = item.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+    let output = item
+      .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+      .replace(/((?:^|[;\s])Cookie\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]")
+      .replace(/((?:^|[;\s])Set-Cookie\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]");
     for (const secret of secrets) output = output.split(secret).join("[REDACTED]");
     return output;
   }

@@ -19,7 +19,12 @@ function assertLease(journal, lease) {
 
 export function assertRollbackCompatible(current, target) {
   if (!current || !target) throw new Error("rollback compatibility evidence is required");
-  for (const [field, label] of COMPATIBILITY_FIELDS) if (current[field] !== target[field]) throw new Error(`${label} is incompatible`);
+  for (const [field, label] of COMPATIBILITY_FIELDS) {
+    if (typeof current[field] !== "string" || current[field].trim() === "" || typeof target[field] !== "string" || target[field].trim() === "") {
+      throw new Error(`${label} evidence is required`);
+    }
+    if (current[field] !== target[field]) throw new Error(`${label} is incompatible`);
+  }
   if (!exactStrings(current.bindings, target.bindings)) throw new Error("binding set is incompatible");
   if (!exactStrings(current.secrets, target.secrets)) throw new Error("secret set is incompatible");
   return true;

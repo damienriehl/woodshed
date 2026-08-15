@@ -85,14 +85,21 @@ test("structured output and exact filename-only ledger fail closed without priva
   assert.throws(() => reconcileMigrationLedger({ remote: [{ name: D1_MIGRATIONS[0]!.filename }], manifest: D1_MIGRATIONS, journal: journal() }), /provenance/);
 });
 
-test("dedicated-account preflight blocks unreadable inventories, protected siblings, collisions, and missing secret continuity", () => {
-  const inventory = { staging: identity };
+test("dedicated-account preflight blocks unreadable inventories, protected siblings, forbidden targets, collisions, and missing secret continuity", () => {
+  const forbiddenDatabaseId = "33333333-3333-4333-8333-333333333333";
+  const inventory = { staging: identity, forbidden: {
+    accountIds: ["c".repeat(32)], databaseIds: [forbiddenDatabaseId],
+    origins: ["https://community.invalid"], workerNames: ["woodshed-community"],
+  } };
   const empty = { accountId: identity.accountId, databases: [], workers: [], routes: [], secretNames: [], deployments: [] };
   assert.deepEqual(assertCredentialedPreflight(inventory, empty, { localSecretAvailable: true }), {
     accountScope: "dedicated-staging", targetAbsent: true, secretInventoryReadable: true,
   });
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, secretNames: null }, { localSecretAvailable: true }), /unreadable/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "hootenanny" }] }, { localSecretAvailable: true }), /protected/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "Woodshed-Community" }] }, { localSecretAvailable: true }), /forbidden/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: forbiddenDatabaseId.toUpperCase(), name: "neutral" }] }, { localSecretAvailable: true }), /forbidden/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ origin: "https://community.invalid/path" }] }, { localSecretAvailable: true }), /forbidden/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: identity.workerName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: identity.databaseName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, empty), /secret continuity/);

@@ -21,6 +21,11 @@ test("rollback accepts only a same-lifecycle, storage-compatible version", () =>
   assert.throws(() => assertRollbackCompatible(lifecycle, { ...lifecycle, durableObject: "pre-lifecycle" }), /Durable Object lifecycle/);
   assert.throws(() => assertRollbackCompatible(lifecycle, { ...lifecycle, d1Schema: "schema-v0" }), /D1 schema/);
   assert.throws(() => assertRollbackCompatible(lifecycle, { ...lifecycle, durableObjectShape: "live-v0" }), /stored-value shape/);
+  for (const field of ["durableObject", "d1Schema", "durableObjectShape"] as const) {
+    for (const invalid of [undefined, null, ""]) {
+      assert.throws(() => assertRollbackCompatible({ ...lifecycle, [field]: invalid }, { ...lifecycle, [field]: invalid }), /evidence is required/);
+    }
+  }
 });
 
 test("D1 recovery quarantines first and refuses drift or a writable origin", async () => {
