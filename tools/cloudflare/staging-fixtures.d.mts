@@ -1,0 +1,4 @@
+import type { StagingJournal } from "./journal.mjs";
+export interface SyntheticFixturePlan { runId: string; preFixtureBookmark: string; communityId: string; eventId: string; organizerParticipationId: string; songIds: string[]; deviceInstallationId: string; durableObjectIdentity: string; operationIds: Record<string, string>; tokenHash: string; rows: Array<{ table: string; key: string }>; parentChildTables: string[] }
+export function createSyntheticFixturePlan(input: { runId: string; organizerToken: string; preFixtureBookmark: string }): SyntheticFixturePlan;
+export function seedSyntheticFixtures(input: { journal: StagingJournal; plan: SyntheticFixturePlan; persistJournal: (journal: StagingJournal) => Promise<unknown>; inspect: (plan: SyntheticFixturePlan) => Promise<{ complete: boolean; count: number }>; seed: (plan: SyntheticFixturePlan) => Promise<unknown> }): Promise<{ reconciled: boolean; count: number }>;

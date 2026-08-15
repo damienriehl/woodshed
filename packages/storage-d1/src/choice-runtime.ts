@@ -85,6 +85,10 @@ export class D1ChoiceRuntime {
     return { participationId: String(row.participation_id), communityId: String(row.community_id), eventId: String(row.event_id), role: String(row.role) };
   }
 
+  async revokeSession(token: string) {
+    await this.database.prepare("UPDATE participant_sessions SET revoked_at=? WHERE id_hash=? AND revoked_at IS NULL").bind(this.now().toISOString(), await webSha256(token)).run();
+  }
+
   async assertEvent(session: RuntimeSession, eventId: string) {
     if (session.eventId !== eventId) throw new RuntimeError("denied");
     const event = await this.database.prepare("SELECT community_id FROM events WHERE id=?").bind(eventId).first<{ community_id: string }>();

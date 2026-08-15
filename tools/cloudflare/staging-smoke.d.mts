@@ -1,0 +1,4 @@
+import type { StagingJournal } from "./journal.mjs";
+import type { SyntheticFixturePlan } from "./staging-fixtures.mjs";
+export interface AcceptanceEvidence { contract: string; runId: string; sourceSha: string; phase: string; outcomes: Record<string, unknown>; counts: Record<string, number>; productionAuthority: false; target: string }
+export function runDeployedAcceptance(options: { origin: string; journal: StagingJournal; plan: SyntheticFixturePlan; organizerToken: string; fetch: (url: string, init?: RequestInit) => Promise<Response>; persistJournal: (journal: StagingJournal) => Promise<unknown>; inspectFixtures: (plan: SyntheticFixturePlan) => Promise<{ complete: boolean; count: number }>; seedFixtures: (plan: SyntheticFixturePlan) => Promise<unknown>; buildLiveCommand: (input: { commandCredential: string; authorityEpoch: number; plan: SyntheticFixturePlan }) => unknown | Promise<unknown> }): Promise<AcceptanceEvidence>;

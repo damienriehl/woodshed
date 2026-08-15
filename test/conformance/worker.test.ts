@@ -147,6 +147,11 @@ describe("Cloudflare Worker runtime", () => {
       const logout = await fixture.fetch("/api/logout", { method: "POST", headers: fixture.mutationHeaders(`${cookie}; woodshed_session_deadbeefdeadbeef=another`) });
       assert.equal(logout.status, 204);
       assert.equal(logout.headers.getSetCookie().filter(value => /Max-Age=0/.test(value)).length, 2);
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie } })).status, 401);
+
+      const bearerLogout = await fixture.fetch("/api/logout", { method: "POST", headers: fixture.authHeaders(true) });
+      assert.equal(bearerLogout.status, 204);
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: fixture.authHeaders() })).status, 401);
 
       await fixture.DB.prepare("UPDATE guest_participations SET revoked_at=? WHERE id=?").bind("2030-01-01T12:02:00.000Z", participation!.participation_id).run();
       assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie } })).status, 401);

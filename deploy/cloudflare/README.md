@@ -2,7 +2,9 @@
 
 > Status: experimental adapter slice, not a complete Woodshed deployment. It currently proves D1-backed discovery, public accountless sessions, ranked ballot read/write, proposals, logout, live queue commands, and Durable Object authority handoff/recovery. It does not yet expose invite exchange, account claiming, draft setlists, staffing, or rehearsal APIs. Use the Node/SQLite runtime for the complete implemented application surface.
 
-Before deploying, replace the D1 database identifiers and `APP_ORIGIN` placeholder in `wrangler.jsonc`, apply every migration in `migrations/d1`, and provision `LIVE_COMMAND_SECRET` through the platform secret store. Never place that secret in `wrangler.jsonc`, source control, command output, or a client bundle.
+Do not replace tracked values in `wrangler.jsonc` with account-specific values. The checked-in `staging` environment is a non-deployable contract: deployment tooling must validate the private inventory and generate its effective configuration beneath the ignored `.cloudflare-staging/` directory. Account IDs, database IDs, real origins, credentials, and unredacted command output stay outside the public repository.
+
+The private inventory must select the literal `staging` environment, bind a Worker whose safe name contains `staging`, provide the expected full source commit, and enumerate forbidden production identities. Validation fails closed for a dirty worktree, an unexpected or abbreviated commit, unknown fields, placeholder values, unsafe or Hootenanny-shaped targets, and any overlap with the forbidden inventory. Diagnostic summaries name only configured field classes; they never print configured values.
 
 `LIVE_COMMAND_SECRET` is a server-held root used to derive a separate command credential for each community, event, and device. The authenticated authority acquire and handoff-confirm responses return only that device-scoped credential.
 
@@ -15,6 +17,14 @@ The Worker expects these bindings:
 
 Deploy schema before code. Do not route production traffic until the missing endpoint/session contract is implemented and the migration, Worker health, ballot, live-command, and authority-handoff smoke checks pass against the target environment.
 
+All Cloudflare commands must use the repository-local, exactly pinned Wrangler binary with both the checked-in config and the explicit staging environment. This mutation-free check demonstrates that selection without reading an ambient global Wrangler installation:
+
+```sh
+npm run cloudflare:staging:version
+```
+
+It does not authenticate, inspect an account, or mutate Cloudflare. There is intentionally no production environment or promotion command in this contract.
+
 ## Local deployment rehearsal
 
 Run the bundled smoke gate before configuring or mutating a Cloudflare account:
@@ -26,3 +36,12 @@ npm run smoke:cloudflare
 The gate bundles the actual Worker entry point and runs it with genuine local workerd D1 and Durable Object bindings through pinned Miniflare. It applies the ordered D1 migration chain before seeding synthetic events, then exercises public join, event-scoped cookies, context, ballot persistence, proposals, logout, and authority acquisition. It also verifies that a quota query uses migration 008's index and that the event trigger seeds choice configuration.
 
 This local gate does not deploy, create D1 databases, write secrets, change DNS, or route traffic. A real staging rehearsal still requires reviewed target-specific values for `database_id`, `APP_ORIGIN`, and `LIVE_COMMAND_SECRET`; apply migrations before Worker code and record rollback evidence before changing an alias.
+
+### Deployed synthetic acceptance
+
+The programmatic `runDeployedAcceptance` boundary requires an immutable deployed journal. It journals the deterministic synthetic fixture graph before the first write, then exercises the exact HTTPS origin through participant, security-denial, authority, live-command, and logout checks. Public evidence contains statuses, counts, and revisions only. A passing smoke remains `quarantined`; only whole-stack teardown may mark cleanup complete.
+### Recovery and teardown
+
+Recovery treats Worker code, D1, and Durable Object state as separate domains. Worker rollback is allowed only to a verified version with the same legacy Durable Object lifecycle and compatible D1 schema, Durable Object value shape, bindings, and secrets. D1 Time Travel requires a quarantined, non-writable origin plus an unchanged exclusive-owner/last-write check and never claims to restore Durable Object state.
+
+Teardown removes only the run journal identities, in dependency order, and proves route/hostname, credentials/secret, Worker/version, Durable Object namespace/state, D1, and the time-bounded deployment token absent. Durable Object deletion stays on the existing legacy migration-array mechanism with an explicit run-owned deleted_classes lifecycle tag. A corrupt journal, identity drift, or unexpected dependent authorizes no deletion. Retain the private journal through the +24-hour absence/audit check. See docs/operations/cloudflare-staging.md for the operator contract.

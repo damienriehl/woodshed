@@ -5,6 +5,8 @@ coverage/
 .env
 .env.*
 !.env.example
+.cloudflare-staging/
+.wrangler/
 *.db
 *.sqlite
 *.sqlite3
