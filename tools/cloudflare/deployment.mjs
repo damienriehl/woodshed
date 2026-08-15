@@ -220,7 +220,8 @@ export async function runMigrationFirstDeployment(options) {
     await persistJournal(journal);
   }
 
-  reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
+  const finalReconciliation = reconcileMigrationLedger({ remote: await inspectLedger(), manifest, journal });
+  if (finalReconciliation.pending.length !== 0) throw new Error("remote migration ledger is incomplete before deploy");
   await verifyFinalSchema();
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before deploy");
   let intent = journal.mutations.find((item) => item?.kind === "worker-deploy");

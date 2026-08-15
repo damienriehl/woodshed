@@ -179,6 +179,25 @@ test("migration-first apply persists provenance, reconciles response loss, block
   assert.equal(mutations, 0);
 });
 
+test("deployment fails closed when the final remote migration ledger is incomplete", async () => {
+  const first = D1_MIGRATIONS[0]!;
+  let deployments = 0;
+  let schemaVerifications = 0;
+  await assert.rejects(runMigrationFirstDeployment({
+    journal: journal(), lease, manifest: [first], expectedSnapshot: { revision: "same" },
+    inspectSnapshot: async () => ({ revision: "same" }),
+    inspectLedger: async () => [],
+    persistJournal: async () => {},
+    applyMigration: async () => {},
+    verifyMigration: async () => true,
+    verifyFinalSchema: async () => { schemaVerifications += 1; },
+    deployWorker: async () => { deployments += 1; return { deploymentId: "must-not-deploy" }; },
+    verifyDeployment: async () => {},
+  }), /remote migration ledger is incomplete before deploy/);
+  assert.equal(schemaVerifications, 0);
+  assert.equal(deployments, 0);
+});
+
 test("restart reconciles pending migration and deployment intents from remote state without replay", async () => {
   const first = D1_MIGRATIONS[0]!;
   const state = journal();
