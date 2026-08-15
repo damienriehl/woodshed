@@ -130,6 +130,15 @@ test("schema verification covers foreign keys, integrity, strict objects, choice
   }));
   assert.throws(() => assertSchemaInvariants({ ...expected, foreignKeyViolations: 1 }, expected), /foreign key/i);
   assert.throws(() => assertSchemaInvariants({ ...expected, migration009: { ...expected.migration009, afterAssociations: 2 } }, expected), /preservation/i);
+  for (const field of ["beforeRows", "afterRows", "beforeAssociations", "afterAssociations"] as const) {
+    for (const invalid of [undefined, null, "3", -1, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(
+        () => assertSchemaInvariants({ ...expected, migration009: { ...expected.migration009, [field]: invalid } }, expected),
+        /preservation/i,
+        `expected ${field}=${String(invalid)} to fail closed`,
+      );
+    }
+  }
 });
 
 test("deployment identity and bindings must match the frozen release and configuration", () => {

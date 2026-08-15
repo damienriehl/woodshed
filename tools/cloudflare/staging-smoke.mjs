@@ -45,6 +45,10 @@ export async function runDeployedAcceptance(options) {
     const authority = await parsed(await request(`/api/events/${plan.eventId}/live/authority/acquire`, { method: "POST", headers: organizerHeaders, body: body({ deviceInstallationId: plan.deviceInstallationId }) }), [200], "authority acquisition");
     if (!Number.isSafeInteger(authority?.epoch) || typeof authority?.commandCredential !== "string" || !authority.commandCredential) throw new Error("authority response contract failed");
     const liveCommand = await buildLiveCommand({ commandCredential: authority.commandCredential, authorityEpoch: authority.epoch, plan });
+    if (!liveCommand || typeof liveCommand !== "object" || typeof liveCommand.entryId !== "string" || !liveCommand.entryId) throw new Error("live command contract failed");
+    const liveBefore = await parsed(await request(`/api/events/${plan.eventId}/live/state`, { headers: { authorization: `Bearer ${organizerToken}` } }), [200], "initial live state");
+    if (!Number.isSafeInteger(liveBefore?.revision) || !Array.isArray(liveBefore?.entries)) throw new Error("initial live state contract failed");
+    if (liveBefore.entries.some(({ id }) => id === liveCommand.entryId)) throw new Error("synthetic live entry existed before command");
     const liveResult = await parsed(await request(`/api/events/${plan.eventId}/live/commands`, { method: "POST", headers: organizerHeaders, body: body(liveCommand) }), [200], "live command");
     const liveState = await parsed(await request(`/api/events/${plan.eventId}/live/state`, { headers: { authorization: `Bearer ${organizerToken}` } }), [200], "live state");
     const logout = await request("/api/logout", { method: "POST", headers: jsonHeaders(origin, { cookie }) });
@@ -54,7 +58,9 @@ export async function runDeployedAcceptance(options) {
 
     const security = { wrongOrigin: wrongOrigin.status === 403, missingCsrf: missingCsrf.status === 403, missingSession: missingSession.status === 401, retiredSessionReplay: afterLogout.status === 401, participantOrganizer: participantOrganizer.status === 403 };
     if (Object.values(security).some((passed) => !passed)) throw new Error("deployed security matrix failed");
-    if (!Number.isSafeInteger(liveResult?.revision) || !Number.isSafeInteger(liveState?.revision)) throw new Error("live response contract failed");
+    if (!Number.isSafeInteger(liveResult?.revision) || !liveResult?.entry || typeof liveResult.entry.state !== "string" || !Number.isSafeInteger(liveState?.revision) || !Array.isArray(liveState?.entries)) throw new Error("live response contract failed");
+    const exercisedEntry = liveState.entries.find(({ id }) => id === liveCommand.entryId);
+    if (liveState.revision !== liveResult.revision || liveResult.entry.id !== liveCommand.entryId || !exercisedEntry || exercisedEntry.state !== liveResult.entry.state) throw new Error("live state readback mismatch");
     journal.phase = "quarantined";
     journal.acceptance = { ...journal.acceptance, status: "passed", cleanupComplete: false };
     await persistJournal(journal);

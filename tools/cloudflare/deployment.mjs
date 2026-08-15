@@ -162,7 +162,16 @@ export function assertSchemaInvariants(actual, expected) {
   for (const key of ["tables", "indexes", "triggers", "constraints"]) exactSet(actual[key], expected[key], key);
   if (actual.choiceConfigSeeded !== true) throw new Error("event choice configuration seed verification failed");
   const preservation = actual.migration009;
-  if (!preservation || preservation.beforeRows !== preservation.afterRows || preservation.beforeAssociations !== preservation.afterAssociations) {
+  const preservationCounts = preservation && [
+    preservation.beforeRows,
+    preservation.afterRows,
+    preservation.beforeAssociations,
+    preservation.afterAssociations,
+  ];
+  if (!preservationCounts
+    || preservationCounts.some((count) => !Number.isSafeInteger(count) || count < 0)
+    || preservation.beforeRows !== preservation.afterRows
+    || preservation.beforeAssociations !== preservation.afterAssociations) {
     throw new Error("migration 009 preservation verification failed");
   }
   return true;
