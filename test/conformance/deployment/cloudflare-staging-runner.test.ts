@@ -45,8 +45,36 @@ test("preflight uncertainty, absent lease, and identity drift cause zero mutatio
   let mutations = 0;
   const mutate = async () => { mutations += 1; };
   await assert.rejects(runStagingOperation({ operation: "apply", inventory: null, boundaries: { mutate } }), /inventory/);
-  await assert.rejects(runStagingOperation({ operation: "apply", inventory: identity, lease: null, expectedIdentity: identity, remoteIdentity: identity, boundaries: { mutate } }), /lease/);
-  await assert.rejects(runStagingOperation({ operation: "apply", inventory: identity, lease: { runId: "run-a", owner: "owner-a", active: true }, expectedIdentity: identity, remoteIdentity: { ...identity, workerName: "changed" }, boundaries: { mutate } }), /identity changed/);
+  await assert.rejects(runStagingOperation({ operation: "apply", runId: "run-a", owner: "owner-a", inventory: identity, lease: null, expectedIdentity: identity, remoteIdentity: identity, boundaries: { mutate } }), /lease/);
+  await assert.rejects(runStagingOperation({ operation: "apply", runId: "run-a", owner: "owner-a", inventory: identity, lease: { runId: "run-a", owner: "owner-a", active: true }, expectedIdentity: identity, remoteIdentity: { ...identity, workerName: "changed" }, boundaries: { mutate } }), /identity changed/);
+  assert.equal(mutations, 0);
+});
+
+test("apply and verify reject active leases belonging to another run or owner", async () => {
+  let mutations = 0;
+  const mutate = async () => { mutations += 1; };
+  const base = { runId: "run-a", owner: "owner-a", inventory: identity, expectedIdentity: identity, remoteIdentity: identity, boundaries: { mutate } };
+  for (const operation of ["apply", "verify"]) {
+    await assert.rejects(runStagingOperation({ ...base, operation, lease: { active: true, runId: "run-b", owner: "owner-a" } }), /lease/);
+    await assert.rejects(runStagingOperation({ ...base, operation, lease: { active: true, runId: "run-a", owner: "owner-b" } }), /lease/);
+  }
+  assert.equal(mutations, 0);
+});
+
+test("pre-provisioning database-name drift blocks mutation before a UUID exists", async () => {
+  let mutations = 0;
+  const expectedIdentity = { ...identity, databaseId: undefined };
+  const remoteIdentity = { ...expectedIdentity, databaseName: "woodshed-staging-other-run" };
+  await assert.rejects(runStagingOperation({
+    operation: "apply",
+    runId: "run-a",
+    owner: "owner-a",
+    inventory: identity,
+    lease: { active: true, runId: "run-a", owner: "owner-a" },
+    expectedIdentity,
+    remoteIdentity,
+    boundaries: { mutate: async () => { mutations += 1; } },
+  }), /identity changed/);
   assert.equal(mutations, 0);
 });
 

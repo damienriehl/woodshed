@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { loadJournal } from "./cloudflare/journal.mjs";
 
 const OPERATIONS = new Set(["preflight", "plan", "apply", "verify", "teardown", "status"]);
-const IDENTITY_FIELDS = ["accountId", "databaseId", "workerName", "origin"];
+const IDENTITY_FIELDS = ["accountId", "databaseId", "databaseName", "workerName", "origin"];
 
 function sameIdentity(expected, actual) {
   return expected && actual && IDENTITY_FIELDS.every((key) => expected[key] === actual[key]);
@@ -40,7 +40,7 @@ export async function runStagingOperation(options) {
   }
   if (!options.inventory || typeof options.inventory !== "object") throw new Error("validated inventory is required");
   if (operation === "preflight" || operation === "plan") return { operation, mutationCount: 0 };
-  if (!options.lease?.active) throw new Error("active ownership lease is required");
+  if (!options.lease?.active || options.lease.runId !== options.runId || options.lease.owner !== options.owner) throw new Error("active ownership lease is required");
   if (!sameIdentity(options.expectedIdentity, options.remoteIdentity)) throw new Error("remote identity changed");
   return boundaries.mutate?.({ operation });
 }
