@@ -94,6 +94,7 @@ export async function generateEffectiveConfig(options) {
     account_id: inventory.staging.accountId,
     name: inventory.staging.workerName,
     workers_dev: workersDev,
+    preview_urls: false,
     d1_databases: [{
       binding: "DB",
       database_name: inventory.staging.databaseName,
@@ -366,8 +367,8 @@ export function createApiTokenClient({ token, fetch = globalThis.fetch, apiBase 
       if (!response.ok) throw new Error("workers.dev exposure inventory failed");
       let payload;
       try { payload = await response.json(); } catch { throw new Error("workers.dev exposure inventory is unreadable"); }
-      if (payload?.success !== true || typeof payload.result?.enabled !== "boolean") throw new Error("workers.dev exposure inventory is unreadable");
-      return { exists: true, enabled: payload.result.enabled };
+      if (payload?.success !== true || typeof payload.result?.enabled !== "boolean" || typeof payload.result?.previews_enabled !== "boolean") throw new Error("workers.dev exposure inventory is unreadable");
+      return { exists: true, enabled: payload.result.enabled || payload.result.previews_enabled };
     },
     async inspectAccountSubdomain(accountId) {
       if (typeof accountId !== "string" || !/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("valid staging account identity is required");

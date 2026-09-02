@@ -1,4 +1,5 @@
 export function createWranglerAdapter(options: Record<string, any>): any;
+export function prepareWranglerHome(root: string): { isolatedHome: string; emptyEnvironment: string };
 export function runBoundedSubprocess(file: string, args: string[], options: Record<string, any>): Promise<{ exitCode: number | null; signal?: string | null; stdout: string; stderr: string }>;
 export function assertCredentialedPreflight(inventory: any, remote: any, options?: any): any;
 export function assertSharedAccountInventory(inventory: any, remote: any): true;

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
@@ -58,6 +61,36 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.equal((adapter as any).invoke, undefined);
   await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
   await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
+});
+
+test("Wrangler home preparation creates a private home and empty environment without invoking Wrangler", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "woodshed-wrangler-home-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  createWranglerAdapter({ root, token: "synthetic-private-token" });
+
+  const isolatedHome = path.join(root, ".cloudflare-staging", "wrangler-home");
+  const emptyEnvironment = path.join(isolatedHome, "empty-environment");
+  assert.equal((await stat(isolatedHome)).mode & 0o777, 0o700);
+  assert.equal((await stat(emptyEnvironment)).mode & 0o777, 0o600);
+  assert.equal(await readFile(emptyEnvironment, "utf8"), "");
+});
+
+test("Wrangler worker inventories translate only script_not_found code 10007 to empty", async () => {
+  const missing = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 1, stdout: "", stderr: "workers.api.error.script_not_found [code: 10007]" }),
+  });
+  assert.deepEqual(await missing.secretList("woodshed-staging-synthetic"), []);
+  assert.deepEqual(await missing.deploymentsList("woodshed-staging-synthetic"), []);
+  assert.deepEqual(await missing.versionsList("woodshed-staging-synthetic"), []);
+
+  const ambiguous = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 1, stdout: "", stderr: "worker not found" }),
+  });
+  await assert.rejects(ambiguous.secretList("woodshed-staging-synthetic"), /Wrangler command failed/);
 });
 
 test("live Wrangler methods remain staging-scoped, bounded, and keep credentials out of arguments", async () => {
@@ -161,6 +194,7 @@ test("shared-account preflight allows declared protected inventory and blocks un
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: "Hootenanny-Live" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "production.invalid/*", script: "neutral" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "neutral.invalid/PrOdUcTiOn/*", script: "neutral" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ hostname: "neutral.invalid", script: "hoot-api", environment: "production" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "*", script: "neutral" }] }, { localSecretAvailable: true }), /unreadable route inventory/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: identity.workerName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: identity.databaseName }] }, { localSecretAvailable: true }), /already exists/);

@@ -15,7 +15,7 @@ import {
   publicOperationResult,
   runLiveOperation,
 } from "../../../tools/cloudflare/live-driver.mjs";
-import { createJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
+import { createJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { createEvidenceEnvelope } from "../../../tools/cloudflare/evidence.mjs";
 import { D1_MIGRATIONS } from "../../../tools/cloudflare/migrations.mjs";
 import { publicErrorMessage } from "../../../tools/cloudflare-staging.mjs";
@@ -38,6 +38,60 @@ function inventory() {
       workerNames: ["protected-worker"],
     },
   };
+}
+
+async function failedApplyFixture(t: any, { quarantineFails = false } = {}) {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-incident-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-incident-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const freshInventory = inventory();
+  delete (freshInventory.staging as Partial<typeof freshInventory.staging>).databaseId;
+  await writeFile(inventoryPath, JSON.stringify(freshInventory));
+
+  const databases: Array<{ uuid: string; name: string }> = [];
+  const applyFailure = new Error("synthetic post-provision apply failure");
+  let quarantineInspections = 0;
+  const adapterFactory = () => ({
+    whoami: async () => ({ accountId }),
+    d1List: async () => databases,
+    deploymentsList: async () => [],
+    versionsList: async () => [],
+    secretList: async () => [],
+    d1Create: async (name: string) => { databases.push({ uuid: databaseId, name }); },
+    d1TimeTravelInfo: async () => { throw applyFailure; },
+  });
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectAccountSubdomain: async () => "synthetic",
+    inspectWorkersDev: async () => {
+      quarantineInspections += 1;
+      if (quarantineFails) throw new Error("synthetic quarantine failure");
+      return { exists: false, enabled: false };
+    },
+  };
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: "run-incident",
+    owner: "owner-incident",
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", LIVE_COMMAND_SECRET: "s".repeat(32) },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory,
+    tokenClientFactory: () => tokenClient,
+    fetch: async () => new Response(null, { status: 404 }),
+  };
+  await runLiveOperation({ ...common, operation: "plan" }, dependencies);
+  return { applyFailure, common, dependencies, journalPath, quarantineInspections: () => quarantineInspections };
 }
 
 test("live CLI requires the explicit staging environment and closed flag set", () => {
@@ -68,6 +122,7 @@ test("effective config is run-isolated, explicit, content-attested, and supports
   const parsed = JSON.parse(await readFile(active.configPath, "utf8"));
   assert.equal(parsed.env.staging.name, workerName);
   assert.equal(parsed.env.staging.workers_dev, true);
+  assert.equal(parsed.env.staging.preview_urls, false);
   assert.equal(parsed.env.staging.vars.WOODSHED_SOURCE_SHA, sourceSha);
   assert.equal(parsed.env.staging.vars.WOODSHED_CONFIG_DIGEST, active.configDigest);
   assert.match(active.configPath, /\.cloudflare-staging/);
@@ -314,7 +369,7 @@ test("deployment token lifecycle uses authorization headers and never URL or bod
       if (url.includes("/workers/routes")) return Response.json({ success: true, result: [{ pattern: "staging.example.invalid/*", script: "neutral-staging-worker" }], result_info: { total_pages: 1 } });
       if (url.includes("/workers/domains")) return Response.json({ success: true, result: [{ hostname: "staging.example.invalid", service: "neutral-staging-worker", environment: "staging" }], result_info: { total_pages: 1 } });
       if (url.endsWith("/workers/subdomain")) return Response.json({ success: true, result: { subdomain: "synthetic" } });
-      if (url.includes("/subdomain")) return Response.json({ success: true, result: { enabled: true } });
+      if (url.includes("/subdomain")) return Response.json({ success: true, result: { enabled: false, previews_enabled: true } });
       if (url.includes("workers/scripts")) return Response.json({ success: true, result: [{ id: "neutral-staging-worker" }], result_info: { total_pages: 1 } });
       if (init.method === "DELETE") { active = false; return Response.json({ success: true, result: {} }); }
       return active
@@ -339,6 +394,13 @@ test("deployment token lifecycle uses authorization headers and never URL or bod
 
   const forbidden = createApiTokenClient({ token: "synthetic-cloud-token", fetch: async () => new Response(null, { status: 403 }) });
   await assert.rejects(forbidden.inspect(), /unauthorized/);
+
+  const unreadablePreview = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    fetch: async () => Response.json({ success: true, result: { enabled: false } }),
+  });
+  await assert.rejects(unreadablePreview.inspectWorkersDev(accountId, workerName), /exposure inventory is unreadable/);
 });
 
 test("teardown revokes a journal-owned run-minted token without revoking the borrowed operator token", async (t) => {
@@ -398,6 +460,110 @@ test("teardown revokes a journal-owned run-minted token without revoking the bor
   assert.equal(result.absenceCount, 8);
   assert.deepEqual(revoked, ["run-minted-token-id"]);
   assert.equal((await tokenClient.inspect()).active, true);
+});
+
+test("apply failure after D1 identity assignment records an incident, quarantines, and rethrows", async (t) => {
+  const fixture = await failedApplyFixture(t);
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error) => error === fixture.applyFailure);
+
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.identity.databaseId, databaseId);
+  assert.deepEqual(journal.incident, {
+    failedPhase: "resources-ready",
+    owner: "owner-incident",
+    nextAction: "reconcile-and-forward-fix-or-teardown",
+    wholeStackRollback: false,
+  });
+  assert.equal(journal.phase, "quarantined");
+  assert.equal(fixture.quarantineInspections(), 2);
+  assert.deepEqual(journal.mutations.find((item: any) => item.kind === "workers-dev-disable"), {
+    kind: "workers-dev-disable",
+    domain: "route",
+    id: journal.resources.find((item: any) => item.domain === "route").id,
+    status: "applied",
+    notRequired: true,
+  });
+});
+
+test("apply failure marks quarantineFailed and warns that the origin must be treated as live", async (t) => {
+  const fixture = await failedApplyFixture(t, { quarantineFails: true });
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error: any) => {
+    assert.equal(error.message, "apply failed and automatic origin quarantine failed; treat the origin as live");
+    assert.equal(error.cause, fixture.applyFailure);
+    return true;
+  });
+
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.identity.databaseId, databaseId);
+  assert.equal(journal.incident.failedPhase, "resources-ready");
+  assert.equal(journal.incident.quarantineFailed, true);
+  assert.equal(journal.incident.nextAction, "treat-origin-as-live-and-reconcile");
+  assert.equal(journal.incident.wholeStackRollback, false);
+  assert.equal(fixture.quarantineInspections(), 1);
+});
+
+test("preview-only exposure fails quarantine absence proof", async (t) => {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-preview-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-preview-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const remoteWithoutTarget = { accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] };
+  const activeConfigDigest = "d".repeat(64);
+  const journal = createJournal({ runId: "run-preview", owner: "owner-preview", sourceSha, identity: stagingInventory.staging });
+  journal.phase = "verified";
+  journal.preflight = { protectedRevision: createIdentityRevision(remoteWithoutTarget), targetRevision: "synthetic", operatorTokenPresent: true };
+  journal.config = { activeDigest: activeConfigDigest };
+  journal.resources.push({ domain: "route", id: "workers-dev-preview", runId: journal.runId, owner: journal.owner, status: "owned" });
+  await saveJournal(journalPath, journal);
+
+  let deployCalls = 0;
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => [{ uuid: databaseId, name: stagingInventory.staging.databaseName }],
+    deploymentsList: async () => [{ id: "deployment-before", script_name: workerName }],
+    versionsList: async () => [],
+    secretList: async () => [],
+    deploy: async () => { deployCalls += 1; },
+  };
+  const exposureClient = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    fetch: async () => Response.json({ success: true, result: { enabled: false, previews_enabled: true } }),
+  });
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectWorkersDev: exposureClient.inspectWorkersDev,
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => tokenClient,
+    fetch: async () => Response.json({
+      sourceSha,
+      configDigest: activeConfigDigest,
+      lifecycle: "legacy-sqlite-v1",
+      bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"],
+    }),
+  };
+  await assert.rejects(runLiveOperation({
+    root: testRoot,
+    operation: "verify",
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
+  }, dependencies), /origin quarantine absence proof failed/);
+  assert.equal(deployCalls, 1);
 });
 
 test("mocked live boundaries complete plan through teardown in dependency order with absence proof", async (t) => {

@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { attestMigration } from "./journal.mjs";
 
@@ -12,6 +12,15 @@ function safeWorkerName(value) {
 }
 
 const safeDatabaseName = safeWorkerName;
+
+export function prepareWranglerHome(root) {
+  if (typeof root !== "string" || root.length === 0) throw new Error("repository root is required");
+  const isolatedHome = path.join(root, ".cloudflare-staging", "wrangler-home");
+  const emptyEnvironment = path.join(isolatedHome, "empty-environment");
+  mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  writeFileSync(emptyEnvironment, "", { mode: 0o600 });
+  return Object.freeze({ isolatedHome, emptyEnvironment });
+}
 
 function parseJson(value, label = "Cloudflare structured output") {
   try { return typeof value === "string" ? JSON.parse(value) : value; }
@@ -80,6 +89,7 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
   if (relativeConfig.startsWith("..") || path.isAbsolute(relativeConfig)) throw new Error("Wrangler config must remain inside the repository worktree");
   const isolatedHome = path.join(root, ".cloudflare-staging", "wrangler-home");
   const emptyEnvironment = path.join(isolatedHome, "empty-environment");
+  if (!spawn) prepareWranglerHome(root);
   const inheritedNames = ["PATH", "USER", "SHELL", "TMPDIR", "TEMP", "TMP", "CI", "NO_COLOR", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
   const childEnv = Object.fromEntries(inheritedNames.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]));
   Object.assign(childEnv, { HOME: isolatedHome, XDG_CONFIG_HOME: isolatedHome, CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false", CLOUDFLARE_INCLUDE_PROCESS_ENV: "false", WRANGLER_LOG: "none", WRANGLER_LOG_PATH: path.join(root, ".cloudflare-staging", "wrangler.log"), WRANGLER_SEND_METRICS: "false" });
@@ -88,10 +98,6 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) throw new Error("Wrangler arguments must be strings");
     if (args.includes("--config") || args.includes("--env") || args.includes("-c") || args.includes("-e")) throw new Error("Wrangler environment selection is owned by the staging adapter");
     if (args.some((arg) => /(?:route|domain|dns)/i.test(arg))) throw new Error("route mutation commands are not supported");
-    if (!spawn) {
-      await mkdir(isolatedHome, { recursive: true, mode: 0o700 });
-      await writeFile(emptyEnvironment, "", { mode: 0o600 });
-    }
     const completeArgs = [...args, "--env-file", emptyEnvironment, "--config", config, "--env", "staging"];
     const executionOptions = {
       cwd: root, env: childEnv,
@@ -101,7 +107,7 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
       ? await spawn(binary, completeArgs, executionOptions)
       : await runBoundedSubprocess(binary, completeArgs, executionOptions);
     if (!result || result.exitCode !== 0) {
-      if (allowNotFound && /(?:not found|does not exist|10090)/i.test(result?.stderr ?? "")) return { exitCode: result.exitCode, stdout: "[]", stderr: "" };
+      if (allowNotFound && /\[code:\s*10007\]/i.test(result?.stderr ?? "")) return { exitCode: result.exitCode, stdout: "[]", stderr: "" };
       throw new Error("Wrangler command failed");
     }
     return result;
@@ -250,8 +256,10 @@ export function assertSharedAccountInventory(inventory, remote) {
     const declaredOrigin = routeMatchesForbiddenOrigin(identity, forbiddenHostnames);
     const script = typeof item?.script === "string" ? item.script : null;
     const declaredScript = script !== null && forbiddenWorkerNames.has(script.toLowerCase());
+    const environment = typeof item?.environment === "string" ? item.environment : null;
     if ((PROTECTED_TARGET.test(identity.pattern) && !declaredOrigin)
-      || (script !== null && PROTECTED_TARGET.test(script) && !declaredScript)) {
+      || (script !== null && PROTECTED_TARGET.test(script) && !declaredScript)
+      || (environment !== null && PROTECTED_TARGET.test(environment) && !declaredOrigin && !declaredScript)) {
       throw new Error("shared account contains an undeclared protected-looking target");
     }
   }
