@@ -71,7 +71,7 @@ test("teardown is run-owned, dependency ordered, re-entrant, and proves every do
   const journal = {
     runId: "run-a", owner: "owner-a", phase: "quarantined",
     identity: { accountId: "account", databaseId: "db", workerName: "worker", origin: "https://staging.invalid" },
-    resources: [...state.keys()].map((domain) => ({ domain, id: `${domain}-run-a`, runId: "run-a", owner: "owner-a" })),
+    resources: [...state.keys()].map((domain) => ({ domain, id: `${domain}-run-a`, runId: "run-a", owner: "owner-a", ...(domain === "token" ? { provenance: "run-minted" } : {}) })),
   };
   const result = await runStackTeardown({
     journal,
@@ -106,7 +106,7 @@ test("teardown removes every duplicate-domain resource and an applicable hostnam
   const state = new Map(resourceSpecs.map(([, id]) => [id, true]));
   const journal = {
     runId: "run-a", owner: "owner-a", phase: "quarantined", identity: {},
-    resources: resourceSpecs.map(([domain, id]) => ({ domain, id, runId: "run-a", owner: "owner-a" })),
+    resources: resourceSpecs.map(([domain, id]) => ({ domain, id, runId: "run-a", owner: "owner-a", ...(domain === "token" ? { provenance: "run-minted" } : {}) })),
   };
   const removed: string[] = [];
   const result = await runStackTeardown({
@@ -123,7 +123,7 @@ test("teardown removes every duplicate-domain resource and an applicable hostnam
 
 test("teardown rejects duplicate identities before removing anything", async () => {
   const domains = ["route", "credential", "secret", "worker", "durable-object", "d1", "token"];
-  const resources = domains.map((domain) => ({ domain, id: domain + "-a", runId: "run-a", owner: "owner-a" }));
+  const resources = domains.map((domain) => ({ domain, id: domain + "-a", runId: "run-a", owner: "owner-a", ...(domain === "token" ? { provenance: "run-minted" } : {}) }));
   resources.push({ ...{ ...resources[0]! } });
   let removals = 0;
   await assert.rejects(runStackTeardown({
@@ -136,7 +136,7 @@ test("teardown rejects duplicate identities before removing anything", async () 
 });
 
 test("teardown fails closed on identity mismatch or unexpected dependents", async () => {
-  const journal = { runId: "run-a", owner: "owner-a", phase: "quarantined", identity: {}, resources: ["route", "credential", "secret", "worker", "durable-object", "d1", "token"].map((domain) => ({ domain, id: domain + "-run-a", runId: "run-a", owner: "owner-a" })) };
+  const journal = { runId: "run-a", owner: "owner-a", phase: "quarantined", identity: {}, resources: ["route", "credential", "secret", "worker", "durable-object", "d1", "token"].map((domain) => ({ domain, id: domain + "-run-a", runId: "run-a", owner: "owner-a", ...(domain === "token" ? { provenance: "run-minted" } : {}) })) };
   const base = {
     journal, lease: { active: true, runId: "run-a", owner: "owner-a", revision: "7" }, expectedRevision: "7",
     inspectRevision: async () => "7", inspectResource: async () => ({ exists: true, runId: "other", owner: "other" }),
@@ -144,6 +144,20 @@ test("teardown fails closed on identity mismatch or unexpected dependents", asyn
   };
   await assert.rejects(runStackTeardown({ ...base, listDependents: async () => [] }), /identity mismatch/);
   await assert.rejects(runStackTeardown({ ...base, inspectResource: async () => ({ exists: true, runId: "run-a", owner: "owner-a" }), listDependents: async () => ["unknown-child"] }), /unexpected dependent/);
+});
+
+test("teardown re-reads protected identity after its final mutation", async () => {
+  const resources = ["route", "credential", "secret", "worker", "durable-object", "d1"].map((domain) => ({ domain, id: domain + "-run-a", runId: "run-a", owner: "owner-a" }));
+  const state = new Map(resources.map(({ domain }) => [domain, true]));
+  let revision = "7";
+  await assert.rejects(runStackTeardown({
+    journal: { runId: "run-a", owner: "owner-a", phase: "quarantined", resources },
+    lease: { active: true, runId: "run-a", owner: "owner-a", revision: "7" }, expectedRevision: "7",
+    inspectRevision: async () => revision, listDependents: async () => [],
+    inspectResource: async ({ domain }: { domain: string }) => ({ exists: state.get(domain), runId: "run-a", owner: "owner-a" }),
+    removeResource: async ({ domain }: { domain: string }) => { state.set(domain, false); if (domain === "d1") revision = "8"; },
+    verifyTokenInactive: async () => true,
+  }), /last-write identity changed/);
 });
 
 test("failure reports retain safe next action but sanitize sensitive observability", () => {

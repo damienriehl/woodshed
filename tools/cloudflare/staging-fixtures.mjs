@@ -54,24 +54,40 @@ function publicFixtureOwnership(plan) {
 }
 
 export async function seedSyntheticFixtures({ journal, plan, persistJournal, inspect, seed }) {
-  if (journal.phase !== "worker-deployed" || plan.runId !== journal.runId) throw new Error("fixture plan does not belong to deployed run");
+  if (!["worker-deployed", "alias-live"].includes(journal.phase) || plan.runId !== journal.runId) throw new Error("fixture plan does not belong to deployed run");
   if (![persistJournal, inspect, seed].every((fn) => typeof fn === "function")) throw new Error("fixture boundaries are required");
   journal.acceptance = { status: "planned", cleanupComplete: false, fixturePlan: publicFixtureOwnership(plan) };
-  journal.mutations.push({ kind: "synthetic-fixture-batch", operationId: plan.operationIds.join, status: "planned" });
+  let intent = journal.mutations.find((item) => item?.kind === "synthetic-fixture-batch" && item.operationId === plan.operationIds.join);
+  if (!intent) {
+    intent = { kind: "synthetic-fixture-batch", operationId: plan.operationIds.join, status: "planned" };
+    journal.mutations.push(intent);
+  } else if (!["planned", "applied"].includes(intent.status)) {
+    throw new Error("fixture mutation intent cannot be reconciled");
+  }
   await persistJournal(journal);
 
   const exact = (state) => state?.complete === true && state.count === plan.rows.length;
   const before = await inspect(plan);
-  if (exact(before)) return { reconciled: true, count: before.count };
+  if (exact(before)) {
+    intent.status = "applied";
+    await persistJournal(journal);
+    return { reconciled: true, count: before.count };
+  }
   if (before?.count) throw new Error("partial synthetic fixture state requires quarantine");
   try {
     await seed(plan);
   } catch (error) {
     const afterLoss = await inspect(plan);
-    if (exact(afterLoss)) return { reconciled: true, count: afterLoss.count };
+    if (exact(afterLoss)) {
+      intent.status = "applied";
+      await persistJournal(journal);
+      return { reconciled: true, count: afterLoss.count };
+    }
     throw new Error("fixture seed failed; run requires quarantine", { cause: error });
   }
   const after = await inspect(plan);
   if (!exact(after)) throw new Error("fixture seed postcondition failed; run requires quarantine");
+  intent.status = "applied";
+  await persistJournal(journal);
   return { reconciled: false, count: after.count };
 }

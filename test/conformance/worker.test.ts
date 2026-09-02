@@ -70,6 +70,31 @@ async function signedCommand(overrides: Record<string, unknown> = {}) {
 }
 
 describe("Cloudflare Worker runtime", () => {
+  it("exposes only the non-sensitive frozen release marker when staging bindings are present", async () => {
+    const sourceSha = "a".repeat(40), configDigest = "b".repeat(64);
+    const response = await worker.fetch(new Request(`${origin}/api/staging-release`), {
+      DB: {} as D1Database, LIVE_COORDINATOR: authorityNamespace(), APP_ORIGIN: origin,
+      LIVE_COMMAND_SECRET: liveSecret, WOODSHED_SOURCE_SHA: sourceSha, WOODSHED_CONFIG_DIGEST: configDigest,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { sourceSha, configDigest, lifecycle: "legacy-sqlite-v1", bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] });
+
+    const absent = await worker.fetch(new Request(`${origin}/api/staging-release`), {
+      DB: {} as D1Database, LIVE_COORDINATOR: authorityNamespace(), APP_ORIGIN: origin, LIVE_COMMAND_SECRET: liveSecret,
+    });
+    assert.equal(absent.status, 404);
+
+    for (const markers of [
+      { WOODSHED_SOURCE_SHA: "invalid", WOODSHED_CONFIG_DIGEST: configDigest },
+      { WOODSHED_SOURCE_SHA: sourceSha, WOODSHED_CONFIG_DIGEST: "invalid" },
+    ]) {
+      const malformed = await worker.fetch(new Request(`${origin}/api/staging-release`), {
+        DB: {} as D1Database, LIVE_COORDINATOR: authorityNamespace(), APP_ORIGIN: origin, LIVE_COMMAND_SECRET: liveSecret, ...markers,
+      });
+      assert.equal(malformed.status, 404);
+    }
+  });
+
   it("completes the accountless participant first loop with event-scoped sessions", async () => {
     const fixture = await runtime();
     try {

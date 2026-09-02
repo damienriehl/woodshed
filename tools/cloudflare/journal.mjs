@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, rm } from "node:fs/promises";
+import { link, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PHASES = new Set(["pre-write", "resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"]);
 const REQUIRED_IDENTITY = ["accountId", "databaseName", "workerName", "origin"];
+const RESOURCE_DOMAINS = new Set(["route", "hostname", "credential", "secret", "worker", "durable-object", "d1", "token"]);
 
 function requiredString(value, name) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`invalid journal: ${name} is required`);
@@ -21,6 +22,27 @@ export function validateJournal(value) {
   if (value.identity.databaseId !== undefined && (typeof value.identity.databaseId !== "string" || value.identity.databaseId.length === 0)) throw new Error("invalid journal: identity.databaseId");
   if (value.phase !== "pre-write" && !value.identity.databaseId) throw new Error("invalid journal: identity.databaseId is required after provisioning");
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
+  if (value.preflight !== undefined && (!value.preflight || typeof value.preflight !== "object" || value.preflight.operatorTokenPresent !== true)) throw new Error("invalid journal: operator token presence");
+  const resourceKeys = new Set();
+  for (const resource of value.resources) {
+    if (!resource || typeof resource !== "object" || !RESOURCE_DOMAINS.has(resource.domain) || typeof resource.id !== "string" || !resource.id || resource.runId !== value.runId || resource.owner !== value.owner || (resource.status !== undefined && !["planned", "owned"].includes(resource.status))) throw new Error("invalid journal: resource ownership");
+    if (resource.domain === "token" && resource.provenance !== "run-minted") throw new Error("invalid journal: token must be run-minted");
+    const key = `${resource.domain}:${resource.id}`;
+    if (resourceKeys.has(key)) throw new Error("invalid journal: duplicate resource ownership");
+    resourceKeys.add(key);
+  }
+  const mutationKeys = new Set();
+  for (const mutation of value.mutations) {
+    if (!mutation || typeof mutation !== "object" || typeof mutation.kind !== "string" || !mutation.kind || !["planned", "pending", "applied"].includes(mutation.status)) throw new Error("invalid journal: mutation intent");
+    if (mutation.domain !== undefined && (!RESOURCE_DOMAINS.has(mutation.domain) || typeof mutation.id !== "string" || !mutation.id)) throw new Error("invalid journal: mutation resource identity");
+    const key = `${mutation.kind}:${mutation.domain ?? ""}:${mutation.id ?? mutation.operationId ?? ""}`;
+    if (mutationKeys.has(key)) throw new Error("invalid journal: duplicate mutation intent");
+    mutationKeys.add(key);
+    if (mutation.kind === "durable-object-delete") {
+      if (!/^woodshed-staging-delete-[a-f0-9]{16}$/.test(mutation.tag ?? "") || !Array.isArray(mutation.beforeDeploymentIds) || mutation.beforeDeploymentIds.length === 0) throw new Error("invalid journal: Durable Object deletion attestation");
+      if (mutation.status === "applied" && (!/^[a-f0-9]{64}$/.test(mutation.configDigest ?? "") || !Array.isArray(mutation.afterDeploymentIds) || mutation.afterDeploymentIds.length === 0)) throw new Error("invalid journal: Durable Object deletion attestation");
+    }
+  }
   for (const migration of value.migrations) {
     if (!migration || typeof migration !== "object" || typeof migration.filename !== "string" || !/^[a-f0-9]{64}$/.test(migration.sha256) || migration.sourceSha !== value.sourceSha || !["pending", "applied"].includes(migration.status)) {
       throw new Error("invalid journal: migration attestation");
@@ -68,6 +90,36 @@ export async function saveJournal(file, value) {
   } finally {
     if (!renamed) await rm(temporary, { force: true });
   }
+  return journal;
+}
+
+export async function saveNewJournal(file, value) {
+  const journal = validateJournal(structuredClone(value));
+  journal.updatedAt = new Date().toISOString();
+  const directory = path.dirname(file);
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  const handle = await open(temporary, "wx", 0o600);
+  let linked = false;
+  try {
+    try {
+      await handle.writeFile(`${JSON.stringify(journal, null, 2)}\n`);
+      await handle.chmod(0o600);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try { await link(temporary, file); }
+    catch (error) {
+      if (error?.code === "EEXIST") throw new Error("journal path already exists; use status or resume the owned run");
+      throw error;
+    }
+    linked = true;
+    const directoryHandle = await open(directory, "r");
+    try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+  } finally {
+    await rm(temporary, { force: true });
+  }
+  if (!linked) throw new Error("new journal was not persisted");
   return journal;
 }
 

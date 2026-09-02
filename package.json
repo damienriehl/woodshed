@@ -24,6 +24,7 @@
     "test:snapshot": "node --test test/snapshot/*.test.ts",
     "test:conformance": "node --test test/conformance/*.test.ts test/conformance/*.test.mjs",
     "smoke:cloudflare": "node tools/cloudflare-smoke.mjs",
+    "cloudflare:staging": "node tools/cloudflare-staging.mjs",
     "cloudflare:staging:version": "wrangler --config deploy/cloudflare/wrangler.jsonc --env staging --version",
     "test:rehearsal": "node --test test/e2e/rehearsal/*.test.ts",
     "test:live": "node --test test/e2e/live/*.test.ts",

@@ -9,7 +9,7 @@ const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-81
 
 test("fixture ownership is durable before writes and response loss reconciles without replay", async () => {
   const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
-  journal.phase = "worker-deployed";
+  journal.phase = "alias-live";
   const plan = await createSyntheticFixturePlan({ runId: journal.runId, organizerToken: "organizer-token-not-for-evidence", preFixtureBookmark: "bookmark-a" });
   const calls: string[] = [];
   let exists = false;
@@ -19,9 +19,10 @@ test("fixture ownership is durable before writes and response loss reconciles wi
     inspect: async () => { calls.push("inspect"); return { complete: exists, count: exists ? plan.rows.length : 0 }; },
     seed: async () => { calls.push("seed"); exists = true; throw new Error("response lost"); },
   });
-  assert.deepEqual(calls, ["persist", "inspect", "seed", "inspect"]);
+  assert.deepEqual(calls, ["persist", "inspect", "seed", "inspect", "persist"]);
   assert.equal(result.reconciled, true);
-  assert.equal(journal.phase, "worker-deployed");
+  assert.equal(journal.mutations.find((item) => item.kind === "synthetic-fixture-batch")?.status, "applied");
+  assert.equal(journal.phase, "alias-live");
   assert.equal(journal.acceptance!.fixturePlan!.tokenHash.length, 64);
   assert.doesNotMatch(JSON.stringify(journal), /organizer-token-not-for-evidence/);
 });
@@ -70,7 +71,7 @@ test("deployed acceptance drives participant, security, authority, live, and log
     buildLiveCommand: ({ commandCredential }) => { assert.equal(commandCredential, "device-credential-secret"); return { entryId: liveEntryId, operationId: plan.operationIds.live, authentication: "signed-command-secret" }; },
   });
 
-  assert.equal(journal.phase, "quarantined");
+  assert.equal(journal.phase, "verified");
   assert.equal(evidence.outcomes.acceptance, true);
   assert.equal(evidence.outcomes.cleanupComplete, false);
   assert.equal(evidence.counts.fixtureRows, plan.rows.length);
@@ -123,12 +124,12 @@ test("deployed acceptance fails closed unless the live command appears only afte
       inspectFixtures: async () => ({ complete: seeded, count: seeded ? plan.rows.length : 0 }), seedFixtures: async () => { seeded = true; },
       buildLiveCommand: () => ({ entryId: liveEntryId, operationId: plan.operationIds.live, authentication: "signed-command-secret" }),
     }), scenario.error);
-    assert.equal(journal.phase, "quarantined");
+    assert.equal(journal.phase, "verified");
     assert.equal(journal.acceptance!.status, "failed");
   });
 });
 
-test("failed fixture or deployed response quarantines the run and never reports cleanup success", async () => {
+test("failed fixture or deployed response records verification completion without claiming quarantine or cleanup", async () => {
   const journal = createJournal({ runId: "run-c", owner: "owner-a", sourceSha: "c".repeat(40), identity });
   journal.phase = "worker-deployed";
   const plan = await createSyntheticFixturePlan({ runId: journal.runId, organizerToken: "organizer-token", preFixtureBookmark: "bookmark-c" });
@@ -138,6 +139,6 @@ test("failed fixture or deployed response quarantines the run and never reports 
     seedFixtures: async () => { throw new Error("D1 unavailable"); },
     fetch: async () => assert.fail("HTTP must not run"), buildLiveCommand: () => ({}),
   }), /fixture seed failed/);
-  assert.equal(journal.phase, "quarantined");
+  assert.equal(journal.phase, "verified");
   assert.equal(journal.acceptance!.cleanupComplete, false);
 });
