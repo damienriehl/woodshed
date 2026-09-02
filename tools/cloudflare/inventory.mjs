@@ -6,7 +6,7 @@ const ACCOUNT_ID = /^[a-f0-9]{32}$/i;
 const DATABASE_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const WORKER_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const PLACEHOLDER = /(?:replace|placeholder|example|configure|insert|change[-_ ]?me|required)/i;
-const PROTECTED_NAME = /(?:production|hootenanny|(?:^|[^a-z0-9])prod(?=$|[^a-z0-9]))/i;
+const PROTECTED_NAME = /production|hootenanny|(?:^|[^a-z])prod(?:[^a-z]|$)/i;
 
 function object(value, field) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must be an object`);

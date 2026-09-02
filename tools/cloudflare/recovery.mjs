@@ -58,7 +58,8 @@ export async function runQuarantinedD1Recovery(options) {
 }
 
 function ownedResource(resource, journal) {
-  return resource && resource.runId === journal.runId && resource.owner === journal.owner && typeof resource.id === "string" && resource.id.length > 0;
+  return resource && resource.runId === journal.runId && resource.owner === journal.owner && typeof resource.id === "string" && resource.id.length > 0
+    && (resource.domain !== "token" || resource.provenance === "run-minted");
 }
 
 export async function runStackTeardown(options) {
@@ -72,13 +73,15 @@ export async function runStackTeardown(options) {
     if (!ownedResource(resource, journal)) throw new Error("journal resource identity mismatch");
     return resource;
   });
-  for (const domain of ["route", "credential", "secret", "worker", "durable-object", "d1", "token"]) if (!resources.some((resource) => resource.domain === domain)) throw new Error("missing " + domain + " teardown authority");
+  for (const domain of ["route", "credential", "secret", "worker", "durable-object", "d1"]) if (!resources.some((resource) => resource.domain === domain)) throw new Error("missing " + domain + " teardown authority");
   const resourceKeys = resources.map(({ domain, id }) => domain + ":" + id);
   if (new Set(resourceKeys).size !== resourceKeys.length) throw new Error("duplicate teardown resource identity");
   const absence = {};
+  let lastVerifiedRevision = expectedRevision;
   for (const domain of RESOURCE_ORDER) {
     for (const resource of resources.filter((candidate) => candidate.domain === domain)) {
-      if (await inspectRevision() !== expectedRevision) throw new Error("last-write identity changed");
+      lastVerifiedRevision = await inspectRevision();
+      if (lastVerifiedRevision !== expectedRevision) throw new Error("last-write identity changed");
       const dependents = await listDependents(resource);
       if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
       if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
@@ -94,7 +97,9 @@ export async function runStackTeardown(options) {
     }
   }
   if (resources.some(({ domain }) => domain === "token") && await verifyTokenInactive() !== true) throw new Error("deployment token remains active");
-  return { complete: Object.values(absence).every(Boolean), absence, durableObjectStateRemovedWithNamespace: Object.entries(absence).some(([key, absent]) => key.startsWith("durable-object:") && absent) };
+  lastVerifiedRevision = await inspectRevision();
+  if (lastVerifiedRevision !== expectedRevision) throw new Error("last-write identity changed");
+  return { complete: Object.values(absence).every(Boolean), absence, protectedRevision: lastVerifiedRevision, durableObjectStateRemovedWithNamespace: Object.entries(absence).some(([key, absent]) => key.startsWith("durable-object:") && absent) };
 }
 
 export function buildFailureReport({ phase, nextAction, incidentOwner, observations = {} }, configuredSecrets = []) {

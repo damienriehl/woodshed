@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createEvidenceEnvelope, redactEvidence } from "../../../tools/cloudflare/evidence.mjs";
+import { createEvidenceEnvelope, createFinalEvidencePacket, redactEvidence } from "../../../tools/cloudflare/evidence.mjs";
 import { createJournal, loadJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { executeStep, runStagingOperation } from "../../../tools/cloudflare-staging.mjs";
 
@@ -39,6 +39,16 @@ test("fresh D1 journal accepts an approved name before UUID assignment and requi
   assert.equal(fresh.identity.databaseId, undefined);
   fresh.phase = "resources-ready";
   assert.throws(() => validateJournal(fresh), /databaseId is required after provisioning/);
+});
+
+test("journal validation rejects forged ownership and incomplete Durable Object deletion proof", () => {
+  const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
+  journal.resources.push({ domain: "worker", id: identity.workerName, runId: "another-run", owner: journal.owner });
+  assert.throws(() => validateJournal(journal), /resource ownership/);
+
+  journal.resources = [];
+  journal.mutations.push({ kind: "durable-object-delete", domain: "durable-object", id: "run-owned-do", status: "applied" });
+  assert.throws(() => validateJournal(journal), /deletion attestation/);
 });
 
 test("preflight uncertainty, absent lease, and identity drift cause zero mutations", async () => {
@@ -114,4 +124,32 @@ test("shareable evidence accepts only allowlisted fields with exact types", () =
   assert.throws(() => createEvidenceEnvelope({ ...valid, outcomes: { unexpected: true } }), /unknown field.*unexpected/i);
   assert.throws(() => createEvidenceEnvelope({ ...valid, counts: { fixtureRows: -1 } }), /non-negative safe integer/i);
   assert.throws(() => createEvidenceEnvelope({ ...valid, ids: { arbitrary: "value" } }), /unknown field.*arbitrary/i);
+});
+
+test("final evidence reduces exact teardown identities to domain counts and refuses whole-stack rollback claims", () => {
+  const privateResourceId = "private-resource-identity";
+  const input = {
+    runId: "run-a", sourceSha: "a".repeat(40), phase: "cleanup-complete",
+    configDigest: "b".repeat(64), schemaDigest: "c".repeat(64), protectedRevisionBefore: "d".repeat(64), protectedRevisionAfter: "d".repeat(64), migrationCount: 11,
+    absence: {
+      [`route:${privateResourceId}`]: true,
+      [`hostname:${privateResourceId}`]: true,
+      [`credential:${privateResourceId}`]: true,
+      [`secret:${privateResourceId}`]: true,
+      [`worker:${privateResourceId}`]: true,
+      [`durable-object:${privateResourceId}`]: true,
+      [`d1:${privateResourceId}`]: true,
+      [`token:${privateResourceId}`]: true,
+    },
+    rollback: { workerCode: "same-lifecycle-only", initialLifecycle: "forward-fix-only", d1: "quarantined-bookmark-only", durableObject: "forward-fix-only", wholeStackRollback: false },
+    completedAt: "2030-01-01T12:00:00.000Z",
+  };
+  const packet = createFinalEvidencePacket(input);
+  assert.equal(packet.cleanupComplete, true);
+  assert.equal(packet.productionAuthority, false);
+  assert.doesNotMatch(JSON.stringify(packet), new RegExp(privateResourceId));
+  assert.deepEqual(packet.absence.worker, { count: 1, absent: true });
+  assert.equal(packet.nonImpact.protectedInventoryStable, true);
+  assert.throws(() => createFinalEvidencePacket({ ...input, absence: { ...input.absence, [`hostname:${privateResourceId}`]: undefined } }), /complete absence/);
+  assert.throws(() => createFinalEvidencePacket({ ...input, rollback: { ...input.rollback, wholeStackRollback: true } }), /must not be claimed/);
 });

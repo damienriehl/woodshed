@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
   assertDeploymentIdentity,
   assertCredentialedPreflight,
+  assertSharedAccountInventory,
   assertSchemaInvariants,
   createWranglerAdapter,
   persistAssignedDatabaseIdentity,
@@ -47,6 +51,9 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.deepEqual(calls[0].args.slice(-4), ["--config", "/repo/deploy/cloudflare/wrangler.jsonc", "--env", "staging"]);
   assert.equal(calls[0].options.shell, false);
   assert.equal((calls[0].options as any).env.CLOUDFLARE_API_TOKEN, "private-token");
+  assert.equal((calls[0].options as any).env.HOME, "/repo/.cloudflare-staging/wrangler-home");
+  assert.equal((calls[0].options as any).env.CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV, "false");
+  assert.deepEqual(calls[0].args.slice(-6, -4), ["--env-file", "/repo/.cloudflare-staging/wrangler-home/empty-environment"]);
   assert.deepEqual(calls[1].args.slice(0, 6), ["secret", "list", "--name", "woodshed-staging-run-a", "--format", "json"]);
   assert.deepEqual(calls[2].args.slice(0, 5), ["secret", "put", "LIVE_COMMAND_SECRET", "--name", "woodshed-staging-run-a"]);
   assert.equal((calls[2].options as any).input, "r".repeat(32));
@@ -54,6 +61,80 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.equal((adapter as any).invoke, undefined);
   await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
   await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
+});
+
+test("Wrangler home preparation creates a private home and empty environment without invoking Wrangler", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "woodshed-wrangler-home-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  createWranglerAdapter({ root, token: "synthetic-private-token" });
+
+  const isolatedHome = path.join(root, ".cloudflare-staging", "wrangler-home");
+  const emptyEnvironment = path.join(isolatedHome, "empty-environment");
+  assert.equal((await stat(isolatedHome)).mode & 0o777, 0o700);
+  assert.equal((await stat(emptyEnvironment)).mode & 0o777, 0o600);
+  assert.equal(await readFile(emptyEnvironment, "utf8"), "");
+});
+
+test("Wrangler worker inventories translate only script_not_found code 10007 to empty", async () => {
+  const missing = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 1, stdout: "", stderr: "workers.api.error.script_not_found [code: 10007]" }),
+  });
+  assert.deepEqual(await missing.secretList("woodshed-staging-synthetic"), []);
+  assert.deepEqual(await missing.deploymentsList("woodshed-staging-synthetic"), []);
+  assert.deepEqual(await missing.versionsList("woodshed-staging-synthetic"), []);
+
+  const ambiguous = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 1, stdout: "", stderr: "worker not found" }),
+  });
+  await assert.rejects(ambiguous.secretList("woodshed-staging-synthetic"), /Wrangler command failed/);
+});
+
+test("live Wrangler methods remain staging-scoped, bounded, and keep credentials out of arguments", async () => {
+  const calls: any[] = [];
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "private-token-value",
+    accountId: "a".repeat(32),
+    configPath: "/repo/.cloudflare-staging/run-safe/wrangler.json",
+    spawn: async (file: string, args: string[], options: any) => {
+      calls.push({ file, args, options });
+      if (args[0] === "whoami") return { exitCode: 0, stdout: "a".repeat(32), stderr: "" };
+      if (args[0] === "d1" && args[1] === "list") return { exitCode: 0, stdout: "[]", stderr: "" };
+      if (["deployments", "versions", "secret"].includes(args[0]!)) return { exitCode: 0, stdout: "[]", stderr: "" };
+      if (args[0] === "d1" && args[1] === "time-travel") return { exitCode: 0, stdout: JSON.stringify({ bookmark: "bookmark-synthetic" }), stderr: "" };
+      if (args[0] === "d1" && args[1] === "execute") return { exitCode: 0, stdout: JSON.stringify([{ success: true, results: [] }]), stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  await adapter.whoami("a".repeat(32));
+  await adapter.d1List();
+  await adapter.deploymentsList("woodshed-staging-synthetic");
+  await adapter.versionsList("woodshed-staging-synthetic");
+  await adapter.secretList("woodshed-staging-synthetic");
+  await adapter.d1Create("woodshed-staging-synthetic-db");
+  await adapter.d1TimeTravelInfo("woodshed-staging-synthetic-db");
+  await adapter.d1Execute("woodshed-staging-synthetic-db", { command: "SELECT 1" });
+  await adapter.d1MigrationsApply("woodshed-staging-synthetic-db");
+  await adapter.deploy("woodshed-staging-synthetic");
+  await adapter.secretDelete("LIVE_COMMAND_SECRET", "woodshed-staging-synthetic");
+  await adapter.deleteWorker("woodshed-staging-synthetic");
+  await adapter.d1Delete("woodshed-staging-synthetic-db");
+
+  for (const call of calls) {
+    assert.deepEqual(call.args.slice(-4), ["--config", "/repo/.cloudflare-staging/run-safe/wrangler.json", "--env", "staging"]);
+    assert.equal(call.options.shell, false);
+    assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, "private-token-value");
+    assert.equal(call.options.env.CLOUDFLARE_ACCOUNT_ID, "a".repeat(32));
+    assert.equal(call.options.env.LIVE_COMMAND_SECRET, undefined);
+    assert.equal(call.options.env.WOODSHED_STAGING_ORGANIZER_TOKEN, undefined);
+  }
+  assert.doesNotMatch(JSON.stringify(calls.map(({ file, args }) => ({ file, args }))), /private-token-value/);
+  await assert.rejects(adapter.deploy("production"), /safe staging Worker name/);
+  await assert.rejects(adapter.d1Create("production"), /safe staging database name/);
 });
 
 test("bounded subprocess output and timeout terminate reliably without double settlement", async () => {
@@ -85,24 +166,52 @@ test("structured output and exact filename-only ledger fail closed without priva
   assert.throws(() => reconcileMigrationLedger({ remote: [{ name: D1_MIGRATIONS[0]!.filename }], manifest: D1_MIGRATIONS, journal: journal() }), /provenance/);
 });
 
-test("dedicated-account preflight blocks unreadable inventories, protected siblings, forbidden targets, collisions, and missing secret continuity", () => {
+test("shared-account preflight allows declared protected inventory and blocks undeclared or targeted identities", () => {
   const forbiddenDatabaseId = "33333333-3333-4333-8333-333333333333";
   const inventory = { staging: identity, forbidden: {
     accountIds: ["c".repeat(32)], databaseIds: [forbiddenDatabaseId],
-    origins: ["https://community.invalid"], workerNames: ["woodshed-community"],
+    origins: ["https://community.invalid"], workerNames: ["woodshed-community", "hootenanny-live"],
   } };
   const empty = { accountId: identity.accountId, databases: [], workers: [], routes: [], secretNames: [], deployments: [] };
   assert.deepEqual(assertCredentialedPreflight(inventory, empty, { localSecretAvailable: true }), {
-    accountScope: "dedicated-staging", targetAbsent: true, secretInventoryReadable: true,
+    accountScope: "shared-account-staging", targetAbsent: true, secretInventoryReadable: true,
+  });
+  const declaredProtected = {
+    ...empty,
+    databases: [{ id: forbiddenDatabaseId.toUpperCase(), name: "HoOtEnAnNy-Live" }],
+    workers: [{ name: "Hootenanny-Live" }, { name: "Woodshed-Community" }],
+    routes: [
+      { pattern: "community.invalid/*", script: "hootenanny-live" },
+      { pattern: "*.community.invalid/*", script: "hootenanny-live" },
+    ],
+  };
+  assert.equal(assertSharedAccountInventory(inventory, declaredProtected), true);
+  assert.deepEqual(assertCredentialedPreflight(inventory, declaredProtected, { localSecretAvailable: true }), {
+    accountScope: "shared-account-staging", targetAbsent: true, secretInventoryReadable: true,
   });
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, secretNames: null }, { localSecretAvailable: true }), /unreadable/);
-  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "hootenanny" }] }, { localSecretAvailable: true }), /protected/);
-  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "Woodshed-Community" }] }, { localSecretAvailable: true }), /forbidden/);
-  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: forbiddenDatabaseId.toUpperCase(), name: "neutral" }] }, { localSecretAvailable: true }), /forbidden/);
-  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ origin: "https://community.invalid/path" }] }, { localSecretAvailable: true }), /forbidden/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: "PrOdUcTiOn-Sibling" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: "Hootenanny-Live" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "production.invalid/*", script: "neutral" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "neutral.invalid/PrOdUcTiOn/*", script: "neutral" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ hostname: "neutral.invalid", script: "hoot-api", environment: "production" }] }, { localSecretAvailable: true }), /undeclared protected-looking target/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, routes: [{ pattern: "*", script: "neutral" }] }, { localSecretAvailable: true }), /unreadable route inventory/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, workers: [{ name: identity.workerName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...empty, databases: [{ id: "22222222-2222-4222-8222-222222222222", name: identity.databaseName }] }, { localSecretAvailable: true }), /already exists/);
   assert.throws(() => assertCredentialedPreflight(inventory, empty), /secret continuity/);
+
+  assert.throws(() => assertSharedAccountInventory({
+    ...inventory,
+    staging: { ...identity, workerName: "hootenanny-live" },
+  }, empty), /declared forbidden target/);
+  assert.throws(() => assertSharedAccountInventory({
+    ...inventory,
+    staging: { ...identity, databaseId: forbiddenDatabaseId.toUpperCase() },
+  }, empty), /declared forbidden target/);
+  assert.throws(() => assertSharedAccountInventory({
+    ...inventory,
+    staging: { ...identity, origin: "https://community.invalid" },
+  }, empty), /declared forbidden target/);
 });
 
 test("assigned D1 UUID is journaled with ownership before provisioning continues", async () => {
@@ -129,14 +238,17 @@ test("schema verification covers foreign keys, integrity, strict objects, choice
     indexes: ["idx_event_participants_event"],
     triggers: ["seed_event_choice_config"],
     constraints: ["participant_event_composite", "recovery_token_unique"],
+    definitionDigest: "d".repeat(64),
     choiceConfigSeeded: true,
-    migration009: { beforeRows: 3, afterRows: 3, beforeAssociations: 3, afterAssociations: 3 },
+    migration009: { beforeRows: 3, afterRows: 3, beforeAssociations: 3, afterAssociations: 3, beforeAssociationDigest: "f".repeat(64), afterAssociationDigest: "f".repeat(64) },
   };
   assert.doesNotThrow(() => assertSchemaInvariants(expected, {
-    tables: expected.tables, indexes: expected.indexes, triggers: expected.triggers, constraints: expected.constraints,
+    tables: expected.tables, indexes: expected.indexes, triggers: expected.triggers, constraints: expected.constraints, definitionDigest: expected.definitionDigest,
   }));
   assert.throws(() => assertSchemaInvariants({ ...expected, foreignKeyViolations: 1 }, expected), /foreign key/i);
   assert.throws(() => assertSchemaInvariants({ ...expected, migration009: { ...expected.migration009, afterAssociations: 2 } }, expected), /preservation/i);
+  assert.throws(() => assertSchemaInvariants({ ...expected, migration009: { ...expected.migration009, afterAssociationDigest: "0".repeat(64) } }, expected), /preservation/i);
+  assert.throws(() => assertSchemaInvariants({ ...expected, definitionDigest: "e".repeat(64) }, expected), /definition fingerprint/i);
   for (const field of ["beforeRows", "afterRows", "beforeAssociations", "afterAssociations"] as const) {
     for (const invalid of [undefined, null, "3", -1, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
       assert.throws(

@@ -2,10 +2,13 @@
 export { createSyntheticFixturePlan, seedSyntheticFixtures } from "./cloudflare/staging-fixtures.mjs";
 export { runDeployedAcceptance } from "./cloudflare/staging-smoke.mjs";
 export { assertRollbackCompatible, buildFailureReport, createJournalRetention, runQuarantinedD1Recovery, runStackTeardown } from "./cloudflare/recovery.mjs";
+export { collectRemoteInventory, createApiTokenClient, createIdentityRevision, executeJournaledMutation, generateEffectiveConfig, parseLiveArguments, publicOperationResult, runLiveOperation } from "./cloudflare/live-driver.mjs";
 import { pathToFileURL } from "node:url";
+import { redactEvidence } from "./cloudflare/evidence.mjs";
 import { loadJournal } from "./cloudflare/journal.mjs";
+import { LIVE_OPERATIONS, parseLiveArguments, publicOperationResult, runLiveOperation } from "./cloudflare/live-driver.mjs";
 
-const OPERATIONS = new Set(["preflight", "plan", "apply", "verify", "teardown", "status"]);
+const OPERATIONS = new Set(LIVE_OPERATIONS);
 const IDENTITY_FIELDS = ["accountId", "databaseId", "databaseName", "workerName", "origin"];
 
 function sameIdentity(expected, actual) {
@@ -45,11 +48,18 @@ export async function runStagingOperation(options) {
   return boundaries.mutate?.({ operation });
 }
 
-async function main(argv) {
-  const operation = argv[0];
-  if (operation !== "status") throw new Error("usage: cloudflare-staging status <journal>");
-  const journal = await runStagingOperation({ operation: "status", journalPath: argv[1] });
-  process.stdout.write(`${JSON.stringify({ runId: journal.runId, phase: journal.phase })}\n`);
+export function publicErrorMessage(error, environment = process.env) {
+  const configuredSecrets = [environment.CLOUDFLARE_API_TOKEN, environment.LIVE_COMMAND_SECRET, environment.WOODSHED_STAGING_ORGANIZER_TOKEN];
+  return redactEvidence({ message: error instanceof Error ? error.message : "staging operation failed" }, configuredSecrets).message;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main(process.argv.slice(2)).catch((error) => { process.stderr.write(`${error.message}\n`); process.exitCode = 1; });
+async function main(argv) {
+  const parsed = parseLiveArguments(argv);
+  const result = await runLiveOperation({ ...parsed, processEnvironment: process.env });
+  process.stdout.write(`${JSON.stringify(publicOperationResult(result))}\n`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main(process.argv.slice(2)).catch((error) => {
+  process.stderr.write(`${publicErrorMessage(error)}\n`);
+  process.exitCode = 1;
+});

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { LIVE_OPERATIONS } from "../../../tools/cloudflare/live-driver.mjs";
 // @ts-expect-error JavaScript staging contract intentionally ships without a separate type surface.
 import { describeInventoryFields, validateStagingInventory } from "../../../tools/cloudflare/inventory.mjs";
 
@@ -55,6 +56,7 @@ test("fails closed for missing, placeholder, unsafe, default, or production targ
     ["default environment", (value) => { value.environment = "default"; }, /environment.*staging/i],
     ["forbidden target", (value) => { value.staging.accountId = value.forbidden.accountIds[0]!; }, /forbidden/i],
     ["hootenanny target", (value) => { value.staging.workerName = "hootenanny-staging"; }, /hootenanny/i],
+    ["numeric prod boundary", (value) => { value.staging.workerName = "woodshed-staging-prod1"; }, /production|prod/i],
   ];
 
   for (const [name, mutate, expected] of cases) {
@@ -143,9 +145,14 @@ test("repository scripts pin the local Wrangler binary to the staging environmen
     packageJson.scripts["cloudflare:staging:version"],
     "wrangler --config deploy/cloudflare/wrangler.jsonc --env staging --version",
   );
+  assert.equal(packageJson.scripts["cloudflare:staging"], "node tools/cloudflare-staging.mjs");
   assert.doesNotMatch(packageJson.scripts["cloudflare:staging:version"], /npx|--env default|--env production/);
 
   const wrangler = await readFile(new URL("../../../deploy/cloudflare/wrangler.jsonc", import.meta.url), "utf8");
   assert.match(wrangler, /"env"\s*:\s*\{\s*"staging"/s);
   assert.doesNotMatch(wrangler, /replace-during-install/);
+
+  const driver = await readFile(new URL("../../../tools/cloudflare-staging.mjs", import.meta.url), "utf8");
+  assert.deepEqual(LIVE_OPERATIONS, ["preflight", "plan", "apply", "verify", "teardown", "status", "absence-check"]);
+  assert.doesNotMatch(driver, /operation !== ["']status["']/);
 });

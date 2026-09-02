@@ -12,7 +12,7 @@ async function parsed(response, expected, label) {
 
 export async function runDeployedAcceptance(options) {
   const { origin, journal, plan, organizerToken, fetch, persistJournal, inspectFixtures, seedFixtures, buildLiveCommand } = options;
-  if (journal.phase !== "worker-deployed") throw new Error("immutable deployed Worker proof is required before acceptance");
+  if (!["worker-deployed", "alias-live"].includes(journal.phase)) throw new Error("immutable deployed Worker proof is required before acceptance");
   if (origin !== journal.identity.origin || !origin.startsWith("https://")) throw new Error("accepted HTTPS origin must match the journal");
   if (typeof organizerToken !== "string" || typeof fetch !== "function" || typeof buildLiveCommand !== "function") throw new Error("acceptance boundaries are required");
   const request = (pathname, init = {}) => fetch(new URL(pathname, origin).href, init);
@@ -61,16 +61,18 @@ export async function runDeployedAcceptance(options) {
     if (!Number.isSafeInteger(liveResult?.revision) || !liveResult?.entry || typeof liveResult.entry.state !== "string" || !Number.isSafeInteger(liveState?.revision) || !Array.isArray(liveState?.entries)) throw new Error("live response contract failed");
     const exercisedEntry = liveState.entries.find(({ id }) => id === liveCommand.entryId);
     if (liveState.revision !== liveResult.revision || liveResult.entry.id !== liveCommand.entryId || !exercisedEntry || exercisedEntry.state !== liveResult.entry.state) throw new Error("live state readback mismatch");
-    journal.phase = "quarantined";
+    journal.phase = "verified";
     journal.acceptance = { ...journal.acceptance, status: "passed", cleanupComplete: false };
-    await persistJournal(journal);
-    return createEvidenceEnvelope({
+    const evidence = createEvidenceEnvelope({
       runId: journal.runId, sourceSha: journal.sourceSha, phase: journal.phase,
       outcomes: { acceptance: true, security, cleanupComplete: false, disposableResidueExpected: true, productionAuthority: false },
       counts: { fixtureRows: fixtures.count, choiceRevision: reread.revision, liveRevision: liveState.revision, liveEntries: Array.isArray(liveState.entries) ? liveState.entries.length : 0 },
     });
+    journal.acceptanceEvidence = evidence;
+    await persistJournal(journal);
+    return evidence;
   } catch (error) {
-    journal.phase = "quarantined";
+    journal.phase = "verified";
     journal.acceptance = { ...journal.acceptance, status: "failed", cleanupComplete: false };
     await persistJournal(journal);
     throw error;

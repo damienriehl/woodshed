@@ -5,7 +5,7 @@ import { D1ChoiceRuntime, RuntimeError, record, webSha256, type RuntimeSession }
 import { D1LiveRuntime,deriveDeviceCredential } from "../../../packages/storage-d1/src/live-runtime.ts";
 export { LiveCoordinator } from "./live-do.ts";
 
-export type WorkerBindings={DB:D1Database;LIVE_COORDINATOR:DurableObjectNamespace;APP_ORIGIN:string;LIVE_COMMAND_SECRET:string;CLOCK_ISO?:string};
+export type WorkerBindings={DB:D1Database;LIVE_COORDINATOR:DurableObjectNamespace;APP_ORIGIN:string;LIVE_COMMAND_SECRET:string;CLOCK_ISO?:string;WOODSHED_SOURCE_SHA?:string;WOODSHED_CONFIG_DIGEST?:string};
 const headers={"referrer-policy":"no-referrer","x-content-type-options":"nosniff","content-security-policy":"default-src 'self'; frame-ancestors 'none'; base-uri 'none'","cache-control":"private, no-store"};
 const safe=new Set(["GET","HEAD","OPTIONS"]),organizers=new Set(["organizer","community-admin"]),participants=new Set(["participant",...organizers]);
 const json=(body:unknown,status=200,extraHeaders?:HeadersInit)=>Response.json(body,{status,headers:extraHeaders?{...headers,...Object.fromEntries(new Headers(extraHeaders))}:headers});
@@ -25,7 +25,13 @@ function requireOrganizer(session:RuntimeSession){if(!organizers.has(session.rol
 
 export default {async fetch(request:Request,env:WorkerBindings):Promise<Response>{
   try{
-    const url=new URL(request.url),choice=new D1ChoiceRuntime(env.DB,()=>new Date(env.CLOCK_ISO??Date.now()));
+    const url=new URL(request.url);
+    if(request.method==="GET"&&url.pathname==="/api/staging-release"){
+      if(!/^[a-f0-9]{40,64}$/i.test(env.WOODSHED_SOURCE_SHA??"")||!/^[a-f0-9]{64}$/i.test(env.WOODSHED_CONFIG_DIGEST??""))return json({error:"not-found"},404);
+      const bindings=(["APP_ORIGIN","DB","LIVE_COMMAND_SECRET","LIVE_COORDINATOR"] as const).filter(name=>env[name]!==undefined);
+      return json({sourceSha:env.WOODSHED_SOURCE_SHA,configDigest:env.WOODSHED_CONFIG_DIGEST,lifecycle:"legacy-sqlite-v1",bindings});
+    }
+    const choice=new D1ChoiceRuntime(env.DB,()=>new Date(env.CLOCK_ISO??Date.now()));
     if(request.method==="GET"&&url.pathname==="/api/discovery")return json({events:await choice.discoverEvents()});
     const joinEvent=eventMatch(url.pathname,"/join-open");
     if(joinEvent&&request.method==="POST"){mutationGuard(request,env);const value=await body(request);if(typeof value.operationId!=="string"||!value.operationId)throw new RuntimeError("invalid-request");const cookieName=await eventCookie(joinEvent),session=await choice.joinOpen(joinEvent,value.operationId,cookies(request)[cookieName]);return json({assurance:session.assurance},200,{"set-cookie":setSessionCookie(cookieName,session.token,env)});}
