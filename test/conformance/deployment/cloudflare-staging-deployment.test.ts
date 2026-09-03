@@ -214,6 +214,29 @@ test("shared-account preflight allows declared protected inventory and blocks un
   }, empty), /declared forbidden target/);
 });
 
+test("empty forbidden account IDs preserve shared-account deployment guards", () => {
+  const inventory = { staging: identity, forbidden: {
+    accountIds: [], databaseIds: ["33333333-3333-4333-8333-333333333333"],
+    origins: ["https://community.invalid"], workerNames: ["woodshed-community", "hootenanny-live"],
+  } };
+  const matchingRemote = { accountId: identity.accountId, databases: [], workers: [], routes: [], secretNames: [], deployments: [] };
+
+  assert.deepEqual(assertCredentialedPreflight(inventory, matchingRemote, { localSecretAvailable: true }), {
+    accountScope: "shared-account-staging", targetAbsent: true, secretInventoryReadable: true,
+  });
+  assert.throws(
+    () => assertSharedAccountInventory(inventory, { ...matchingRemote, accountId: "d".repeat(32) }),
+    /authenticated Cloudflare account does not match staging inventory/,
+  );
+
+  const forbiddenAccountId = "c".repeat(32);
+  assert.throws(() => assertSharedAccountInventory({
+    ...inventory,
+    staging: { ...inventory.staging, accountId: forbiddenAccountId },
+    forbidden: { ...inventory.forbidden, accountIds: [forbiddenAccountId] },
+  }, { ...matchingRemote, accountId: forbiddenAccountId }), /declared forbidden target/);
+});
+
 test("assigned D1 UUID is journaled with ownership before provisioning continues", async () => {
   const state = journal();
   delete (state.identity as any).databaseId;

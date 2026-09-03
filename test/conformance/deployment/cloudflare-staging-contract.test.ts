@@ -114,6 +114,18 @@ test("accepts an explicitly empty forbidden account ID list", () => {
   assert.deepEqual(result.forbidden.accountIds, []);
 });
 
+test("rejects present invalid forbidden account ID collections", () => {
+  for (const invalid of ["not-an-array", {}, ["   "], [123]]) {
+    const inventory = validInventory();
+    inventory.forbidden.accountIds = invalid as string[];
+
+    assert.throws(
+      () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+      /forbidden\.accountIds must be an array of non-empty strings/i,
+    );
+  }
+});
+
 test("rejects the staging account in forbidden account IDs", () => {
   const inventory = validInventory();
   inventory.staging.accountId = "A".repeat(32);
