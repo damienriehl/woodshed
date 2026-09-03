@@ -31,6 +31,13 @@ function nonemptyStringArray(value, field) {
   return value;
 }
 
+function possiblyEmptyStringArray(value, field) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+    throw new Error(`${field} must be an array of non-empty strings`);
+  }
+  return value;
+}
+
 function optionalDatabaseId(value, field) {
   if (value === undefined) return undefined;
   const databaseId = requiredString(value, field).toLowerCase();
@@ -80,7 +87,7 @@ export function validateStagingInventory(input, sourceState) {
   assertNotProtected(origin, "staging.origin");
   if (!origin.includes("staging") && !origin.endsWith(".workers.dev")) throw new Error("staging.origin must be unmistakably staging or workers.dev");
 
-  const forbiddenAccountIds = nonemptyStringArray(forbidden.accountIds, "forbidden.accountIds").map((value) => value.toLowerCase());
+  const forbiddenAccountIds = possiblyEmptyStringArray(forbidden.accountIds, "forbidden.accountIds").map((value) => value.toLowerCase());
   const forbiddenDatabaseIds = nonemptyStringArray(forbidden.databaseIds, "forbidden.databaseIds").map((value) => value.toLowerCase());
   const forbiddenOrigins = nonemptyStringArray(forbidden.origins, "forbidden.origins").map((value) => normalizedOrigin(value, "forbidden.origins"));
   const forbiddenWorkerNames = nonemptyStringArray(forbidden.workerNames, "forbidden.workerNames").map((value) => value.toLowerCase());

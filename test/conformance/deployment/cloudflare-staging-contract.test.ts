@@ -105,16 +105,64 @@ test("accepts an approved fresh D1 name before Cloudflare assigns its UUID", () 
   assert.equal(result.staging.databaseId, undefined);
 });
 
-test("requires complete forbidden sets and compares normalized identifiers", () => {
-  for (const field of ["accountIds", "databaseIds", "origins", "workerNames"] as const) {
+test("accepts an explicitly empty forbidden account ID list", () => {
+  const inventory = validInventory();
+  inventory.forbidden.accountIds = [];
+
+  const result = validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true });
+
+  assert.deepEqual(result.forbidden.accountIds, []);
+});
+
+test("rejects present invalid forbidden account ID collections", () => {
+  for (const invalid of ["not-an-array", {}, ["   "], [123]]) {
+    const inventory = validInventory();
+    inventory.forbidden.accountIds = invalid as string[];
+
+    assert.throws(
+      () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+      /forbidden\.accountIds must be an array of non-empty strings/i,
+    );
+  }
+});
+
+test("rejects the staging account in forbidden account IDs", () => {
+  const inventory = validInventory();
+  inventory.staging.accountId = "A".repeat(32);
+  inventory.forbidden.accountIds = ["a".repeat(32)];
+
+  assert.throws(
+    () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+    /account is forbidden/i,
+  );
+});
+
+test("rejects malformed forbidden account IDs", () => {
+  const inventory = validInventory();
+  inventory.forbidden.accountIds = ["not-an-account-id"];
+
+  assert.throws(
+    () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+    /invalid account ID/i,
+  );
+});
+
+test("requires the forbidden account IDs field", () => {
+  const inventory = validInventory();
+  delete (inventory.forbidden as Partial<typeof inventory.forbidden>).accountIds;
+
+  assert.throws(
+    () => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }),
+    /forbidden\.accountIds.*array/i,
+  );
+});
+
+test("requires non-empty forbidden resource sets", () => {
+  for (const field of ["databaseIds", "origins", "workerNames"] as const) {
     const inventory = validInventory();
     inventory.forbidden[field] = [];
     assert.throws(() => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }), /non-empty array/i);
   }
-  const inventory = validInventory();
-  inventory.staging.accountId = "A".repeat(32);
-  inventory.forbidden.accountIds = ["a".repeat(32)];
-  assert.throws(() => validateStagingInventory(inventory, { actualSourceSha: sourceSha, worktreeClean: true }), /account is forbidden/i);
 });
 
 test("rejects unknown fields, a dirty tree, and a mismatched full source SHA", () => {
