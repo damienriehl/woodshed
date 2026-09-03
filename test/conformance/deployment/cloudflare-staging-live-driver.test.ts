@@ -94,6 +94,90 @@ async function failedApplyFixture(t: any, { quarantineFails = false } = {}) {
   return { applyFailure, common, dependencies, journalPath, quarantineInspections: () => quarantineInspections };
 }
 
+async function d1ReconciliationFixture(t: any, intentStatus?: "pending" | "applied", {
+  providerAcceptanceId = databaseId,
+  remoteDatabaseId = databaseId,
+  responseLoss = false,
+} = {}) {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-d1-reconcile-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-d1-reconcile-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const freshInventory = inventory();
+  delete (freshInventory.staging as Partial<typeof freshInventory.staging>).databaseId;
+  await writeFile(inventoryPath, JSON.stringify(freshInventory));
+
+  const state = {
+    databases: [] as Array<{ uuid: string; name: string }>,
+    mutationCalls: [] as string[],
+    timeTravelReads: 0,
+  };
+  const acceptedReplayStop = new Error("accepted D1 replay reached the next apply boundary");
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => state.databases,
+    deploymentsList: async () => [],
+    versionsList: async () => [],
+    secretList: async () => [],
+    d1Create: async (name: string) => {
+      state.mutationCalls.push("d1-create");
+      if (responseLoss) {
+        state.databases = [{ uuid: remoteDatabaseId, name }];
+        throw new Error("synthetic D1 create response loss");
+      }
+    },
+    d1MigrationsApply: async () => { state.mutationCalls.push("d1-migrate"); },
+    d1Execute: async () => { state.mutationCalls.push("d1-seed"); return []; },
+    d1Delete: async () => { state.mutationCalls.push("d1-delete"); },
+    deploy: async () => { state.mutationCalls.push("deploy"); },
+    secretPut: async () => { state.mutationCalls.push("secret-put"); },
+    secretDelete: async () => { state.mutationCalls.push("secret-delete"); },
+    deleteWorker: async () => { state.mutationCalls.push("worker-delete"); },
+    d1TimeTravelInfo: async () => { state.timeTravelReads += 1; throw acceptedReplayStop; },
+  };
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectAccountSubdomain: async () => "synthetic",
+    inspectWorkersDev: async () => ({ exists: false, enabled: false }),
+  };
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: `run-d1-${intentStatus ?? "response-loss"}`,
+    owner: "owner-d1-reconcile",
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", LIVE_COMMAND_SECRET: "s".repeat(32) },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => tokenClient,
+    fetch: async () => new Response(null, { status: 404 }),
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  };
+  await runLiveOperation({ ...common, operation: "plan" }, dependencies);
+  if (intentStatus) {
+    const journal = JSON.parse(await readFile(journalPath, "utf8"));
+    const d1Resource = journal.resources.find((item: any) => item.domain === "d1");
+    journal.mutations.push({
+      kind: "d1-create",
+      domain: "d1",
+      id: d1Resource.id,
+      status: intentStatus,
+      ...(intentStatus === "applied" ? { providerAcceptance: { id: providerAcceptanceId } } : {}),
+    });
+    await saveJournal(journalPath, journal);
+    state.databases = [{ uuid: remoteDatabaseId, name: freshInventory.staging.databaseName }];
+  }
+  return { acceptedReplayStop, common, dependencies, freshInventory, journalPath, state };
+}
+
 test("live CLI requires the explicit staging environment and closed flag set", () => {
   const parsed = parseLiveArguments([
     "apply", "--env", "staging", "--inventory", "/private/inventory.json",
@@ -213,6 +297,106 @@ test("journaled mutation persists intent before write, aborts drift, and reconci
     mutate: async () => { mutations += 1; }, owns: () => true,
   }), /no replay authorized/);
   assert.equal(mutations, 0);
+});
+
+test("pending d1-create refuses a pre-existing same-named database without adopting or mutating it", async (t) => {
+  const fixture = await d1ReconciliationFixture(t, "pending");
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error: any) => {
+    assert.equal(error.message, `a database named ${fixture.freshInventory.staging.databaseName} already exists; tear down the pending run before retrying`);
+    assert.doesNotMatch(error.message, new RegExp(`${accountId}|${databaseId}`));
+    return true;
+  });
+
+  assert.equal(fixture.state.mutationCalls.length, 0);
+  assert.equal(fixture.state.timeTravelReads, 0);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const d1Resource = journal.resources.find((item: any) => item.domain === "d1");
+  assert.equal(journal.identity.databaseId, undefined);
+  assert.equal(d1Resource.status, "planned");
+  assert.match(d1Resource.id, /^planned-/);
+  assert.equal(journal.mutations.find((item: any) => item.kind === "d1-create").status, "pending");
+  assert.deepEqual(journal.incident, {
+    kind: "d1-create-refused",
+    failedPhase: "pre-write",
+    owner: "owner-d1-reconcile",
+    nextAction: "tear-down-pending-run-before-retrying",
+    wholeStackRollback: false,
+  });
+});
+
+test("applied d1-create with persisted provider acceptance reconciles the exact database", async (t) => {
+  const fixture = await d1ReconciliationFixture(t, "applied");
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error) => error === fixture.acceptedReplayStop);
+
+  assert.equal(fixture.state.mutationCalls.length, 0);
+  assert.equal(fixture.state.timeTravelReads, 1);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.identity.databaseId, databaseId);
+  assert.equal(journal.mutations.find((item: any) => item.kind === "d1-create").status, "applied");
+  assert.equal(journal.resources.find((item: any) => item.domain === "d1").id, databaseId);
+  assert.equal(journal.resources.find((item: any) => item.domain === "d1").status, "owned");
+});
+
+test("applied d1-create refuses a same-named database with a mismatched provider acceptance", async (t) => {
+  const acceptedDatabaseId = "22222222-3333-4444-8555-666666666666";
+  const fixture = await d1ReconciliationFixture(t, "applied", { providerAcceptanceId: acceptedDatabaseId });
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), /existing resource is not owned by this run/);
+
+  assert.deepEqual(fixture.state.mutationCalls, []);
+  assert.equal(fixture.state.timeTravelReads, 0);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const d1Resource = journal.resources.find((item: any) => item.domain === "d1");
+  const d1Intent = journal.mutations.find((item: any) => item.kind === "d1-create");
+  assert.equal(journal.identity.databaseId, undefined);
+  assert.equal(d1Resource.status, "planned");
+  assert.match(d1Resource.id, /^planned-/);
+  assert.equal(d1Intent.status, "applied");
+  assert.equal(d1Intent.providerAcceptance.id, acceptedDatabaseId);
+});
+
+test("d1-create response loss refuses the newly visible database without accepting ownership", async (t) => {
+  const fixture = await d1ReconciliationFixture(t, undefined, { responseLoss: true });
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error: any) => {
+    assert.equal(error.message, `a database named ${fixture.freshInventory.staging.databaseName} already exists; tear down the pending run before retrying`);
+    return true;
+  });
+
+  assert.deepEqual(fixture.state.mutationCalls, ["d1-create"]);
+  assert.equal(fixture.state.timeTravelReads, 0);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const d1Resource = journal.resources.find((item: any) => item.domain === "d1");
+  const d1Intent = journal.mutations.find((item: any) => item.kind === "d1-create");
+  assert.equal(journal.identity.databaseId, undefined);
+  assert.equal(d1Resource.status, "planned");
+  assert.match(d1Resource.id, /^planned-/);
+  assert.equal(d1Intent.status, "pending");
+  assert.equal(d1Intent.providerAcceptance, undefined);
+  assert.equal(journal.incident.kind, "d1-create-refused");
+});
+
+test("teardown of a refused d1-create run preserves the foreign database", async (t) => {
+  const fixture = await d1ReconciliationFixture(t, "pending");
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), /tear down the pending run before retrying/);
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.state.mutationCalls.length, 0);
+  assert.deepEqual(fixture.state.databases, [{ uuid: databaseId, name: fixture.freshInventory.staging.databaseName }]);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.phase, "cleanup-complete");
+  assert.equal(journal.teardown.refusedD1Create, true);
+
+  const delayed = await runLiveOperation({ ...fixture.common, operation: "absence-check" }, fixture.dependencies);
+  assert.deepEqual(delayed, { operation: "absence-check", phase: "cleanup-complete", absenceCount: 0, passed: true });
+  assert.equal(fixture.state.mutationCalls.length, 0);
+  assert.deepEqual(fixture.state.databases, [{ uuid: databaseId, name: fixture.freshInventory.staging.databaseName }]);
+  const auditedJournal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.deepEqual(auditedJournal.absenceChecks.at(-1), {
+    checkedAt: "2030-01-01T12:00:00.000Z",
+    domains: 0,
+    passed: true,
+    refusedD1Create: true,
+  });
 });
 
 test("credentialed preflight calls no mutation and its public result contains no target identity", async (t) => {
@@ -610,7 +794,7 @@ test("mocked live boundaries complete plan through teardown in dependency order 
       assert.ok(journal.resources.some((item: any) => item.domain === "d1"));
       assert.ok(journal.mutations.some((item: any) => item.kind === "d1-create" && item.status === "pending"));
       assertIdentityRead("d1-create");
-      state.calls.push("d1-create"); state.databases = [{ uuid: assignedDatabaseId, name }]; throw new Error("response lost");
+      state.calls.push("d1-create"); state.databases = [{ uuid: assignedDatabaseId, name }];
     },
     d1TimeTravelInfo: async () => read({ bookmark: "bookmark-synthetic" }),
     d1Execute: async (_name: string, options: { command?: string; file?: string }) => {

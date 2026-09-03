@@ -5,6 +5,7 @@ export interface StagingMutation {
   kind: string; status: "planned" | "pending" | "applied"; domain?: StagingResourceDomain; id?: string; operationId?: string;
   sourceSha?: string; deploymentId?: string; beforeDeploymentIds?: string[]; afterDeploymentIds?: string[];
   tag?: string; configDigest?: string; notRequired?: boolean; revocationAccepted?: boolean;
+  providerAcceptance?: { id: string };
 }
 export interface MigrationAttestation {
   filename: string; sha256: string; sourceSha: string; status: "pending" | "applied";
