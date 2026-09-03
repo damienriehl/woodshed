@@ -209,8 +209,9 @@ function sameResource(left, right) {
 }
 
 export async function executeJournaledMutation(options) {
-  const { journal, expectedRevision, inspectRevision, resource, kind, persistJournal, inspect, mutate, owns, finalize, intentMetadata = {} } = options;
+  const { journal, expectedRevision, inspectRevision, resource, kind, persistJournal, inspect, mutate, owns, reconcileExisting, finalize, intentMetadata = {} } = options;
   if (![inspectRevision, persistJournal, inspect, mutate, owns].every((value) => typeof value === "function")) throw new Error("journaled mutation boundaries are required");
+  if (reconcileExisting !== undefined && typeof reconcileExisting !== "function") throw new Error("journaled mutation reconciliation is invalid");
   if (await inspectRevision() !== expectedRevision) throw new Error("remote identity changed");
   if (!resource || typeof resource.domain !== "string" || typeof resource.id !== "string" || !resource.id) throw new Error("resource ownership is required");
   let owned = journal.resources.find((item) => sameResource(item, resource));
@@ -232,7 +233,10 @@ export async function executeJournaledMutation(options) {
   const before = await inspect();
   let result;
   if (before?.exists) {
-    if (!existingIntent || !owns(before)) throw new Error("existing resource is not owned by this run");
+    const reconciled = reconcileExisting === undefined
+      ? existingIntent && owns(before)
+      : await reconcileExisting({ intent, state: before });
+    if (!reconciled) throw new Error("existing resource is not owned by this run");
     result = { reconciled: true, state: before };
   } else {
     if (existingIntent) throw new Error("pending mutation is absent remotely; no replay authorized");
@@ -244,7 +248,10 @@ export async function executeJournaledMutation(options) {
       result = { reconciled: false, state: after };
     } catch (error) {
       const afterLoss = await inspect();
-      if (!afterLoss?.exists || !owns(afterLoss)) throw new Error("mutation outcome is uncertain; no retry authorized", { cause: error });
+      const reconciled = afterLoss?.exists && (reconcileExisting === undefined
+        ? owns(afterLoss)
+        : await reconcileExisting({ intent, state: afterLoss }));
+      if (!reconciled) throw new Error("mutation outcome is uncertain; no retry authorized", { cause: error });
       result = { reconciled: true, state: afterLoss };
     }
   }
@@ -744,13 +751,26 @@ async function applyOperation(options, dependencies) {
   assertSharedAccountInventory(inventory, remote);
   const protectedBefore = protectedRevision(remote, journal.identity);
   if (protectedBefore !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
-  const currentD1 = remote.databases.find((item) => item.name === journal.identity.databaseName);
-  const pendingD1 = journal.mutations.some((item) => item?.kind === "d1-create" && item.status === "pending");
-  if (journal.phase === "pre-write" && currentD1 && !pendingD1) throw new Error("disposable target already exists and is not journal-owned");
 
   if (!journal.identity.databaseId) {
     const expectedRevision = createIdentityRevision(remote);
     const plannedD1 = resourceId(journal, "d1");
+    const refuseUnacceptedDatabase = async ({ intent, state }) => {
+      const acceptedId = intent.status === "applied" ? intent.providerAcceptance?.id : undefined;
+      if (acceptedId === state.id && state.name === journal.identity.databaseName) return true;
+      if (intent.status === "pending") {
+        journal.incident = {
+          kind: "d1-create-refused",
+          failedPhase: journal.phase,
+          owner: journal.owner,
+          nextAction: "tear-down-pending-run-before-retrying",
+          wholeStackRollback: false,
+        };
+        await persist(options.journalPath, journal);
+        throw new Error(`a database named ${journal.identity.databaseName} already exists; tear down the pending run before retrying`);
+      }
+      return false;
+    };
     const created = await executeJournaledMutation({
       journal, expectedRevision,
       inspectRevision: () => currentIdentityRevision(adapter, inventory, tokenClient),
@@ -762,9 +782,11 @@ async function applyOperation(options, dependencies) {
       },
       mutate: async () => { await adapter.d1Create(journal.identity.databaseName); return { exists: true }; },
       owns: (state) => state.name === journal.identity.databaseName && typeof state.id === "string",
-      finalize: async ({ result }) => {
+      reconcileExisting: refuseUnacceptedDatabase,
+      finalize: async ({ intent, result }) => {
         const database = result.state;
         if (!DATABASE_ID.test(database?.id ?? "") || database.name !== journal.identity.databaseName) throw new Error("created database identity is invalid");
+        intent.providerAcceptance = { id: database.id.toLowerCase() };
         journal.identity.databaseId = database.id.toLowerCase();
         journal.resources = journal.resources.filter((item) => !(item.domain === "d1" && item.id === plannedD1));
         putResource(journal, "d1", journal.identity.databaseId).status = "owned";
@@ -1077,6 +1099,46 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(journal.teardown?.absence ?? {}).length, cleanupComplete: true, wholeStackRollback: false };
   }
+  if (journal.phase === "pre-write" && journal.incident?.kind === "d1-create-refused") {
+    if (journal.identity.databaseId || journal.resources.some((resource) => resource.status === "owned") || journal.mutations.some((mutation) => mutation.status === "applied")) {
+      throw new Error("refused D1 create journal contains unexpected ownership");
+    }
+    const credentials = requireCredentials(options.credentialEnvironment, "teardown");
+    const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
+    const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
+    await assertOperatorTokenActive(tokenClient);
+    const remote = await collectProtectedInventory({ adapter, inventory, tokenClient });
+    assertSharedAccountInventory(inventory, remote);
+    const protectedAfter = protectedRevision(remote, journal.identity);
+    if (protectedAfter !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
+    const completedAt = dependencies.now().toISOString();
+    const absence = Object.fromEntries(journal.resources.map((resource) => [`${resource.domain}:${resource.id}`, true]));
+    const d1Intent = journal.mutations.find((mutation) => mutation?.kind === "d1-create");
+    if (!d1Intent || d1Intent.status !== "pending") throw new Error("refused D1 create intent is missing");
+    journal.phase = "cleanup-complete";
+    journal.acceptance = { status: "not-run", cleanupComplete: true };
+    journal.incident = { ...journal.incident, resolvedAt: completedAt };
+    journal.teardown = { absence, completedAt, durableObjectStateRemovedWithNamespace: false, refusedD1Create: true };
+    journal.retention = createJournalRetention({ incidentResolvedAt: completedAt });
+    const packet = createFinalEvidencePacket({
+      runId: journal.runId,
+      sourceSha: journal.sourceSha,
+      phase: journal.phase,
+      configDigest: sha256(canonicalJson({ sourceSha: journal.sourceSha, state: "configuration-not-generated" })),
+      schemaDigest: sha256(canonicalJson([])),
+      protectedRevisionBefore: journal.preflight.protectedRevision,
+      protectedRevisionAfter: protectedAfter,
+      migrationCount: 0,
+      absence,
+      rollback: { workerCode: "not-deployed", initialLifecycle: "not-deployed", d1: "not-owned", durableObject: "not-deployed", wholeStackRollback: false },
+      completedAt,
+    });
+    const evidencePath = `${options.journalPath}.evidence.json`;
+    await saveEvidencePacket(evidencePath, packet);
+    await persist(options.journalPath, journal);
+    await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
+    return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(absence).length, cleanupComplete: true, wholeStackRollback: false };
+  }
   if (journal.phase !== "quarantined") throw new Error("origin must be quarantined before teardown");
   const credentials = requireCredentials(options.credentialEnvironment, "teardown");
   const privateConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false });
@@ -1270,6 +1332,20 @@ async function absenceOperation(options, dependencies) {
   if (journal.phase !== "cleanup-complete") throw new Error("completed teardown journal is required");
   const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
   const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
+  if (journal.teardown?.refusedD1Create === true && journal.incident?.kind === "d1-create-refused") {
+    if (journal.identity.databaseId || journal.resources.some((resource) => resource.status === "owned") || journal.mutations.some((mutation) => mutation.status === "applied" || mutation.providerAcceptance !== undefined)) {
+      throw new Error("refused D1 create journal contains unexpected ownership");
+    }
+    const d1Intent = journal.mutations.find((mutation) => mutation?.kind === "d1-create");
+    if (!d1Intent || d1Intent.status !== "pending") throw new Error("refused D1 create intent is missing");
+    await assertOperatorTokenActive(tokenClient);
+    const remote = await collectProtectedInventory({ adapter, inventory, tokenClient });
+    assertSharedAccountInventory(inventory, remote);
+    if (protectedRevision(remote, journal.identity) !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
+    journal.absenceChecks = [...(journal.absenceChecks ?? []), { checkedAt: dependencies.now().toISOString(), domains: 0, passed: true, refusedD1Create: true }];
+    await persist(options.journalPath, journal);
+    return { operation: "absence-check", phase: journal.phase, absenceCount: 0, passed: true };
+  }
   const remote = await collectRemoteInventory({ adapter, inventory });
   assertCredentialedPreflight(inventory, await withAccountWideWorkers(inventory, remote, tokenClient), { localSecretAvailable: true });
   const d1Absent = !remote.databases.some((item) => item.id === journal.identity.databaseId || item.name === journal.identity.databaseName);

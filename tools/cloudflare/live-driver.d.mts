@@ -21,6 +21,7 @@ export function executeJournaledMutation(options: {
   inspect: () => Promise<any>;
   mutate: () => Promise<any>;
   owns: (state: any) => boolean;
+  reconcileExisting?: (context: { intent: any; state: any }) => Promise<boolean> | boolean;
   intentMetadata?: Record<string, unknown>;
   finalize?: (context: { journal: any; intent: any; owned: any; result: { reconciled: boolean; state: any } }) => Promise<void> | void;
 }): Promise<{ reconciled: boolean; state: any }>;

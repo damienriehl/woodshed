@@ -18,6 +18,18 @@ D1 Time Travel is a separate, destructive recovery domain. Before restore, withd
 
 Every post-write failure is a partial-deployment incident. Quarantine the origin before restore or teardown, preserve the bookmark and frozen identities, and never automatically restore persistent state. A corrupt journal, owner/run mismatch, changed last-write identity, unreadable inventory, or unexpected dependent authorizes no deletion.
 
+### Pending D1 create refusal
+
+If `apply` reports that a database with the staging name already exists and instructs the operator to tear down the pending run, stop that run. A pending `d1-create` intent has no persisted provider acceptance, so the driver records an incident and refuses to adopt, migrate, seed, or delete the same-named database. Do not add a database ID to `STAGING_JOURNAL_PATH` or otherwise claim the database for the run.
+
+Close the refused journal with the same files and run ownership values:
+
+```sh
+npm run cloudflare:staging -- teardown --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
+```
+
+This refusal-specific teardown records cleanup without deleting the pre-existing database. The delayed `absence-check` invocations below validate the closed refusal journal and protected inventory without claiming or deleting that database. Resolve the name conflict outside the refused run, then use a new `STAGING_JOURNAL_PATH` and `STAGING_RUN_ID` before planning and applying again.
+
 Destroy only identities explicitly owned by the run journal, in dependency order:
 
 1. Route or `workers.dev` exposure and any run-owned hostname.
