@@ -5,10 +5,23 @@ import path from "node:path";
 const PHASES = new Set(["pre-write", "resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"]);
 const REQUIRED_IDENTITY = ["accountId", "databaseName", "workerName", "origin"];
 const RESOURCE_DOMAINS = new Set(["route", "hostname", "credential", "secret", "worker", "durable-object", "d1", "token"]);
+const CLOSED_D1_REFUSAL_INCIDENTS = new Set(["d1-create-refused", "d1-acceptance-mismatch"]);
 
 function requiredString(value, name) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`invalid journal: ${name} is required`);
   return value;
+}
+
+function isClosedD1Refusal(value) {
+  if (value.phase !== "cleanup-complete" || value.teardown?.refusedD1Create !== true || !CLOSED_D1_REFUSAL_INCIDENTS.has(value.incident?.kind)) return false;
+  if (value.incident.kind === "d1-create-refused") return true;
+  if (value.incident.databaseName !== value.identity.databaseName || !Array.isArray(value.resources) || !Array.isArray(value.mutations)) return false;
+  const d1Intent = value.mutations.find((mutation) => mutation?.kind === "d1-create");
+  return d1Intent?.status === "applied"
+    && typeof d1Intent.providerAcceptance?.id === "string"
+    && d1Intent.providerAcceptance.id.length > 0
+    && value.resources.every((resource) => resource?.status !== "owned")
+    && value.mutations.every((mutation) => mutation?.status !== "applied" || mutation === d1Intent);
 }
 
 export function validateJournal(value) {
@@ -20,7 +33,7 @@ export function validateJournal(value) {
   if (!value.identity || typeof value.identity !== "object") throw new Error("invalid journal: identity");
   for (const field of REQUIRED_IDENTITY) requiredString(value.identity[field], `identity.${field}`);
   if (value.identity.databaseId !== undefined && (typeof value.identity.databaseId !== "string" || value.identity.databaseId.length === 0)) throw new Error("invalid journal: identity.databaseId");
-  const closedD1Refusal = value.phase === "cleanup-complete" && value.incident?.kind === "d1-create-refused" && value.teardown?.refusedD1Create === true;
+  const closedD1Refusal = isClosedD1Refusal(value);
   if (value.phase !== "pre-write" && !value.identity.databaseId && !closedD1Refusal) throw new Error("invalid journal: identity.databaseId is required after provisioning");
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
   if (value.preflight !== undefined && (!value.preflight || typeof value.preflight !== "object" || value.preflight.operatorTokenPresent !== true)) throw new Error("invalid journal: operator token presence");

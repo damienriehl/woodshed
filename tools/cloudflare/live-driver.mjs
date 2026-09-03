@@ -32,6 +32,7 @@ const OPTION_NAMES = new Map([
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const SAFE_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const DATABASE_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const D1_CREATE_REFUSAL_INCIDENTS = new Set(["d1-create-refused", "d1-acceptance-mismatch"]);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -769,6 +770,15 @@ async function applyOperation(options, dependencies) {
         await persist(options.journalPath, journal);
         throw new Error(`a database named ${journal.identity.databaseName} already exists; tear down the pending run before retrying`);
       }
+      journal.incident = {
+        kind: "d1-acceptance-mismatch",
+        databaseName: journal.identity.databaseName,
+        failedPhase: journal.phase,
+        owner: journal.owner,
+        nextAction: "tear-down-refused-run-before-retrying",
+        wholeStackRollback: false,
+      };
+      await persist(options.journalPath, journal);
       return false;
     };
     const created = await executeJournaledMutation({
@@ -1085,6 +1095,22 @@ async function writeCredentialRevocation(config, journal, now) {
   return file;
 }
 
+function refusedD1CreateIntent(journal) {
+  const incidentKind = journal.incident?.kind;
+  if (!D1_CREATE_REFUSAL_INCIDENTS.has(incidentKind)) throw new Error("refused D1 create incident is missing");
+  const d1Intent = journal.mutations.find((mutation) => mutation?.kind === "d1-create");
+  const acceptanceMismatch = incidentKind === "d1-acceptance-mismatch";
+  const unexpectedAppliedMutation = journal.mutations.some((mutation) => mutation.status === "applied" && (!acceptanceMismatch || mutation !== d1Intent));
+  if (journal.identity.databaseId || journal.resources.some((resource) => resource.status === "owned") || unexpectedAppliedMutation) {
+    throw new Error("refused D1 create journal contains unexpected ownership");
+  }
+  if (!d1Intent || (!acceptanceMismatch && d1Intent.status !== "pending")) throw new Error("refused D1 create intent is missing");
+  if (acceptanceMismatch && (journal.incident.databaseName !== journal.identity.databaseName || d1Intent.status !== "applied" || !d1Intent.providerAcceptance?.id)) {
+    throw new Error("refused D1 create acceptance mismatch is invalid");
+  }
+  return d1Intent;
+}
+
 async function teardownOperation(options, dependencies) {
   requiredOptions(options, ["inventoryPath", "journalPath", "runId", "owner"]);
   const inventory = validateStagingInventory(await readPrivateJson(options.root, options.inventoryPath), dependencies.sourceState?.(options.root) ?? inspectSourceState(options.root));
@@ -1099,10 +1125,8 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(journal.teardown?.absence ?? {}).length, cleanupComplete: true, wholeStackRollback: false };
   }
-  if (journal.phase === "pre-write" && journal.incident?.kind === "d1-create-refused") {
-    if (journal.identity.databaseId || journal.resources.some((resource) => resource.status === "owned") || journal.mutations.some((mutation) => mutation.status === "applied")) {
-      throw new Error("refused D1 create journal contains unexpected ownership");
-    }
+  if (journal.phase === "pre-write" && D1_CREATE_REFUSAL_INCIDENTS.has(journal.incident?.kind)) {
+    refusedD1CreateIntent(journal);
     const credentials = requireCredentials(options.credentialEnvironment, "teardown");
     const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
     const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
@@ -1113,8 +1137,6 @@ async function teardownOperation(options, dependencies) {
     if (protectedAfter !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
     const completedAt = dependencies.now().toISOString();
     const absence = Object.fromEntries(journal.resources.map((resource) => [`${resource.domain}:${resource.id}`, true]));
-    const d1Intent = journal.mutations.find((mutation) => mutation?.kind === "d1-create");
-    if (!d1Intent || d1Intent.status !== "pending") throw new Error("refused D1 create intent is missing");
     journal.phase = "cleanup-complete";
     journal.acceptance = { status: "not-run", cleanupComplete: true };
     journal.incident = { ...journal.incident, resolvedAt: completedAt };
@@ -1332,12 +1354,8 @@ async function absenceOperation(options, dependencies) {
   if (journal.phase !== "cleanup-complete") throw new Error("completed teardown journal is required");
   const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
   const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
-  if (journal.teardown?.refusedD1Create === true && journal.incident?.kind === "d1-create-refused") {
-    if (journal.identity.databaseId || journal.resources.some((resource) => resource.status === "owned") || journal.mutations.some((mutation) => mutation.status === "applied" || mutation.providerAcceptance !== undefined)) {
-      throw new Error("refused D1 create journal contains unexpected ownership");
-    }
-    const d1Intent = journal.mutations.find((mutation) => mutation?.kind === "d1-create");
-    if (!d1Intent || d1Intent.status !== "pending") throw new Error("refused D1 create intent is missing");
+  if (journal.teardown?.refusedD1Create === true && D1_CREATE_REFUSAL_INCIDENTS.has(journal.incident?.kind)) {
+    refusedD1CreateIntent(journal);
     await assertOperatorTokenActive(tokenClient);
     const remote = await collectProtectedInventory({ adapter, inventory, tokenClient });
     assertSharedAccountInventory(inventory, remote);
