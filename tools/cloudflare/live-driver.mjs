@@ -13,7 +13,7 @@ import {
 } from "./deployment.mjs";
 import { createFinalEvidencePacket, saveEvidencePacket } from "./evidence.mjs";
 import { validateStagingInventory } from "./inventory.mjs";
-import { createJournal, loadJournal, saveJournal, saveNewJournal } from "./journal.mjs";
+import { createJournal, loadJournal, saveJournal, saveNewJournal, TEARDOWN_ENTRY_PHASES } from "./journal.mjs";
 import { D1_MIGRATIONS, verifyMigrationDirectory } from "./migrations.mjs";
 import { assertRollbackCompatible, createJournalRetention, runStackTeardown } from "./recovery.mjs";
 import { createSyntheticFixturePlan } from "./staging-fixtures.mjs";
@@ -47,6 +47,72 @@ function safeRunId(runId) {
 function requiredString(value, label) {
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${label} is required`);
   return value;
+}
+
+const defaultSetTimer = (callback, delay) => setTimeout(callback, delay);
+const defaultClearTimer = (handle) => clearTimeout(handle);
+
+function confirmation(outcome, attempts, checkedAt, lastError = null) {
+  return { outcome, attempts, checkedAt: checkedAt.toISOString(), lastError };
+}
+
+function rateLimited(error) {
+  return error !== null
+    && (typeof error === "object" || typeof error === "function")
+    && (error.status === 429 || error.statusCode === 429);
+}
+
+function waitForRetry(delay, setTimer, clearTimer) {
+  return new Promise((resolve) => {
+    let handle = null;
+    handle = setTimer(() => {
+      clearTimer(handle);
+      resolve();
+    }, delay);
+  });
+}
+
+export async function confirmAbsence(probe, {
+  setTimer = defaultSetTimer,
+  clearTimer = defaultClearTimer,
+  now = () => new Date(),
+  maxAttempts: attemptLimit = 8,
+  initialDelayMs = 500,
+  factor = 2,
+  maxDelayMs = 8_000,
+  budgetMs = 45_000,
+  random = Math.random,
+} = {}) {
+  const startedAt = now().getTime();
+  let attempts = 0;
+
+  while (attempts < attemptLimit) {
+    attempts += 1;
+    let present;
+    try {
+      present = await probe();
+    } catch (error) {
+      if (rateLimited(error)) return confirmation("could-not-confirm", attempts, now(), error);
+      throw error;
+    }
+
+    if (!present) return confirmation("proven-absent", attempts, now());
+    // Every attempt observed it and nothing errored: that is the strongest evidence available
+    // that it really is present. Only running out of wall-clock or hitting a rate limit leaves
+    // the question genuinely open.
+    if (attempts >= attemptLimit) return confirmation("present", attempts, now());
+
+    const checkedAt = now();
+    const elapsedMs = checkedAt.getTime() - startedAt;
+    const backoffMs = Math.min(maxDelayMs, initialDelayMs * factor ** (attempts - 1));
+    const delayMs = backoffMs / 2 + (backoffMs / 2) * random();
+    if (elapsedMs >= budgetMs || delayMs > budgetMs - elapsedMs) {
+      return confirmation("could-not-confirm", attempts, checkedAt);
+    }
+    await waitForRetry(delayMs, setTimer, clearTimer);
+  }
+
+  return confirmation("could-not-confirm", attempts, now());
 }
 
 function effectiveConfigDirectory(root, runId) {
@@ -373,7 +439,9 @@ export function createApiTokenClient({ token, fetch = globalThis.fetch, apiBase 
       if (typeof accountId !== "string" || !/^[a-f0-9]{32}$/i.test(accountId) || typeof workerName !== "string" || !SAFE_NAME.test(workerName)) throw new Error("valid staging exposure identity is required");
       const response = await request(`/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/subdomain`, {}, accountApiBase);
       if (response.status === 404) return { exists: false, enabled: false };
-      if (!response.ok) throw new Error("workers.dev exposure inventory failed");
+      // The status rides on the error so the retry can tell a 429 from an ordinary failure;
+      // without it the rate-limit branch is unreachable against the real client.
+      if (!response.ok) throw Object.assign(new Error("workers.dev exposure inventory failed"), { status: response.status });
       let payload;
       try { payload = await response.json(); } catch { throw new Error("workers.dev exposure inventory is unreadable"); }
       if (payload?.success !== true || typeof payload.result?.enabled !== "boolean" || typeof payload.result?.previews_enabled !== "boolean") throw new Error("workers.dev exposure inventory is unreadable");
@@ -441,6 +509,32 @@ async function collectProtectedInventory({ adapter, inventory, tokenClient }) {
 async function workersDevEnabled(inventory, journal, tokenClient) {
   if (typeof tokenClient?.inspectWorkersDev !== "function") throw new Error("authenticated workers.dev exposure inventory is required");
   return (await tokenClient.inspectWorkersDev(inventory.staging.accountId, journal.identity.workerName)).enabled;
+}
+
+function confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now }) {
+  return confirmAbsence(() => workersDevEnabled(inventory, journal, tokenClient), { setTimer, clearTimer, now });
+}
+
+// wrangler's secret commands once resolved --name plus --env into "<name>-staging", creating a
+// Worker the journal never owned. That is fixed at argument composition, so this should never
+// fire -- which is why it refuses rather than deletes: a journal is authority to remove only
+// what it owns, so an unowned near-miss is a fact for a human, never a cleanup target.
+export async function assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient) {
+  const suffixed = `${journal.identity.workerName}-staging`;
+  const scripts = await tokenClient.listWorkerScripts(inventory.staging.accountId);
+  if (scripts.some((script) => script?.name === suffixed)) throw new Error("unowned environment-suffixed Worker blocks cleanup completion");
+}
+
+async function recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed = false } = {}) {
+  // Cloudflare publishes no read-after-write guarantee for the workers.dev subdomain, so
+  // an exhausted retry means unknown -- not absent, and not quarantine failure. Record what
+  // was checked and when, and whether the disable itself errored: "the disable failed and I
+  // could not confirm" is a different incident from "it succeeded and I could not confirm".
+  journal.incident = {
+    ...(journal.incident ?? {}),
+    originAbsence: { status: absence.outcome, checkedAt: absence.checkedAt, attempts: absence.attempts, disableFailed },
+  };
+  await persist(journalPath, journal);
 }
 
 function inventoryMatchesJournal(journalIdentity, inventoryIdentity) {
@@ -688,6 +782,8 @@ function defaultDependencies(overrides = {}) {
     sourceState: overrides.sourceState,
     acceptance: overrides.acceptance ?? runDeployedAcceptance,
     now: overrides.now ?? (() => new Date()),
+    setTimer: overrides.setTimer ?? defaultSetTimer,
+    clearTimer: overrides.clearTimer ?? defaultClearTimer,
   };
 }
 
@@ -901,8 +997,6 @@ async function applyOperation(options, dependencies) {
       }
     },
   });
-  const durableIntent = journal.mutations.find((item) => item?.kind === "durable-object-create");
-  durableIntent.status = "applied";
   journal.deployment = { initialId: deployed.deployment.deploymentId, sourceSha: journal.sourceSha, configDigest: privateConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COORDINATOR"], rollback: "forward-fix-only", lifecycle: "legacy-sqlite-v1" };
   await persist(options.journalPath, journal);
 
@@ -963,7 +1057,7 @@ async function applyWithIncidentCapture(options, dependencies) {
         const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
         const privateAdapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: privateConfig.configPath });
         const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
-        await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
+        await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
       }
     } catch {
       quarantineFailed = true;
@@ -978,7 +1072,12 @@ async function applyWithIncidentCapture(options, dependencies) {
   }
 }
 
-async function quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath, fetch }) {
+async function quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory }) {
+  // journalPath and the clock/fetch seams are always options.X / dependencies.X; only the
+  // adapters and the journal differ per call site. Threading them explicitly grew this
+  // signature to ten parameters and duplicated the same four lines at all three callers.
+  const journalPath = options.journalPath;
+  const { fetch, setTimer, clearTimer, now } = dependencies;
   const enabledBefore = await workersDevEnabled(inventory, journal, tokenClient);
   let intent = journal.mutations.find((item) => item?.kind === "workers-dev-disable");
   if (!intent) {
@@ -995,10 +1094,27 @@ async function quarantine({ adapter, privateAdapter, tokenClient, journal, inven
       await privateAdapter.deploy(journal.identity.workerName);
     }
     catch (error) {
-      if (await workersDevEnabled(inventory, journal, tokenClient)) throw error;
+      const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
+      if (absence.outcome === "present") throw error;
+      if (absence.outcome === "could-not-confirm") {
+        await recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed: true });
+        return absence.outcome;
+      }
+      await settleQuarantine({ privateAdapter, journal, journalPath, intent });
+      return "proven-absent";
     }
   }
-  if (await workersDevEnabled(inventory, journal, tokenClient)) throw new Error("origin quarantine absence proof failed");
+  const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
+  if (absence.outcome === "present") throw new Error("origin quarantine absence proof failed");
+  if (absence.outcome === "could-not-confirm") {
+    await recordUnconfirmedOriginAbsence(journalPath, journal, absence);
+    return absence.outcome;
+  }
+  await settleQuarantine({ privateAdapter, journal, journalPath, intent });
+  return "proven-absent";
+}
+
+async function settleQuarantine({ privateAdapter, journal, journalPath, intent }) {
   if (Array.isArray(intent.beforeDeploymentIds)) {
     const proof = await deploymentProof(privateAdapter, journal.identity.workerName);
     intent.deploymentId = newDeploymentId(intent.beforeDeploymentIds, proof);
@@ -1027,10 +1143,17 @@ async function verifyOperation(options, dependencies) {
   if (journal.phase === "verified") {
     const acceptanceFailed = journal.acceptance?.status !== "passed";
     const savedEvidence = journal.acceptanceEvidence;
-    await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
-    if (acceptanceFailed || !savedEvidence) throw new Error("deployed acceptance previously failed; origin is quarantined");
-    return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, wholeStackRollback: false };
+    const replayAbsence = await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
+    if (acceptanceFailed || !savedEvidence) {
+      const originState = journal.phase === "quarantined" ? "origin is quarantined" : "origin absence could not be confirmed";
+      throw new Error(`deployed acceptance previously failed; ${originState}`);
+    }
+    // Same rule as the first-run path: a re-entrant verify must not report success over an
+    // origin it could not prove closed.
+    if (replayAbsence !== "proven-absent") throw new Error("deployed acceptance passed but origin absence could not be confirmed");
+    return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, originAbsence: replayAbsence, wholeStackRollback: false };
   }
+  let originAbsence;
   const markerExpected = { sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] };
   const assertActiveOrigin = async () => {
     if (!await workersDevEnabled(inventory, journal, tokenClient)) throw new Error("authenticated workers.dev exposure is inactive");
@@ -1077,9 +1200,13 @@ async function verifyOperation(options, dependencies) {
     journal.acceptanceEvidence = evidence;
     await persist(options.journalPath, journal);
   } finally {
-    await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
+    originAbsence = await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
   }
-  return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, wholeStackRollback: false };
+  // An unconfirmed origin is not a clean verify. The operator sees it in the result and the
+  // CLI exits non-zero, because "verify succeeded" over a possibly-live exposure is the one
+  // reading of this state that is never safe.
+  if (originAbsence !== "proven-absent") throw new Error("deployed acceptance passed but origin absence could not be confirmed");
+  return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, originAbsence, wholeStackRollback: false };
 }
 
 function activeCredential(journal) {
@@ -1170,12 +1297,13 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(absence).length, cleanupComplete: true, wholeStackRollback: false };
   }
-  if (journal.phase !== "quarantined") throw new Error("origin must be quarantined before teardown");
+  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("teardown requires a post-write journal phase");
   const credentials = requireCredentials(options.credentialEnvironment, "teardown");
   const privateConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false });
   const deleteConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false, deleteDurableObject: true });
   let adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: privateConfig.configPath });
   const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
+  const absenceOptions = { setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now };
   await assertOperatorTokenActive(tokenClient);
   assertSharedAccountInventory(inventory, await collectProtectedInventory({ adapter, inventory, tokenClient }));
   const expectedProtected = journal.preflight.protectedRevision;
@@ -1189,15 +1317,31 @@ async function teardownOperation(options, dependencies) {
     return deployments.length > 0 || versions.length > 0;
   };
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
+  // A Worker is matched by name alone, so inspectResource can only stamp the journal's own
+  // identity onto whatever is remotely present -- which makes recovery's ownership check
+  // compare the journal against itself. That was safe while teardown required "quarantined",
+  // because reaching it implied this run had deployed. The widened entry accepts phases that
+  // carry no such implication, so a run that crashed before deploying could delete a same-named
+  // Worker a later run created. Require this run's own applied deploy before touching one.
+  const DEPLOYED_PHASES = ["worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"];
+  const deployedByThisRun = journal.mutations.some((item) => item?.kind === "worker-deploy" && item.status === "applied")
+    || DEPLOYED_PHASES.includes(journal.phase);
+  const assertRunDeployedIt = (present) => {
+    if (present && !deployedByThisRun) throw new Error("remote Worker predates this run's deployment; refusing to remove it");
+    return present;
+  };
   const inspectResource = async (resource) => {
-    if (resource.domain === "route") return { exists: await workersDevEnabled(inventory, journal, tokenClient), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "route") {
+      const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
+      return { exists: absence.outcome !== "proven-absent", runId: journal.runId, owner: journal.owner };
+    }
     if (resource.domain === "credential") {
       if (!activeCredential(journal) || !journal.identity.databaseId) return { exists: false, runId: journal.runId, owner: journal.owner };
       const rows = d1Results(await adapter.d1Execute(journal.identity.databaseName, { command: `SELECT count(*) AS count FROM participant_sessions WHERE id_hash=${sql(activeCredential(journal))} AND revoked_at IS NULL` }));
       return { exists: Number(rows[0]?.count ?? 0) > 0, runId: journal.runId, owner: journal.owner };
     }
-    if (resource.domain === "secret") return { exists: (await adapter.secretList(journal.identity.workerName)).some((item) => item?.name === "LIVE_COMMAND_SECRET"), runId: journal.runId, owner: journal.owner };
-    if (resource.domain === "worker") return { exists: await workerExists(), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "secret") return { exists: assertRunDeployedIt((await adapter.secretList(journal.identity.workerName)).some((item) => item?.name === "LIVE_COMMAND_SECRET")), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "worker") return { exists: assertRunDeployedIt(await workerExists()), runId: journal.runId, owner: journal.owner };
     if (resource.domain === "durable-object") {
       const deletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && item.tag === deleteConfig.deletionTag && item.configDigest === deleteConfig.configDigest);
       const creationApplied = journal.mutations.some((item) => item?.kind === "durable-object-create" && item.status === "applied");
@@ -1310,13 +1454,21 @@ async function teardownOperation(options, dependencies) {
     intent.status = "applied";
     await persist(options.journalPath, journal);
   };
+  // Refuse before ANY removal, not per-domain: RESOURCE_ORDER processes the route first, and
+  // that branch redeploys this run's config over whatever Worker is present. A per-resource
+  // guard would fire only after that mutation had already landed on a foreign Worker.
+  assertRunDeployedIt(await workerExists());
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   const result = await runStackTeardown({
     journal,
     lease: journal.lease,
     expectedRevision: expectedProtected,
     inspectRevision,
     listDependents: async (resource) => {
-      if (resource.domain === "worker" && await workersDevEnabled(inventory, journal, tokenClient)) return ["owned-origin-still-active"];
+      if (resource.domain === "worker") {
+        const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
+        if (absence.outcome !== "proven-absent") return ["owned-origin-still-active"];
+      }
       if (["durable-object", "d1"].includes(resource.domain) && await workerExists()) return ["owned-worker-still-present"];
       return [];
     },
@@ -1333,6 +1485,7 @@ async function teardownOperation(options, dependencies) {
   for (const intent of journal.mutations.filter((item) => item?.kind?.startsWith("teardown-") && item.status === "pending")) {
     if (result.absence[`${intent.domain}:${intent.id}`] === true) intent.status = "applied";
   }
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   journal.phase = "cleanup-complete";
   journal.acceptance = { ...(journal.acceptance ?? { status: "not-run" }), cleanupComplete: true };
   journal.teardown = { absence: result.absence, completedAt: dependencies.now().toISOString(), durableObjectStateRemovedWithNamespace: result.durableObjectStateRemovedWithNamespace };
@@ -1381,8 +1534,13 @@ async function absenceOperation(options, dependencies) {
   const d1Absent = !remote.databases.some((item) => item.id === journal.identity.databaseId || item.name === journal.identity.databaseName);
   const workerAbsent = !remote.workers.some((item) => item.name === journal.identity.workerName);
   const durableObjectDeletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && /^woodshed-staging-delete-[a-f0-9]{16}$/.test(item.tag ?? "") && /^[a-f0-9]{64}$/.test(item.configDigest ?? ""));
+  const absenceOptions = { setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now };
+  // A D1 database or Worker still present already dooms the proof below, and the failure path
+  // records no per-domain detail, so spending the route retry budget first buys nothing.
+  if (!d1Absent || !workerAbsent) throw new Error("delayed absence proof failed");
+  const routeAbsence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
   const absent = {
-    route: !(await workersDevEnabled(inventory, journal, tokenClient)),
+    route: routeAbsence.outcome === "proven-absent",
     hostname: true,
     credential: d1Absent,
     secret: workerAbsent && !remote.secretNames.includes("LIVE_COMMAND_SECRET"),
@@ -1420,6 +1578,6 @@ export async function runLiveOperation(input, overrides = {}) {
 }
 
 export function publicOperationResult(result) {
-  const allowed = ["operation", "phase", "ok", "mutationCount", "accountScope", "migrationCount", "rollback", "wholeStackRollback", "cleanupComplete", "absenceCount", "passed", "outcomes", "counts"];
+  const allowed = ["operation", "phase", "ok", "originAbsence", "mutationCount", "accountScope", "migrationCount", "rollback", "wholeStackRollback", "cleanupComplete", "absenceCount", "passed", "outcomes", "counts"];
   return Object.fromEntries(Object.entries(result).filter(([key]) => allowed.includes(key)));
 }

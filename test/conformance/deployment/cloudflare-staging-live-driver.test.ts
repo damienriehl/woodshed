@@ -7,6 +7,8 @@ import test from "node:test";
 
 import {
   collectRemoteInventory,
+  assertNoEnvironmentSuffixedWorker,
+  confirmAbsence,
   createApiTokenClient,
   createIdentityRevision,
   executeJournaledMutation,
@@ -17,9 +19,13 @@ import {
   remoteSchema,
   runLiveOperation,
 } from "../../../tools/cloudflare/live-driver.mjs";
+import { runMigrationFirstDeployment } from "../../../tools/cloudflare/deployment.mjs";
 import { createJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { createEvidenceEnvelope } from "../../../tools/cloudflare/evidence.mjs";
 import { D1_MIGRATIONS } from "../../../tools/cloudflare/migrations.mjs";
+import { runStackTeardown } from "../../../tools/cloudflare/recovery.mjs";
+import { createSyntheticFixturePlan } from "../../../tools/cloudflare/staging-fixtures.mjs";
+import { runDeployedAcceptance } from "../../../tools/cloudflare/staging-smoke.mjs";
 import { publicErrorMessage } from "../../../tools/cloudflare-staging.mjs";
 
 const sourceSha = "a".repeat(40);
@@ -27,6 +33,191 @@ const accountId = "b".repeat(32);
 const databaseId = "11111111-2222-4333-8444-555555555555";
 const workerName = "woodshed-staging-synthetic";
 const origin = `https://${workerName}.synthetic.workers.dev`;
+
+function fakeRetryTimers() {
+  const delays: number[] = [];
+  const callbacks: Array<() => void> = [];
+  let timerScheduled: (() => void) | undefined;
+  return {
+    delays,
+    setTimer(callback: () => void, delay: number) {
+      callbacks.push(callback);
+      delays.push(delay);
+      timerScheduled?.();
+      timerScheduled = undefined;
+      return callbacks.length;
+    },
+    clearTimer() {},
+    async fireNext() {
+      if (callbacks.length === 0) await new Promise<void>((resolve) => { timerScheduled = resolve; });
+      const callback = callbacks.shift();
+      assert.ok(callback);
+      callback();
+    },
+  };
+}
+
+function immediateRetryTimers() {
+  const delays: number[] = [];
+  return {
+    delays,
+    setTimer(callback: () => void, delay: number) {
+      delays.push(delay);
+      queueMicrotask(callback);
+      return delays.length;
+    },
+    clearTimer() {},
+  };
+}
+
+function statefulExposureTokenClient(exposures: Array<{ enabled: boolean; previews_enabled?: boolean }>) {
+  let reads = 0;
+  const exposureClient = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    fetch: async () => {
+      const exposure = exposures[reads];
+      reads += 1;
+      assert.ok(exposure, "unexpected workers.dev exposure read");
+      return Response.json({ success: true, result: { previews_enabled: false, ...exposure } });
+    },
+  });
+  return {
+    reads: () => reads,
+    tokenClient: {
+      inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+      listWorkerScripts: async () => [],
+      listWorkerRoutes: async () => [],
+      listWorkerDomains: async () => [],
+      inspectWorkersDev: exposureClient.inspectWorkersDev,
+    },
+  };
+}
+
+test("confirmAbsence proves absence without scheduling a retry", async () => {
+  const timers = fakeRetryTimers();
+  const result = await confirmAbsence(async () => false, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  });
+
+  assert.deepEqual(result, {
+    outcome: "proven-absent",
+    attempts: 1,
+    checkedAt: "2030-01-01T12:00:00.000Z",
+    lastError: null,
+  });
+  assert.deepEqual(timers.delays, []);
+});
+
+test("confirmAbsence retries with non-decreasing full-jitter delays", async () => {
+  const timers = fakeRetryTimers();
+  let probeCalls = 0;
+  const confirmation = confirmAbsence(async () => {
+    probeCalls += 1;
+    return probeCalls < 3;
+  }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    random: () => 1,
+  });
+
+  await timers.fireNext();
+  await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "proven-absent");
+  assert.equal(result.attempts, 3);
+  assert.deepEqual(timers.delays, [500, 1_000]);
+  assert.ok(timers.delays.every((delay, index) => index === 0 || delay >= timers.delays[index - 1]!));
+});
+
+test("confirmAbsence reports present after the whole attempt ladder observed it", async () => {
+  // Every attempt saw it and nothing errored, so this is the strongest present-evidence the
+  // endpoint can give -- it must re-arm the hard refusal, not degrade to unknown. Only the
+  // wall-clock cut-off and the rate-limit exit below leave the question genuinely open.
+  const timers = fakeRetryTimers();
+  const confirmation = confirmAbsence(async () => true, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    maxAttempts: 8,
+    random: () => 1,
+  });
+
+  for (let retry = 0; retry < 7; retry += 1) await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "present");
+  assert.notEqual(result.outcome, "proven-absent");
+  assert.equal(result.attempts, 8);
+});
+
+test("confirmAbsence stops when the wall-clock budget is exhausted", async () => {
+  const timers = fakeRetryTimers();
+  let probeCalls = 0;
+  const confirmation = confirmAbsence(async () => {
+    probeCalls += 1;
+    return true;
+  }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date(probeCalls < 2 ? 0 : 101),
+    maxAttempts: 8,
+    initialDelayMs: 1,
+    budgetMs: 100,
+    random: () => 1,
+  });
+
+  await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "could-not-confirm");
+  assert.ok(result.attempts < 8);
+  assert.equal(result.attempts, 2);
+});
+
+test("confirmAbsence stops immediately on rate limiting", async () => {
+  const timers = fakeRetryTimers();
+  const rateLimitError = Object.assign(new Error("rate limited"), { status: 429 });
+  const result = await confirmAbsence(async () => { throw rateLimitError; }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  });
+
+  assert.equal(result.outcome, "could-not-confirm");
+  assert.equal(result.attempts, 1);
+  assert.equal(result.lastError, rateLimitError);
+  assert.deepEqual(timers.delays, []);
+});
+
+test("confirmAbsence propagates non-rate-limit probe errors", async () => {
+  const error = Object.assign(new Error("bad request"), { status: 400 });
+  await assert.rejects(confirmAbsence(async () => { throw error; }, {
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  }), (thrown) => thrown === error);
+});
+
+test("confirmAbsence waits before retrying with real timers", async () => {
+  let probeCalls = 0;
+  const startedAt = Date.now();
+  const result = await confirmAbsence(async () => {
+    probeCalls += 1;
+    return probeCalls === 1;
+  }, {
+    initialDelayMs: 60,
+    maxAttempts: 3,
+    random: () => 1,
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.outcome, "proven-absent");
+  assert.equal(probeCalls, 2);
+  assert.ok(elapsedMs >= 55, `expected a real delay of at least 55ms, received ${elapsedMs}ms`);
+});
 
 function inventory() {
   return {
@@ -194,6 +385,164 @@ async function preWorkerTeardownFixture(t: any, durableCreateStatus: "pending" |
   return { common, dependencies, journalPath, databasePresent: () => databasePresent, databaseDeletes: () => databaseDeletes };
 }
 
+async function postWriteTeardownFixture(
+  t: any,
+  phase: "resources-ready" | "bookmark-captured" | "schema-expanded" | "worker-deployed" | "alias-live" = "worker-deployed",
+  deploymentPath: "new" | "reconciled" = "new",
+) {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-post-write-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-post-write-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const revision = createIdentityRevision({ accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] });
+  const journal = createJournal({
+    runId: `run-post-write-${phase}`,
+    owner: "owner-post-write",
+    sourceSha,
+    identity: stagingInventory.staging,
+  });
+  journal.phase = phase === "resources-ready" ? "resources-ready" : "bookmark-captured";
+  journal.preflight = { protectedRevision: revision, targetRevision: revision, operatorTokenPresent: true };
+  journal.lease = { active: true, runId: journal.runId, owner: journal.owner, revision };
+  journal.acceptance = { status: "not-run", cleanupComplete: false };
+  for (const [domain, id, status] of [
+    ["route", "route-post-write", "planned"],
+    ["hostname", "hostname-post-write", "planned"],
+    ["credential", "credential-post-write", "planned"],
+    ["secret", "secret-post-write", "planned"],
+    ["worker", workerName, "planned"],
+    ["durable-object", "durable-post-write", "planned"],
+    ["d1", databaseId, "owned"],
+  ] as const) journal.resources.push({ domain, id, status, runId: journal.runId, owner: journal.owner });
+  journal.mutations.push(
+    { kind: "d1-create", domain: "d1", id: databaseId, status: "applied", providerAcceptance: { id: databaseId } },
+    { kind: "durable-object-create", domain: "durable-object", id: "durable-post-write", status: "pending" },
+  );
+  if (deploymentPath === "reconciled") journal.mutations.push({ kind: "worker-deploy", status: "pending", sourceSha });
+  await saveJournal(journalPath, journal);
+
+  const state = {
+    databasePresent: true,
+    workerPresent: deploymentPath === "reconciled",
+    deploymentSequence: deploymentPath === "reconciled" ? 1 : 0,
+    durableIntentPersistedBeforeDeploymentVerification: false,
+  };
+  if (!["resources-ready", "bookmark-captured"].includes(phase)) {
+    const deploymentFailure = new Error("synthetic deployment stopped after schema expansion");
+    const deployment = runMigrationFirstDeployment({
+      journal,
+      lease: journal.lease,
+      manifest: [],
+      expectedSnapshot: { revision },
+      inspectSnapshot: async () => ({ revision }),
+      inspectLedger: async () => [],
+      persistJournal: (value: any) => {
+        const workerIntent = value.mutations.find((item: any) => item.kind === "worker-deploy");
+        const durableIntent = value.mutations.find((item: any) => item.kind === "durable-object-create");
+        if (workerIntent?.status === "pending" && durableIntent?.status === "applied") {
+          state.durableIntentPersistedBeforeDeploymentVerification = true;
+        }
+        if (workerIntent?.status === "applied") {
+          assert.equal(durableIntent?.status, "applied");
+        }
+        return saveJournal(journalPath, value);
+      },
+      applyMigration: async () => {},
+      verifyMigration: async () => true,
+      verifyFinalSchema: async () => {
+        journal.phase = "schema-expanded";
+        await saveJournal(journalPath, journal);
+      },
+      deployWorker: async () => {
+        if (phase === "schema-expanded") throw deploymentFailure;
+        state.workerPresent = true;
+        state.deploymentSequence += 1;
+        return { deploymentId: `deployment-post-write-${state.deploymentSequence}` };
+      },
+      inspectDeployment: async () => state.workerPresent
+        ? { deploymentId: `deployment-post-write-${state.deploymentSequence}` }
+        : undefined,
+      verifyDeployment: async () => {
+        assert.equal(state.durableIntentPersistedBeforeDeploymentVerification, true);
+      },
+    });
+    if (phase === "schema-expanded") await assert.rejects(deployment, /deployment outcome is uncertain; no replay authorized/);
+    else {
+      await deployment;
+      if (phase === "alias-live") {
+        journal.phase = "alias-live";
+        await saveJournal(journalPath, journal);
+      }
+    }
+  }
+
+  const deployments = () => state.workerPresent
+    ? [{ id: `deployment-post-write-${state.deploymentSequence}`, script_name: workerName }]
+    : [];
+  const versions = () => state.workerPresent
+    ? [{ id: `version-post-write-${state.deploymentSequence}`, script_name: workerName }]
+    : [];
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => state.databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
+    deploymentsList: async () => deployments(),
+    versionsList: async () => versions(),
+    secretList: async () => [],
+    d1Execute: async () => [{ success: true, results: [{ count: 0 }] }],
+    deploy: async () => { state.workerPresent = true; state.deploymentSequence += 1; },
+    deleteWorker: async () => { state.workerPresent = false; },
+    d1Delete: async () => { state.databasePresent = false; },
+  };
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectWorkersDev: async () => ({ exists: state.workerPresent, enabled: false }),
+  };
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token" },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => tokenClient,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  };
+  return {
+    common,
+    dependencies,
+    journal,
+    journalPath,
+    revision,
+    removeWorker: () => { state.workerPresent = false; },
+  };
+}
+
+function directTeardownOptions(journal: any, revision: string) {
+  return {
+    journal,
+    lease: journal.lease,
+    expectedRevision: revision,
+    inspectRevision: async () => revision,
+    listDependents: async () => [],
+    inspectResource: async () => ({ exists: false, runId: journal.runId, owner: journal.owner }),
+    removeResource: async () => {},
+    verifyTokenInactive: async () => true,
+  };
+}
+
 async function d1ReconciliationFixture(t: any, intentStatus?: "pending" | "applied", {
   providerAcceptanceId = databaseId,
   remoteDatabaseId = databaseId,
@@ -311,6 +660,11 @@ test("effective config is run-isolated, explicit, content-attested, and supports
   assert.equal(parsed.env.staging.vars.WOODSHED_CONFIG_DIGEST, active.configDigest);
   assert.match(active.configPath, /\.cloudflare-staging/);
   assert.match(active.configDigest, /^[a-f0-9]{64}$/);
+
+  const privateDeployment = await generateEffectiveConfig({ root, runId: "run-a", inventory: inventory(), databaseId, sourceSha, workersDev: false });
+  const privateConfig = JSON.parse(await readFile(privateDeployment.configPath, "utf8"));
+  assert.equal(privateConfig.env.staging.workers_dev, false);
+  assert.equal(privateConfig.env.staging.preview_urls, false);
 
   const deletion = await generateEffectiveConfig({ root, runId: "run-a", inventory: inventory(), databaseId, sourceSha, workersDev: false, deleteDurableObject: true });
   const deletionConfig = JSON.parse(await readFile(deletion.configPath, "utf8"));
@@ -573,6 +927,167 @@ test("teardown requires deleted_classes proof after Durable Object creation appl
   assert.equal(fixture.databasePresent(), true);
 });
 
+test("a genuine worker-deployed journal passes both teardown gates and cleanup replays idempotently", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const deployedJournal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(deployedJournal.phase, "worker-deployed");
+
+  const direct = await runStackTeardown(directTeardownOptions(structuredClone(deployedJournal), fixture.revision));
+  assert.equal(direct.complete, true);
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "absence-check" }, fixture.dependencies),
+    (error: any) => error?.message === "completed teardown journal is required",
+  );
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+  assert.equal((await runLiveOperation({ ...fixture.common, operation: "teardown", processEnvironment: {} }, fixture.dependencies)).cleanupComplete, true);
+});
+
+test("worker-deployed teardown still requires an active ownership lease", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const journal = structuredClone(fixture.journal);
+  journal.lease!.active = false;
+
+  await assert.rejects(
+    runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+    (error: any) => error?.message === "active ownership lease is required",
+  );
+});
+
+test("worker-deployed teardown still refuses a changed identity revision", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+
+  await assert.rejects(
+    runStackTeardown({ ...directTeardownOptions(structuredClone(fixture.journal), fixture.revision), inspectRevision: async () => "changed" }),
+    (error: any) => error?.message === "last-write identity changed",
+  );
+});
+
+test("worker-deployed teardown still refuses resource ownership by another run or owner", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const wrongRun = structuredClone(fixture.journal);
+  wrongRun.resources[0]!.runId = "another-run";
+  const wrongOwner = structuredClone(fixture.journal);
+  wrongOwner.resources[0]!.owner = "another-owner";
+
+  for (const journal of [wrongRun, wrongOwner]) {
+    await assert.rejects(
+      runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+      (error: any) => error?.message === "journal resource identity mismatch",
+    );
+  }
+});
+
+test("worker-deployed teardown still requires every resource domain authority", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const journal = structuredClone(fixture.journal);
+  journal.resources = journal.resources.filter((resource: any) => resource.domain !== "credential");
+
+  await assert.rejects(
+    runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+    (error: any) => error?.message === "missing credential teardown authority",
+  );
+});
+
+test("teardown completes from schema-expanded", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "schema-expanded");
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "schema-expanded");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});
+
+test("teardown completes from bookmark-captured", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "bookmark-captured");
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "bookmark-captured");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});
+
+for (const phase of ["resources-ready", "alias-live"] as const) {
+  test(`teardown completes from ${phase}`, async (t) => {
+    const fixture = await postWriteTeardownFixture(t, phase);
+    assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, phase);
+
+    const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+    assert.equal(result.cleanupComplete, true);
+    assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+  });
+}
+
+for (const { name, exposures } of [
+  {
+    name: "teardown retries a stale route absence read",
+    exposures: [{ enabled: false }, { enabled: true }, { enabled: false }, { enabled: false }],
+  },
+  {
+    name: "teardown retries a stale exposure dependent before removing the worker",
+    exposures: [{ enabled: false }, { enabled: false }, { enabled: true }, { enabled: false }],
+  },
+]) {
+  test(name, async (t) => {
+    const fixture = await postWriteTeardownFixture(t);
+    const exposure = statefulExposureTokenClient(exposures);
+    const timers = immediateRetryTimers();
+
+    const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, {
+      ...fixture.dependencies,
+      tokenClientFactory: () => exposure.tokenClient,
+      setTimer: timers.setTimer,
+      clearTimer: timers.clearTimer,
+    });
+
+    assert.equal(result.cleanupComplete, true);
+    assert.equal(exposure.reads(), 4);
+    assert.equal(timers.delays.length, 1);
+  });
+}
+
+test("teardown preserves a failed acceptance result from a verified journal", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const plan = createSyntheticFixturePlan({ runId: fixture.journal.runId, organizerToken: "organizer-synthetic", preFixtureBookmark: "bookmark-synthetic" });
+  await assert.rejects(runDeployedAcceptance({
+    origin,
+    journal: fixture.journal,
+    plan,
+    organizerToken: "organizer-synthetic",
+    persistJournal: (journal: any) => saveJournal(fixture.journalPath, journal),
+    inspectFixtures: async () => ({ complete: false, count: 0 }),
+    seedFixtures: async () => { throw new Error("synthetic acceptance failure"); },
+    fetch: async () => assert.fail("HTTP must not run after fixture failure"),
+    buildLiveCommand: () => assert.fail("live command must not be built after fixture failure"),
+  }), /fixture seed failed; run requires quarantine/);
+  assert.equal(fixture.journal.phase, "verified");
+  assert.equal(fixture.journal.acceptance?.status, "failed");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(journal.acceptance.status, "failed");
+  assert.equal(journal.acceptance.cleanupComplete, true);
+});
+
+test("worker-deployed teardown with an absent worker still requires deleted_classes proof", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "worker-deployed", "reconciled");
+  const deployedJournal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(deployedJournal.mutations.find((item: any) => item.kind === "durable-object-create")?.status, "applied");
+  fixture.removeWorker();
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+    (error: any) => error?.message === "Durable Object absence is unproven without the deleted_classes lifecycle",
+  );
+});
+
 test("credentialed preflight calls no mutation and its public result contains no target identity", async (t) => {
   const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-private-"));
   t.after(() => rm(privateDirectory, { recursive: true, force: true }));
@@ -820,6 +1335,54 @@ test("teardown revokes a journal-owned run-minted token without revoking the bor
   assert.equal((await tokenClient.inspect()).active, true);
 });
 
+test("verification fails an inactive origin after one read without scheduling a retry", async (t) => {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-inactive-origin-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-inactive-origin-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const journal = createJournal({ runId: "run-inactive-origin", owner: "owner-inactive-origin", sourceSha, identity: stagingInventory.staging });
+  journal.phase = "alias-live";
+  journal.preflight = { protectedRevision: createIdentityRevision({ accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] }), targetRevision: "synthetic", operatorTokenPresent: true };
+  journal.config = { activeDigest: "f".repeat(64) };
+  journal.resources.push({ domain: "route", id: "workers-dev-inactive", runId: journal.runId, owner: journal.owner, status: "owned" });
+  await saveJournal(journalPath, journal);
+
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => [{ uuid: databaseId, name: stagingInventory.staging.databaseName }],
+    deploymentsList: async () => [{ id: "deployment-inactive", script_name: workerName }],
+    versionsList: async () => [],
+    secretList: async () => [],
+  };
+  const exposure = statefulExposureTokenClient([{ enabled: false }]);
+  let scheduledTimers = 0;
+
+  await assert.rejects(runLiveOperation({
+    root: testRoot,
+    operation: "verify",
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
+  }, {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => exposure.tokenClient,
+    setTimer: () => { scheduledTimers += 1; return scheduledTimers; },
+    clearTimer: () => {},
+  }), /authenticated workers\.dev exposure is inactive/);
+
+  assert.equal(exposure.reads(), 1);
+  assert.equal(scheduledTimers, 0);
+});
+
 test("apply failure after D1 identity assignment records an incident, quarantines, and rethrows", async (t) => {
   const fixture = await failedApplyFixture(t);
   await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error) => error === fixture.applyFailure);
@@ -860,7 +1423,209 @@ test("apply failure marks quarantineFailed and warns that the origin must be tre
   assert.equal(fixture.quarantineInspections(), 1);
 });
 
-test("preview-only exposure fails quarantine absence proof", async (t) => {
+test("quarantine reconciles a lost disable response after one confirmation read", async (t) => {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-quarantine-reconcile-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-quarantine-reconcile-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const activeConfigDigest = "d".repeat(64);
+  const journal = createJournal({ runId: "run-quarantine-reconcile", owner: "owner-quarantine-reconcile", sourceSha, identity: stagingInventory.staging });
+  journal.phase = "verified";
+  journal.preflight = { protectedRevision: createIdentityRevision({ accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] }), targetRevision: "synthetic", operatorTokenPresent: true };
+  journal.config = { activeDigest: activeConfigDigest };
+  journal.acceptance = { status: "passed", cleanupComplete: false };
+  journal.acceptanceEvidence = createEvidenceEnvelope({
+    runId: journal.runId,
+    sourceSha: journal.sourceSha,
+    phase: journal.phase,
+    outcomes: { acceptance: true },
+    counts: {},
+  });
+  journal.resources.push({ domain: "route", id: "workers-dev-reconcile", runId: journal.runId, owner: journal.owner, status: "owned" });
+  await saveJournal(journalPath, journal);
+
+  let deploymentId = "deployment-before";
+  let deployCalls = 0;
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => [{ uuid: databaseId, name: stagingInventory.staging.databaseName }],
+    deploymentsList: async () => [{ id: deploymentId, script_name: workerName }],
+    versionsList: async () => [],
+    secretList: async () => [],
+    deploy: async () => {
+      deployCalls += 1;
+      deploymentId = "deployment-after";
+      throw new Error("synthetic disable response loss");
+    },
+  };
+  const exposure = statefulExposureTokenClient([{ enabled: true }, { enabled: false }]);
+
+  const result = await runLiveOperation({
+    root: testRoot,
+    operation: "verify",
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
+  }, {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => exposure.tokenClient,
+    fetch: async () => Response.json({
+      sourceSha,
+      configDigest: activeConfigDigest,
+      lifecycle: "legacy-sqlite-v1",
+      bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"],
+    }),
+    setTimer: () => assert.fail("a proven absence must not schedule a retry"),
+  });
+
+  const saved = JSON.parse(await readFile(journalPath, "utf8"));
+  assert.equal(result.phase, "quarantined");
+  assert.equal(exposure.reads(), 2);
+  assert.equal(deployCalls, 1);
+  assert.equal(saved.mutations.find((item: any) => item.kind === "workers-dev-disable")?.status, "applied");
+  assert.equal(saved.phase, "quarantined");
+});
+
+test("an unconfirmable quarantine is recorded and can still be torn down", async (t) => {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-unconfirmed-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-unconfirmed-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const activeConfigDigest = "e".repeat(64);
+  const revision = createIdentityRevision({ accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] });
+  const journal = createJournal({ runId: "run-unconfirmed", owner: "owner-unconfirmed", sourceSha, identity: stagingInventory.staging });
+  journal.phase = "verified";
+  journal.preflight = { protectedRevision: revision, targetRevision: revision, operatorTokenPresent: true };
+  journal.lease = { active: true, runId: journal.runId, owner: journal.owner, revision };
+  journal.config = { activeDigest: activeConfigDigest };
+  journal.acceptance = { status: "passed", cleanupComplete: false };
+  journal.acceptanceEvidence = createEvidenceEnvelope({
+    runId: journal.runId,
+    sourceSha: journal.sourceSha,
+    phase: journal.phase,
+    outcomes: { acceptance: true },
+    counts: {},
+  });
+  for (const [domain, id] of [
+    ["route", "workers-dev-unconfirmed"], ["hostname", "hostname-unconfirmed"],
+    ["credential", "credential-unconfirmed"], ["secret", "secret-unconfirmed"],
+    ["worker", workerName], ["durable-object", "durable-unconfirmed"], ["d1", databaseId],
+  ] as const) journal.resources.push({ domain, id, runId: journal.runId, owner: journal.owner, status: "owned" });
+  journal.mutations.push({ kind: "durable-object-create", domain: "durable-object", id: "durable-unconfirmed", status: "applied" });
+  await saveJournal(journalPath, journal);
+
+  const state = { exposureEnabled: true, rateLimited: true, exposureSequence: [] as boolean[], workerPresent: true, databasePresent: true, deploymentSequence: 1 };
+  const deployments = () => state.workerPresent ? [{ id: `deployment-${state.deploymentSequence}`, script_name: workerName }] : [];
+  const adapterFactory = ({ configPath }: { configPath?: string }) => ({
+    whoami: async () => ({ accountId }),
+    d1List: async () => state.databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
+    deploymentsList: async () => deployments(),
+    versionsList: async () => [],
+    secretList: async () => [],
+    d1Execute: async () => [{ success: true, results: [{ count: 0 }] }],
+    deploy: async () => {
+      assert.ok(configPath);
+      state.workerPresent = true;
+      state.deploymentSequence += 1;
+    },
+    deleteWorker: async () => { state.workerPresent = false; },
+    d1Delete: async () => { state.databasePresent = false; },
+  });
+  let exposureReadCount = 0;
+  const exposureClient = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    // The first read is quarantine's enabledBefore check; every read after it is the absence
+    // proof, and those hit a real 429 Response so the rate-limit path runs through the actual
+    // client error shape rather than a fabricated error object.
+    fetch: async () => {
+      exposureReadCount += 1;
+      if (state.rateLimited && exposureReadCount > 1) return new Response(null, { status: 429 });
+      return Response.json({ success: true, result: { enabled: state.exposureSequence.shift() ?? state.exposureEnabled, previews_enabled: false } });
+    },
+  });
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectWorkersDev: exposureClient.inspectWorkersDev,
+  };
+  const timers = immediateRetryTimers();
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory,
+    tokenClientFactory: () => tokenClient,
+    fetch: async () => Response.json({
+      sourceSha,
+      configDigest: activeConfigDigest,
+      lifecycle: "legacy-sqlite-v1",
+      bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"],
+    }),
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  };
+
+  // verify must refuse rather than report success over an origin it could not prove closed --
+  // the incident is still recorded, and the run stays closeable by teardown.
+  await assert.rejects(
+    runLiveOperation({ ...common, operation: "verify" }, dependencies),
+    /origin absence could not be confirmed/,
+  );
+  const afterQuarantine = JSON.parse(await readFile(journalPath, "utf8"));
+  assert.equal(afterQuarantine.phase, "verified");
+  assert.equal(exposureReadCount, 2);
+  assert.deepEqual(afterQuarantine.incident.originAbsence, {
+    status: "could-not-confirm",
+    checkedAt: "2030-01-01T12:00:00.000Z",
+    attempts: 1,
+    disableFailed: false,
+  });
+  assert.equal(afterQuarantine.incident.quarantineFailed, undefined);
+  assert.notEqual(afterQuarantine.phase, "quarantined");
+  assert.equal(afterQuarantine.mutations.find((item: any) => item.kind === "workers-dev-disable")?.status, "pending");
+
+  state.exposureEnabled = false;
+  state.rateLimited = false;
+  const tornDown = await runLiveOperation({ ...common, operation: "teardown" }, dependencies);
+  assert.equal(tornDown.phase, "cleanup-complete");
+  assert.equal(tornDown.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(journalPath, "utf8")).phase, "cleanup-complete");
+
+  const readsBeforeAbsenceCheck = exposureReadCount;
+  const timersBeforeAbsenceCheck = timers.delays.length;
+  state.exposureSequence.push(true, false);
+  const delayed = await runLiveOperation({ ...common, operation: "absence-check" }, dependencies);
+  assert.equal(delayed.passed, true);
+  assert.equal(exposureReadCount, readsBeforeAbsenceCheck + 2);
+  assert.equal(timers.delays.length, timersBeforeAbsenceCheck + 1);
+});
+
+test("preview-only exposure remains an unproven quarantine absence", async (t) => {
   const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-preview-private-"));
   const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-preview-root-"));
   t.after(() => rm(privateDirectory, { recursive: true, force: true }));
@@ -900,6 +1665,7 @@ test("preview-only exposure fails quarantine absence proof", async (t) => {
     listWorkerDomains: async () => [],
     inspectWorkersDev: exposureClient.inspectWorkersDev,
   };
+  const timers = immediateRetryTimers();
   const dependencies = {
     sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
     adapterFactory: () => adapter,
@@ -910,6 +1676,9 @@ test("preview-only exposure fails quarantine absence proof", async (t) => {
       lifecycle: "legacy-sqlite-v1",
       bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"],
     }),
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
   };
   await assert.rejects(runLiveOperation({
     root: testRoot,
@@ -921,6 +1690,12 @@ test("preview-only exposure fails quarantine absence proof", async (t) => {
     owner: journal.owner,
     processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
   }, dependencies), /origin quarantine absence proof failed/);
+  // A preview hostname that stays enabled across the whole attempt ladder is present, not
+  // unknown, so this stays the hard refusal it always was -- the retry removes the stale-read
+  // false negative without softening a genuinely live origin into an incident note.
+  const saved = JSON.parse(await readFile(journalPath, "utf8"));
+  assert.equal(saved.phase, "verified");
+  assert.equal(saved.incident?.originAbsence, undefined);
   assert.equal(deployCalls, 1);
 });
 
@@ -1109,4 +1884,74 @@ test("mocked live boundaries complete plan through teardown in dependency order 
   assert.doesNotMatch(finalJournal, /organizer-synthetic|synthetic-cloud-token|ssssssssssssssssssssssssssssssss/);
   const evidence = await readFile(`${journalPath}.evidence.json`, "utf8");
   assert.doesNotMatch(evidence, new RegExp(`${accountId}|${databaseId}|${workerName}|${origin}`));
+});
+
+test("the active-origin assertion stays a single read and never retries", async () => {
+  // Retrying an absence proof removes a false negative. Retrying this assertion would do
+  // the opposite: assertActiveOrigin proves the origin IS live before acceptance runs, so a
+  // retry would paper over a genuinely dead origin until it happened to answer. Pin the
+  // asymmetry in source, because a future edit "fixing" this the same way would be silent.
+  const source = await readFile(new URL("../../../tools/cloudflare/live-driver.mjs", import.meta.url), "utf8");
+  const assertion = source.slice(source.indexOf("const assertActiveOrigin"));
+  const body = assertion.slice(0, assertion.indexOf("\n  };"));
+  assert.match(body, /await workersDevEnabled\(/);
+  assert.doesNotMatch(body, /confirmWorkersDevAbsence|confirmAbsence/);
+});
+
+test("an unowned environment-suffixed Worker blocks cleanup completion and is never deleted", async () => {
+  // wrangler's secret family once resolved --name plus --env into "<name>-staging", creating a
+  // Worker the journal never owned. Argument composition prevents that now. The account-wide
+  // revision guard catches one created DURING a run, but an orphan left by a PREVIOUS run sits
+  // in the preflight baseline and trips nothing -- so teardown would report cleanup complete
+  // right past it. The journal is authority to delete only what it owns, so this refuses and
+  // reports rather than sweeping an unowned resource.
+  const inventory = { staging: { accountId } } as any;
+  const journal = { identity: { workerName } } as any;
+
+  await assert.rejects(
+    assertNoEnvironmentSuffixedWorker(inventory, journal, { listWorkerScripts: async () => [{ name: `${workerName}-staging` }] }),
+    (error: any) => error?.message === "unowned environment-suffixed Worker blocks cleanup completion",
+  );
+
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, { listWorkerScripts: async () => [{ name: workerName }, { name: "unrelated" }] });
+});
+
+test("teardown proves the near-miss refusal runs before it records cleanup complete", async () => {
+  const source = await readFile(new URL("../../../tools/cloudflare/live-driver.mjs", import.meta.url), "utf8");
+  const guard = source.indexOf("await assertNoEnvironmentSuffixedWorker(");
+  const completion = source.indexOf('journal.phase = "cleanup-complete"', guard);
+  assert.ok(guard > 0, "teardown must call the near-miss refusal");
+  assert.ok(completion > guard, "the refusal must run before cleanup-complete is recorded");
+});
+
+test("early-phase teardown refuses to delete a same-named Worker this run never deployed", async (t) => {
+  // The widened teardown entry accepts phases reached before the Worker is deployed. A Worker is
+  // matched by name alone, and inspectResource can only stamp the journal's own identity onto
+  // whatever is remotely present, so recovery's ownership check compares the journal against
+  // itself. Without this guard a run that crashed at resources-ready would delete a Worker a
+  // LATER run created at the same name -- in a shared account, someone else's live Worker.
+  const fixture = await postWriteTeardownFixture(t, "resources-ready");
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.phase, "resources-ready");
+  assert.equal(journal.mutations.some((item: any) => item.kind === "worker-deploy" && item.status === "applied"), false);
+
+  // A Worker exists at the run's name -- created by some LATER run, not this one.
+  let deleted = 0;
+  const base = fixture.dependencies.adapterFactory();
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...base,
+      deploymentsList: async () => [{ id: "deployment-from-another-run", script_name: workerName }],
+      versionsList: async () => [],
+      deleteWorker: async () => { deleted += 1; },
+    }),
+  };
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, dependencies),
+    /remote Worker predates this run's deployment; refusing to remove it/,
+  );
+  assert.equal(deleted, 0);
+  assert.notEqual(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
 });

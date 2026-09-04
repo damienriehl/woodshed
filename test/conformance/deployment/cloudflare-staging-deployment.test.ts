@@ -11,6 +11,7 @@ import {
   assertCredentialedPreflight,
   assertSharedAccountInventory,
   assertSchemaInvariants,
+  composeWranglerArgs,
   createWranglerAdapter,
   persistAssignedDatabaseIdentity,
   reconcileMigrationLedger,
@@ -48,7 +49,24 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.deepEqual(await adapter.json(["secret", "list"], { workerName: "woodshed-staging-run-a" }), [{ id: "safe" }]);
   await adapter.secretPut("LIVE_COMMAND_SECRET", "r".repeat(32), { workerName: "woodshed-staging-run-a" });
   assert.equal(calls[0].file, "/repo/node_modules/.bin/wrangler");
-  assert.deepEqual(calls[0].args.slice(-4), ["--config", "/repo/deploy/cloudflare/wrangler.jsonc", "--env", "staging"]);
+  const composition = {
+    envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+    configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+  };
+  assert.deepEqual(calls[0].args, composeWranglerArgs({
+    args: ["d1", "list", "--json"],
+    ...composition,
+  }));
+  assert.deepEqual(calls[1].args, composeWranglerArgs({
+    args: ["secret", "list", "--name", "woodshed-staging-run-a", "--format", "json"],
+    ...composition,
+    suppressEnv: true,
+  }));
+  assert.deepEqual(calls[2].args, composeWranglerArgs({
+    args: ["secret", "put", "LIVE_COMMAND_SECRET", "--name", "woodshed-staging-run-a"],
+    ...composition,
+    suppressEnv: true,
+  }));
   assert.equal(calls[0].options.shell, false);
   assert.equal((calls[0].options as any).env.CLOUDFLARE_API_TOKEN, "private-token");
   assert.equal((calls[0].options as any).env.HOME, "/repo/.cloudflare-staging/wrangler-home");
@@ -61,6 +79,83 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.equal((adapter as any).invoke, undefined);
   await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
   await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
+});
+
+test("Worker commands use the Wrangler name resolver appropriate to their command family", async () => {
+  const calls: any[] = [];
+  const workerName = "woodshed-staging-synthetic";
+  const configPath = "/repo/.cloudflare-staging/run-safe/wrangler.json";
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    configPath,
+    spawn: async (file: string, args: string[], options: object) => {
+      calls.push({ file, args, options });
+      return { exitCode: 0, stdout: "[]", stderr: "" };
+    },
+  });
+
+  await adapter.deploy(workerName);
+  await adapter.deleteWorker(workerName);
+  await adapter.deploymentsList(workerName);
+  await adapter.versionsList(workerName);
+  await adapter.secretPut("LIVE_COMMAND_SECRET", "r".repeat(32), { workerName });
+  await adapter.secretDelete("LIVE_COMMAND_SECRET", workerName);
+  await adapter.secretList(workerName);
+  await adapter.json(["secret", "list"], { workerName });
+
+  for (const call of calls) {
+    const nameIndex = call.args.indexOf("--name");
+    const configIndex = call.args.indexOf("--config");
+    assert.equal(call.args[nameIndex + 1], workerName);
+    assert.equal(call.args[configIndex + 1], configPath);
+  }
+
+  // Wrangler's getScriptName resolves --name plus --env to the explicit, unsuffixed Worker name.
+  for (const call of calls.slice(0, 4)) {
+    assert.deepEqual(call.args.slice(call.args.indexOf("--env"), call.args.indexOf("--env") + 2), ["--env", "staging"]);
+  }
+  for (const call of calls.slice(4)) {
+    assert.equal(call.args.includes("--env"), false);
+    assert.equal(call.args.includes("-e"), false);
+  }
+});
+
+test("Wrangler argument composition rejects environment flags for secret-family commands", () => {
+  for (const environmentArgs of [["--env", "staging"], ["-e", "staging"]]) {
+    assert.throws(() => composeWranglerArgs({
+      args: ["secret", "list", "--name", "woodshed-staging-synthetic", ...environmentArgs],
+      envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+      configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+      suppressEnv: true,
+    }), /secret-family Wrangler invocation must not include an environment flag/);
+  }
+});
+
+test("Wrangler argument composition requires an explicit Worker name for secret-family commands", () => {
+  // Without --name, wrangler falls through to the config's top-level name, which is a
+  // different Worker entirely. Suppressing --env alone would not catch that.
+  assert.throws(() => composeWranglerArgs({
+    args: ["secret", "list"],
+    envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+    configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+    suppressEnv: true,
+  }), /secret-family Wrangler invocation must name its Worker explicitly/);
+});
+
+test("Wrangler adapter retains its caller-supplied environment and config flag guard", async () => {
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 0, stdout: "[]", stderr: "" }),
+  });
+
+  for (const flag of ["--config", "--env", "-c", "-e"]) {
+    await assert.rejects(
+      adapter.d1Execute("woodshed-staging-synthetic-db", { command: flag }),
+      /Wrangler environment selection is owned by the staging adapter/,
+    );
+  }
 });
 
 test("adapter does not suppress Wrangler structured output", async () => {
@@ -181,8 +276,30 @@ test("live Wrangler methods remain staging-scoped, bounded, and keep credentials
   await adapter.deleteWorker("woodshed-staging-synthetic");
   await adapter.d1Delete("woodshed-staging-synthetic-db");
 
-  for (const call of calls) {
-    assert.deepEqual(call.args.slice(-4), ["--config", "/repo/.cloudflare-staging/run-safe/wrangler.json", "--env", "staging"]);
+  const expectedBaseArgs = [
+    ["whoami", "--account", "a".repeat(32)],
+    ["d1", "list", "--json"],
+    ["deployments", "list", "--name", "woodshed-staging-synthetic", "--json"],
+    ["versions", "list", "--name", "woodshed-staging-synthetic", "--json"],
+    ["secret", "list", "--name", "woodshed-staging-synthetic", "--format", "json"],
+    ["d1", "create", "woodshed-staging-synthetic-db"],
+    ["d1", "time-travel", "info", "woodshed-staging-synthetic-db", "--json"],
+    ["d1", "execute", "woodshed-staging-synthetic-db", "--remote", "--json", "--command", "SELECT 1"],
+    ["d1", "migrations", "apply", "woodshed-staging-synthetic-db", "--remote"],
+    ["deploy", "--name", "woodshed-staging-synthetic"],
+    ["secret", "delete", "LIVE_COMMAND_SECRET", "--name", "woodshed-staging-synthetic"],
+    ["delete", "--name", "woodshed-staging-synthetic"],
+    ["d1", "delete", "woodshed-staging-synthetic-db", "--skip-confirmation"],
+  ];
+  for (const [index, args] of expectedBaseArgs.entries()) {
+    const call = calls[index];
+    assert.ok(call);
+    assert.deepEqual(call.args, composeWranglerArgs({
+      args,
+      envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+      configPath: "/repo/.cloudflare-staging/run-safe/wrangler.json",
+      suppressEnv: args[0] === "secret",
+    }));
     assert.equal(call.options.shell, false);
     assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, "private-token-value");
     assert.equal(call.options.env.CLOUDFLARE_ACCOUNT_ID, "a".repeat(32));
@@ -447,4 +564,48 @@ test("deployment response loss is reconciled only after durable intent and remot
   });
   assert.equal(result.deployment, deployed);
   assert.deepEqual(events, ["persist:pending", "deploy", "inspect-deployment", "verify-deployment", "persist:applied", "persist:applied"]);
+});
+
+test("the pinned Wrangler still resolves worker names the way the secret-family fix assumes", async () => {
+  // The secret family suppresses --env because wrangler resolves those commands through
+  // getLegacyScriptName, which appends the environment to --name, while deploy/delete/
+  // deployments/versions use getScriptName, which does not (cloudflare/workers-sdk#12300).
+  // That asymmetry is an upstream bug, not a contract -- so pin it. If a wrangler upgrade
+  // changes either resolver, this fails and someone re-derives whether suppressEnv is still
+  // right, instead of the driver silently addressing the wrong Worker again.
+  const { version } = JSON.parse(await readFile(new URL("../../../node_modules/wrangler/package.json", import.meta.url), "utf8"));
+  assert.equal(version, "4.28.1", "wrangler moved; re-check both name resolvers before changing this pin");
+
+  const bundle = await readFile(new URL("../../../node_modules/wrangler/wrangler-dist/cli.js", import.meta.url), "utf8");
+  const bodyOf = (name: string) => {
+    const start = bundle.indexOf(`function ${name}(args, config) {`);
+    assert.ok(start > 0, `${name} not found in the wrangler bundle`);
+    return bundle.slice(start, bundle.indexOf("\n}", start));
+  };
+
+  // deploy/delete/deployments/versions: --name wins outright, no environment suffix.
+  assert.match(bodyOf("getScriptName"), /return args\.name \?\? config\.name;/);
+  // secret put/list/delete and tail: --name plus --env becomes "<name>-<env>".
+  assert.match(bodyOf("getLegacyScriptName"), /args\.name && args\.env && isLegacyEnv\(config\)/);
+  assert.match(bodyOf("getLegacyScriptName"), /\$\{args\.name\}-\$\{args\.env\}/);
+});
+
+test("every Cloudflare tool export has a declaration in its .d.mts sibling", async () => {
+  // These modules are typed by hand-maintained sibling declarations, and typecheck only notices
+  // a missing one if some test happens to import the symbol. A review caught isSecretFamily
+  // exported with no declaration; this makes the next omission fail mechanically instead.
+  const modules = ["deployment", "journal", "live-driver", "recovery", "inventory", "evidence", "migrations"];
+  const missing: string[] = [];
+  for (const name of modules) {
+    const sourceUrl = new URL(`../../../tools/cloudflare/${name}.mjs`, import.meta.url);
+    const declarationUrl = new URL(`../../../tools/cloudflare/${name}.d.mts`, import.meta.url);
+    let declaration: string;
+    try { declaration = await readFile(declarationUrl, "utf8"); } catch { continue; }
+    const source = await readFile(sourceUrl, "utf8");
+    for (const match of source.matchAll(/^export\s+(?:async\s+)?(?:function|const|class)\s+([A-Za-z0-9_$]+)/gm)) {
+      const symbol = match[1]!;
+      if (!new RegExp(`\\b${symbol}\\b`).test(declaration)) missing.push(`${name}.mjs: ${symbol}`);
+    }
+  }
+  assert.deepEqual(missing, [], `exports without a .d.mts declaration: ${missing.join(", ")}`);
 });
