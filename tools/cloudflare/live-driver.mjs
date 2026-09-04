@@ -1454,6 +1454,11 @@ async function teardownOperation(options, dependencies) {
     intent.status = "applied";
     await persist(options.journalPath, journal);
   };
+  // Refuse before ANY removal, not per-domain: RESOURCE_ORDER processes the route first, and
+  // that branch redeploys this run's config over whatever Worker is present. A per-resource
+  // guard would fire only after that mutation had already landed on a foreign Worker.
+  assertRunDeployedIt(await workerExists());
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   const result = await runStackTeardown({
     journal,
     lease: journal.lease,

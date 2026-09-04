@@ -589,3 +589,23 @@ test("the pinned Wrangler still resolves worker names the way the secret-family 
   assert.match(bodyOf("getLegacyScriptName"), /args\.name && args\.env && isLegacyEnv\(config\)/);
   assert.match(bodyOf("getLegacyScriptName"), /\$\{args\.name\}-\$\{args\.env\}/);
 });
+
+test("every Cloudflare tool export has a declaration in its .d.mts sibling", async () => {
+  // These modules are typed by hand-maintained sibling declarations, and typecheck only notices
+  // a missing one if some test happens to import the symbol. A review caught isSecretFamily
+  // exported with no declaration; this makes the next omission fail mechanically instead.
+  const modules = ["deployment", "journal", "live-driver", "recovery", "inventory", "evidence", "migrations"];
+  const missing: string[] = [];
+  for (const name of modules) {
+    const sourceUrl = new URL(`../../../tools/cloudflare/${name}.mjs`, import.meta.url);
+    const declarationUrl = new URL(`../../../tools/cloudflare/${name}.d.mts`, import.meta.url);
+    let declaration: string;
+    try { declaration = await readFile(declarationUrl, "utf8"); } catch { continue; }
+    const source = await readFile(sourceUrl, "utf8");
+    for (const match of source.matchAll(/^export\s+(?:async\s+)?(?:function|const|class)\s+([A-Za-z0-9_$]+)/gm)) {
+      const symbol = match[1]!;
+      if (!new RegExp(`\\b${symbol}\\b`).test(declaration)) missing.push(`${name}.mjs: ${symbol}`);
+    }
+  }
+  assert.deepEqual(missing, [], `exports without a .d.mts declaration: ${missing.join(", ")}`);
+});
