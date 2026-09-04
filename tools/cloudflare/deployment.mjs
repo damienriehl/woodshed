@@ -34,6 +34,10 @@ const WORKER_JSON_COMMANDS = new Map([
   ["secret list", ["--format", "json"]],
 ]);
 
+export function isSecretFamily(args) {
+  return Array.isArray(args) && args[0] === "secret";
+}
+
 export function composeWranglerArgs({ args, envFilePath, configPath, suppressEnv = false }) {
   const completeArgs = [
     ...args,
@@ -41,7 +45,7 @@ export function composeWranglerArgs({ args, envFilePath, configPath, suppressEnv
     "--config", configPath,
     ...(suppressEnv ? [] : ["--env", "staging"]),
   ];
-  if (completeArgs[0] === "secret") {
+  if (isSecretFamily(completeArgs)) {
     // Wrangler resolves secret commands through getLegacyScriptName, which appends the
     // environment to --name. Suppressing --env is only half the guarantee: with no
     // --name it falls through to the config's top-level name, a different Worker.
@@ -114,11 +118,13 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
   // Wrangler "none"/"error" suppress --json payloads and the [code: ...] stderr needed for not-found tolerance.
   Object.assign(childEnv, { HOME: isolatedHome, XDG_CONFIG_HOME: isolatedHome, CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false", CLOUDFLARE_INCLUDE_PROCESS_ENV: "false", WRANGLER_LOG: "log", WRANGLER_LOG_PATH: path.join(root, ".cloudflare-staging", "wrangler.log"), WRANGLER_SEND_METRICS: "false" });
   if (accountId) childEnv.CLOUDFLARE_ACCOUNT_ID = accountId;
-  async function invoke(args, { input, allowNotFound = false, suppressEnv = false } = {}) {
+  async function invoke(args, { input, allowNotFound = false } = {}) {
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) throw new Error("Wrangler arguments must be strings");
     if (args.includes("--config") || args.includes("--env") || args.includes("-c") || args.includes("-e")) throw new Error("Wrangler environment selection is owned by the staging adapter");
     if (args.some((arg) => /(?:route|domain|dns)/i.test(arg))) throw new Error("route mutation commands are not supported");
-    const completeArgs = composeWranglerArgs({ args, envFilePath: emptyEnvironment, configPath: config, suppressEnv });
+    // Derived here, not asked of callers: a fifth secret subcommand added later would otherwise
+    // have to remember, and forgetting is precisely the defect this suppression exists to fix.
+    const completeArgs = composeWranglerArgs({ args, envFilePath: emptyEnvironment, configPath: config, suppressEnv: isSecretFamily(args) });
     const executionOptions = {
       cwd: root, env: childEnv,
       input, timeoutMs, killGraceMs, maxOutputBytes, shell: false,
@@ -135,11 +141,7 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
   }
   async function workerJson(command, workerName) {
     if (!safeWorkerName(workerName)) throw new Error("safe staging Worker name is required");
-    const secretFamily = command[0] === "secret";
-    const result = await invoke([...command, "--name", workerName, ...(secretFamily ? ["--format", "json"] : ["--json"])], {
-      allowNotFound: true,
-      ...(secretFamily ? { suppressEnv: true } : {}),
-    });
+    const result = await invoke([...command, "--name", workerName, ...(isSecretFamily(command) ? ["--format", "json"] : ["--json"])], { allowNotFound: true });
     return parseJson(result.stdout);
   }
   const adapter = {
@@ -151,13 +153,13 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
         structuredArgs = ["--name", workerName, ...WORKER_JSON_COMMANDS.get(key)];
       }
       if (!structuredArgs) throw new Error("Wrangler command is not allowlisted");
-      const result = await invoke([...args, ...structuredArgs], key === "secret list" ? { suppressEnv: true } : {});
+      const result = await invoke([...args, ...structuredArgs]);
       return parseJson(result.stdout);
     },
     async secretPut(name, value, { workerName } = {}) {
       if (name !== "LIVE_COMMAND_SECRET" || typeof value !== "string" || value.length < 32) throw new Error("valid root secret is required");
       if (!safeWorkerName(workerName)) throw new Error("safe staging Worker name is required");
-      return invoke(["secret", "put", name, "--name", workerName], { input: value, suppressEnv: true });
+      return invoke(["secret", "put", name, "--name", workerName], { input: value });
     },
     async whoami(accountId) {
       if (typeof accountId !== "string" || !/^[a-f0-9]{32}$/i.test(accountId)) throw new Error("valid staging account identity is required");
@@ -208,7 +210,7 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
     },
     async secretDelete(name, workerName) {
       if (name !== "LIVE_COMMAND_SECRET" || !safeWorkerName(workerName)) throw new Error("safe staging secret identity is required");
-      return invoke(["secret", "delete", name, "--name", workerName], { suppressEnv: true });
+      return invoke(["secret", "delete", name, "--name", workerName]);
     },
   };
   return Object.freeze(adapter);

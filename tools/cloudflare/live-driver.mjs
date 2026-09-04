@@ -49,6 +49,9 @@ function requiredString(value, label) {
   return value;
 }
 
+const defaultSetTimer = (callback, delay) => setTimeout(callback, delay);
+const defaultClearTimer = (handle) => clearTimeout(handle);
+
 function confirmation(outcome, attempts, checkedAt, lastError = null) {
   return { outcome, attempts, checkedAt: checkedAt.toISOString(), lastError };
 }
@@ -70,10 +73,10 @@ function waitForRetry(delay, setTimer, clearTimer) {
 }
 
 export async function confirmAbsence(probe, {
-  setTimer = (callback, delay) => setTimeout(callback, delay),
-  clearTimer = (handle) => clearTimeout(handle),
+  setTimer = defaultSetTimer,
+  clearTimer = defaultClearTimer,
   now = () => new Date(),
-  attempts: attemptLimit = 8,
+  maxAttempts: attemptLimit = 8,
   initialDelayMs = 500,
   factor = 2,
   maxDelayMs = 8_000,
@@ -775,8 +778,8 @@ function defaultDependencies(overrides = {}) {
     sourceState: overrides.sourceState,
     acceptance: overrides.acceptance ?? runDeployedAcceptance,
     now: overrides.now ?? (() => new Date()),
-    setTimer: overrides.setTimer ?? ((callback, delay) => setTimeout(callback, delay)),
-    clearTimer: overrides.clearTimer ?? ((handle) => clearTimeout(handle)),
+    setTimer: overrides.setTimer ?? defaultSetTimer,
+    clearTimer: overrides.clearTimer ?? defaultClearTimer,
   };
 }
 
@@ -1050,10 +1053,7 @@ async function applyWithIncidentCapture(options, dependencies) {
         const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
         const privateAdapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: privateConfig.configPath });
         const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
-        await quarantine({
-          adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
-          fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
-        });
+        await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
       }
     } catch {
       quarantineFailed = true;
@@ -1068,7 +1068,12 @@ async function applyWithIncidentCapture(options, dependencies) {
   }
 }
 
-async function quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath, fetch, setTimer, clearTimer, now }) {
+async function quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory }) {
+  // journalPath and the clock/fetch seams are always options.X / dependencies.X; only the
+  // adapters and the journal differ per call site. Threading them explicitly grew this
+  // signature to ten parameters and duplicated the same four lines at all three callers.
+  const journalPath = options.journalPath;
+  const { fetch, setTimer, clearTimer, now } = dependencies;
   const enabledBefore = await workersDevEnabled(inventory, journal, tokenClient);
   let intent = journal.mutations.find((item) => item?.kind === "workers-dev-disable");
   if (!intent) {
@@ -1132,10 +1137,7 @@ async function verifyOperation(options, dependencies) {
   if (journal.phase === "verified") {
     const acceptanceFailed = journal.acceptance?.status !== "passed";
     const savedEvidence = journal.acceptanceEvidence;
-    await quarantine({
-      adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
-      fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
-    });
+    await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
     if (acceptanceFailed || !savedEvidence) {
       const originState = journal.phase === "quarantined" ? "origin is quarantined" : "origin absence could not be confirmed";
       throw new Error(`deployed acceptance previously failed; ${originState}`);
@@ -1188,10 +1190,7 @@ async function verifyOperation(options, dependencies) {
     journal.acceptanceEvidence = evidence;
     await persist(options.journalPath, journal);
   } finally {
-    await quarantine({
-      adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
-      fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
-    });
+    await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
   }
   return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, wholeStackRollback: false };
 }
@@ -1504,6 +1503,9 @@ async function absenceOperation(options, dependencies) {
   const workerAbsent = !remote.workers.some((item) => item.name === journal.identity.workerName);
   const durableObjectDeletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && /^woodshed-staging-delete-[a-f0-9]{16}$/.test(item.tag ?? "") && /^[a-f0-9]{64}$/.test(item.configDigest ?? ""));
   const absenceOptions = { setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now };
+  // A D1 database or Worker still present already dooms the proof below, and the failure path
+  // records no per-domain detail, so spending the route retry budget first buys nothing.
+  if (!d1Absent || !workerAbsent) throw new Error("delayed absence proof failed");
   const routeAbsence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
   const absent = {
     route: routeAbsence.outcome === "proven-absent",

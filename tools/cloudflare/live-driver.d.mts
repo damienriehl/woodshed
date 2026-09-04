@@ -14,7 +14,7 @@ export interface LiveDriverTimerDependencies {
 }
 
 export interface ConfirmAbsenceOptions extends LiveDriverTimerDependencies {
-  attempts?: number;
+  maxAttempts?: number;
   initialDelayMs?: number;
   factor?: number;
   maxDelayMs?: number;

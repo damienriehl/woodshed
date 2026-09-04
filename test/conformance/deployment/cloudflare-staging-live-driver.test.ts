@@ -140,7 +140,7 @@ test("confirmAbsence cannot confirm after a multi-attempt budget is exhausted", 
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
     now: () => new Date("2030-01-01T12:00:00.000Z"),
-    attempts: 8,
+    maxAttempts: 8,
     random: () => 1,
   });
 
@@ -162,7 +162,7 @@ test("confirmAbsence stops when the wall-clock budget is exhausted", async () =>
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
     now: () => new Date(probeCalls < 2 ? 0 : 101),
-    attempts: 8,
+    maxAttempts: 8,
     initialDelayMs: 1,
     budgetMs: 100,
     random: () => 1,
@@ -206,7 +206,7 @@ test("confirmAbsence waits before retrying with real timers", async () => {
     return probeCalls === 1;
   }, {
     initialDelayMs: 60,
-    attempts: 3,
+    maxAttempts: 3,
     random: () => 1,
   });
   const elapsedMs = Date.now() - startedAt;
