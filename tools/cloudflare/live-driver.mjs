@@ -1284,7 +1284,7 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(absence).length, cleanupComplete: true, wholeStackRollback: false };
   }
-  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("origin must be quarantined before teardown");
+  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("teardown requires a post-write journal phase");
   const credentials = requireCredentials(options.credentialEnvironment, "teardown");
   const privateConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false });
   const deleteConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false, deleteDurableObject: true });
