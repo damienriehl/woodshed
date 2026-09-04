@@ -18,6 +18,18 @@ D1 Time Travel is a separate, destructive recovery domain. Before restore, withd
 
 Every post-write failure is a partial-deployment incident. Quarantine the origin before restore or teardown, preserve the bookmark and frozen identities, and never automatically restore persistent state. A corrupt journal, owner/run mismatch, changed last-write identity, unreadable inventory, or unexpected dependent authorizes no deletion.
 
+`teardown` accepts any post-write phase — `resources-ready` through `quarantined` — so a run that failed before quarantine could finish is still closeable by the driver. Widening the entry phase changes no per-resource proof: ownership, identity revision, lease, forbidden-identity, and dependent checks are identical on every path, and a run that cannot satisfy them is still refused.
+
+### Unconfirmed origin absence
+
+Cloudflare publishes no read-after-write consistency guarantee for the `workers.dev` subdomain endpoint, in either direction. Quarantine therefore retries the absence proof on a bounded schedule, and can still finish without an answer. When that happens the journal records `incident.originAbsence` with `status: "could-not-confirm"`, the attempt count, the timestamp, and whether the disable itself errored (`disableFailed`).
+
+That state is neither success nor failure. The phase does not advance to `quarantined`, because advancing would assert a proof that never happened, and `quarantineFailed` is not set, because that flag means the disable errored — a different incident. Treat the origin as possibly live and run `teardown`: deleting the Worker removes the exposure by construction, which is a stronger proof than the configuration read that could not settle. If `disableFailed` is `true`, the disable deploy failed as well, so inspect the Worker before assuming anything about its state.
+
+### Unowned near-miss Worker
+
+`teardown` refuses to record cleanup complete while a Worker named the run's Worker name plus `-staging` exists in the account, and reports it rather than deleting it — the journal is authority to remove only what it owns. That name came from a wrangler naming inconsistency that argument composition now prevents, so this should never fire; if it does, a Worker from an earlier run is still present and a person should remove it.
+
 ### Pending D1 create refusal
 
 If `apply` reports that a database with the staging name already exists and instructs the operator to tear down the pending run, stop that run. A pending `d1-create` intent has no persisted provider acceptance, so the driver records an incident and refuses to adopt, migrate, seed, or delete the same-named database. Do not add a database ID to `STAGING_JOURNAL_PATH` or otherwise claim the database for the run.
