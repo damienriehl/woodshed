@@ -1,4 +1,5 @@
 export function createWranglerAdapter(options: Record<string, any>): any;
+export function isSecretFamily(args: string[]): boolean;
 export function composeWranglerArgs(options: {
   args: string[];
   envFilePath: string;

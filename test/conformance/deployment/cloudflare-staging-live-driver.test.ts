@@ -134,7 +134,10 @@ test("confirmAbsence retries with non-decreasing full-jitter delays", async () =
   assert.ok(timers.delays.every((delay, index) => index === 0 || delay >= timers.delays[index - 1]!));
 });
 
-test("confirmAbsence cannot confirm after a multi-attempt budget is exhausted", async () => {
+test("confirmAbsence reports present after the whole attempt ladder observed it", async () => {
+  // Every attempt saw it and nothing errored, so this is the strongest present-evidence the
+  // endpoint can give -- it must re-arm the hard refusal, not degrade to unknown. Only the
+  // wall-clock cut-off and the rate-limit exit below leave the question genuinely open.
   const timers = fakeRetryTimers();
   const confirmation = confirmAbsence(async () => true, {
     setTimer: timers.setTimer,
@@ -147,7 +150,7 @@ test("confirmAbsence cannot confirm after a multi-attempt budget is exhausted", 
   for (let retry = 0; retry < 7; retry += 1) await timers.fireNext();
   const result = await confirmation;
 
-  assert.equal(result.outcome, "could-not-confirm");
+  assert.equal(result.outcome, "present");
   assert.notEqual(result.outcome, "proven-absent");
   assert.equal(result.attempts, 8);
 });
@@ -1525,7 +1528,7 @@ test("an unconfirmable quarantine is recorded and can still be torn down", async
   journal.mutations.push({ kind: "durable-object-create", domain: "durable-object", id: "durable-unconfirmed", status: "applied" });
   await saveJournal(journalPath, journal);
 
-  const state = { exposureEnabled: true, exposureSequence: [] as boolean[], workerPresent: true, databasePresent: true, deploymentSequence: 1 };
+  const state = { exposureEnabled: true, rateLimited: true, exposureSequence: [] as boolean[], workerPresent: true, databasePresent: true, deploymentSequence: 1 };
   const deployments = () => state.workerPresent ? [{ id: `deployment-${state.deploymentSequence}`, script_name: workerName }] : [];
   const adapterFactory = ({ configPath }: { configPath?: string }) => ({
     whoami: async () => ({ accountId }),
@@ -1546,8 +1549,12 @@ test("an unconfirmable quarantine is recorded and can still be torn down", async
   const exposureClient = createApiTokenClient({
     token: "synthetic-cloud-token",
     accountApiBase: "https://api.synthetic.invalid/accounts",
+    // The first read is quarantine's enabledBefore check; every read after it is the absence
+    // proof, and those hit a real 429 Response so the rate-limit path runs through the actual
+    // client error shape rather than a fabricated error object.
     fetch: async () => {
       exposureReadCount += 1;
+      if (state.rateLimited && exposureReadCount > 1) return new Response(null, { status: 429 });
       return Response.json({ success: true, result: { enabled: state.exposureSequence.shift() ?? state.exposureEnabled, previews_enabled: false } });
     },
   });
@@ -1583,14 +1590,19 @@ test("an unconfirmable quarantine is recorded and can still be torn down", async
     clearTimer: timers.clearTimer,
   };
 
-  const unconfirmed = await runLiveOperation({ ...common, operation: "verify" }, dependencies);
+  // verify must refuse rather than report success over an origin it could not prove closed --
+  // the incident is still recorded, and the run stays closeable by teardown.
+  await assert.rejects(
+    runLiveOperation({ ...common, operation: "verify" }, dependencies),
+    /origin absence could not be confirmed/,
+  );
   const afterQuarantine = JSON.parse(await readFile(journalPath, "utf8"));
-  assert.equal(unconfirmed.phase, "verified");
-  assert.equal(exposureReadCount, 9);
+  assert.equal(afterQuarantine.phase, "verified");
+  assert.equal(exposureReadCount, 2);
   assert.deepEqual(afterQuarantine.incident.originAbsence, {
     status: "could-not-confirm",
     checkedAt: "2030-01-01T12:00:00.000Z",
-    attempts: 8,
+    attempts: 1,
     disableFailed: false,
   });
   assert.equal(afterQuarantine.incident.quarantineFailed, undefined);
@@ -1598,6 +1610,7 @@ test("an unconfirmable quarantine is recorded and can still be torn down", async
   assert.equal(afterQuarantine.mutations.find((item: any) => item.kind === "workers-dev-disable")?.status, "pending");
 
   state.exposureEnabled = false;
+  state.rateLimited = false;
   const tornDown = await runLiveOperation({ ...common, operation: "teardown" }, dependencies);
   assert.equal(tornDown.phase, "cleanup-complete");
   assert.equal(tornDown.cleanupComplete, true);
@@ -1676,10 +1689,13 @@ test("preview-only exposure remains an unproven quarantine absence", async (t) =
     runId: journal.runId,
     owner: journal.owner,
     processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic" },
-  }, dependencies), /deployed acceptance previously failed; origin absence could not be confirmed/);
+  }, dependencies), /origin quarantine absence proof failed/);
+  // A preview hostname that stays enabled across the whole attempt ladder is present, not
+  // unknown, so this stays the hard refusal it always was -- the retry removes the stale-read
+  // false negative without softening a genuinely live origin into an incident note.
   const saved = JSON.parse(await readFile(journalPath, "utf8"));
   assert.equal(saved.phase, "verified");
-  assert.equal(saved.incident.originAbsence.status, "could-not-confirm");
+  assert.equal(saved.incident?.originAbsence, undefined);
   assert.equal(deployCalls, 1);
 });
 

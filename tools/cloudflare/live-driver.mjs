@@ -97,13 +97,15 @@ export async function confirmAbsence(probe, {
     }
 
     if (!present) return confirmation("proven-absent", attempts, now());
-    if (attempts >= attemptLimit) {
-      return confirmation(attemptLimit === 1 ? "present" : "could-not-confirm", attempts, now());
-    }
+    // Every attempt observed it and nothing errored: that is the strongest evidence available
+    // that it really is present. Only running out of wall-clock or hitting a rate limit leaves
+    // the question genuinely open.
+    if (attempts >= attemptLimit) return confirmation("present", attempts, now());
 
     const checkedAt = now();
     const elapsedMs = checkedAt.getTime() - startedAt;
-    const delayMs = Math.min(maxDelayMs, initialDelayMs * factor ** (attempts - 1)) * random();
+    const backoffMs = Math.min(maxDelayMs, initialDelayMs * factor ** (attempts - 1));
+    const delayMs = backoffMs / 2 + (backoffMs / 2) * random();
     if (elapsedMs >= budgetMs || delayMs > budgetMs - elapsedMs) {
       return confirmation("could-not-confirm", attempts, checkedAt);
     }
@@ -437,7 +439,9 @@ export function createApiTokenClient({ token, fetch = globalThis.fetch, apiBase 
       if (typeof accountId !== "string" || !/^[a-f0-9]{32}$/i.test(accountId) || typeof workerName !== "string" || !SAFE_NAME.test(workerName)) throw new Error("valid staging exposure identity is required");
       const response = await request(`/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/subdomain`, {}, accountApiBase);
       if (response.status === 404) return { exists: false, enabled: false };
-      if (!response.ok) throw new Error("workers.dev exposure inventory failed");
+      // The status rides on the error so the retry can tell a 429 from an ordinary failure;
+      // without it the rate-limit branch is unreachable against the real client.
+      if (!response.ok) throw Object.assign(new Error("workers.dev exposure inventory failed"), { status: response.status });
       let payload;
       try { payload = await response.json(); } catch { throw new Error("workers.dev exposure inventory is unreadable"); }
       if (payload?.success !== true || typeof payload.result?.enabled !== "boolean" || typeof payload.result?.previews_enabled !== "boolean") throw new Error("workers.dev exposure inventory is unreadable");
@@ -1094,18 +1098,20 @@ async function quarantine(options, dependencies, { adapter, privateAdapter, toke
       if (absence.outcome === "present") throw error;
       if (absence.outcome === "could-not-confirm") {
         await recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed: true });
-        return;
+        return absence.outcome;
       }
-      return settleQuarantine({ privateAdapter, journal, journalPath, intent });
+      await settleQuarantine({ privateAdapter, journal, journalPath, intent });
+      return "proven-absent";
     }
   }
   const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
   if (absence.outcome === "present") throw new Error("origin quarantine absence proof failed");
   if (absence.outcome === "could-not-confirm") {
     await recordUnconfirmedOriginAbsence(journalPath, journal, absence);
-    return;
+    return absence.outcome;
   }
   await settleQuarantine({ privateAdapter, journal, journalPath, intent });
+  return "proven-absent";
 }
 
 async function settleQuarantine({ privateAdapter, journal, journalPath, intent }) {
@@ -1137,13 +1143,17 @@ async function verifyOperation(options, dependencies) {
   if (journal.phase === "verified") {
     const acceptanceFailed = journal.acceptance?.status !== "passed";
     const savedEvidence = journal.acceptanceEvidence;
-    await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
+    const replayAbsence = await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
     if (acceptanceFailed || !savedEvidence) {
       const originState = journal.phase === "quarantined" ? "origin is quarantined" : "origin absence could not be confirmed";
       throw new Error(`deployed acceptance previously failed; ${originState}`);
     }
-    return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, wholeStackRollback: false };
+    // Same rule as the first-run path: a re-entrant verify must not report success over an
+    // origin it could not prove closed.
+    if (replayAbsence !== "proven-absent") throw new Error("deployed acceptance passed but origin absence could not be confirmed");
+    return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, originAbsence: replayAbsence, wholeStackRollback: false };
   }
+  let originAbsence;
   const markerExpected = { sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] };
   const assertActiveOrigin = async () => {
     if (!await workersDevEnabled(inventory, journal, tokenClient)) throw new Error("authenticated workers.dev exposure is inactive");
@@ -1190,9 +1200,13 @@ async function verifyOperation(options, dependencies) {
     journal.acceptanceEvidence = evidence;
     await persist(options.journalPath, journal);
   } finally {
-    await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
+    originAbsence = await quarantine(options, dependencies, { adapter, privateAdapter, tokenClient, journal, inventory });
   }
-  return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, wholeStackRollback: false };
+  // An unconfirmed origin is not a clean verify. The operator sees it in the result and the
+  // CLI exits non-zero, because "verify succeeded" over a possibly-live exposure is the one
+  // reading of this state that is never safe.
+  if (originAbsence !== "proven-absent") throw new Error("deployed acceptance passed but origin absence could not be confirmed");
+  return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, originAbsence, wholeStackRollback: false };
 }
 
 function activeCredential(journal) {
@@ -1546,6 +1560,6 @@ export async function runLiveOperation(input, overrides = {}) {
 }
 
 export function publicOperationResult(result) {
-  const allowed = ["operation", "phase", "ok", "mutationCount", "accountScope", "migrationCount", "rollback", "wholeStackRollback", "cleanupComplete", "absenceCount", "passed", "outcomes", "counts"];
+  const allowed = ["operation", "phase", "ok", "originAbsence", "mutationCount", "accountScope", "migrationCount", "rollback", "wholeStackRollback", "cleanupComplete", "absenceCount", "passed", "outcomes", "counts"];
   return Object.fromEntries(Object.entries(result).filter(([key]) => allowed.includes(key)));
 }
