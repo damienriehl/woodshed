@@ -63,6 +63,63 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
 });
 
+test("adapter does not suppress Wrangler structured output", async () => {
+  let childEnv: NodeJS.ProcessEnv | undefined;
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async (_file: string, _args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      childEnv = options.env;
+      return { exitCode: 0, stdout: "[]", stderr: "" };
+    },
+  });
+
+  await adapter.d1List();
+
+  assert.equal(childEnv?.WRANGLER_LOG, "log");
+  assert.notEqual(childEnv?.WRANGLER_LOG, "none");
+  assert.notEqual(childEnv?.WRANGLER_LOG, "error");
+  assert.equal(childEnv?.WRANGLER_LOG_PATH, "/repo/.cloudflare-staging/wrangler.log");
+});
+
+test("deployments list tolerates Wrangler code 10007 not-found errors on stdout", async () => {
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({
+      exitCode: 1,
+      stdout: "This Worker does not exist on your account. [code: 10007]",
+      stderr: "",
+    }),
+  });
+
+  assert.deepEqual(await adapter.deploymentsList("woodshed-staging-synthetic"), []);
+});
+
+test("deployments list tolerates Wrangler code 10007 not-found errors on stderr", async () => {
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "This Worker does not exist on your account. [code: 10007]",
+    }),
+  });
+
+  assert.deepEqual(await adapter.deploymentsList("woodshed-staging-synthetic"), []);
+});
+
+test("deployments list rejects failures without Wrangler code 10007 on either stream", async () => {
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 1, stdout: "request failed", stderr: "worker not found" }),
+  });
+
+  await assert.rejects(adapter.deploymentsList("woodshed-staging-synthetic"), /Wrangler command failed/);
+});
+
 test("Wrangler home preparation creates a private home and empty environment without invoking Wrangler", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "woodshed-wrangler-home-"));
   t.after(() => rm(root, { recursive: true, force: true }));
