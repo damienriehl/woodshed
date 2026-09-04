@@ -508,6 +508,16 @@ function confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, c
   return confirmAbsence(() => workersDevEnabled(inventory, journal, tokenClient), { setTimer, clearTimer, now });
 }
 
+// wrangler's secret commands once resolved --name plus --env into "<name>-staging", creating a
+// Worker the journal never owned. That is fixed at argument composition, so this should never
+// fire -- which is why it refuses rather than deletes: a journal is authority to remove only
+// what it owns, so an unowned near-miss is a fact for a human, never a cleanup target.
+export async function assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient) {
+  const suffixed = `${journal.identity.workerName}-staging`;
+  const scripts = await tokenClient.listWorkerScripts(inventory.staging.accountId);
+  if (scripts.some((script) => script?.name === suffixed)) throw new Error("unowned environment-suffixed Worker blocks cleanup completion");
+}
+
 async function recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed = false } = {}) {
   // Cloudflare publishes no read-after-write guarantee for the workers.dev subdomain, so
   // an exhausted retry means unknown -- not absent, and not quarantine failure. Record what
@@ -1081,7 +1091,7 @@ async function quarantine({ adapter, privateAdapter, tokenClient, journal, inven
         await recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed: true });
         return;
       }
-      // Temporary regression check: mirror the pre-fix fall-through to the second proof.
+      return settleQuarantine({ privateAdapter, journal, journalPath, intent });
     }
   }
   const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
@@ -1274,7 +1284,7 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(absence).length, cleanupComplete: true, wholeStackRollback: false };
   }
-  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("teardown requires a post-write journal phase");
+  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("origin must be quarantined before teardown");
   const credentials = requireCredentials(options.credentialEnvironment, "teardown");
   const privateConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false });
   const deleteConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false, deleteDurableObject: true });
@@ -1444,6 +1454,7 @@ async function teardownOperation(options, dependencies) {
   for (const intent of journal.mutations.filter((item) => item?.kind?.startsWith("teardown-") && item.status === "pending")) {
     if (result.absence[`${intent.domain}:${intent.id}`] === true) intent.status = "applied";
   }
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   journal.phase = "cleanup-complete";
   journal.acceptance = { ...(journal.acceptance ?? { status: "not-run" }), cleanupComplete: true };
   journal.teardown = { absence: result.absence, completedAt: dependencies.now().toISOString(), durableObjectStateRemovedWithNamespace: result.durableObjectStateRemovedWithNamespace };

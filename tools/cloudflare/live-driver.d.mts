@@ -31,6 +31,7 @@ export interface ConfirmAbsenceResult {
 
 export function parseLiveArguments(argv: string[]): LiveCliArguments;
 export function confirmAbsence(probe: () => Promise<boolean>, options?: ConfirmAbsenceOptions): Promise<ConfirmAbsenceResult>;
+export function assertNoEnvironmentSuffixedWorker(inventory: { staging: { accountId: string } }, journal: { identity: { workerName: string } }, tokenClient: { listWorkerScripts(accountId: string): Promise<Array<{ name: string }>> }): Promise<void>;
 export function generateEffectiveConfig(options: Record<string, any>): Promise<{ configPath: string; migrationsDirectory: string; configDigest: string; lifecycleTag: string; deletionTag?: string }>;
 export function collectRemoteInventory(options: Record<string, any>): Promise<Record<string, any>>;
 export function createIdentityRevision(remote: Record<string, any>): string;

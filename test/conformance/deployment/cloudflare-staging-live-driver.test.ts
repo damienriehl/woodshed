@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   collectRemoteInventory,
+  assertNoEnvironmentSuffixedWorker,
   confirmAbsence,
   createApiTokenClient,
   createIdentityRevision,
@@ -1879,4 +1880,30 @@ test("the active-origin assertion stays a single read and never retries", async 
   const body = assertion.slice(0, assertion.indexOf("\n  };"));
   assert.match(body, /await workersDevEnabled\(/);
   assert.doesNotMatch(body, /confirmWorkersDevAbsence|confirmAbsence/);
+});
+
+test("an unowned environment-suffixed Worker blocks cleanup completion and is never deleted", async () => {
+  // wrangler's secret family once resolved --name plus --env into "<name>-staging", creating a
+  // Worker the journal never owned. Argument composition prevents that now. The account-wide
+  // revision guard catches one created DURING a run, but an orphan left by a PREVIOUS run sits
+  // in the preflight baseline and trips nothing -- so teardown would report cleanup complete
+  // right past it. The journal is authority to delete only what it owns, so this refuses and
+  // reports rather than sweeping an unowned resource.
+  const inventory = { staging: { accountId } } as any;
+  const journal = { identity: { workerName } } as any;
+
+  await assert.rejects(
+    assertNoEnvironmentSuffixedWorker(inventory, journal, { listWorkerScripts: async () => [{ name: `${workerName}-staging` }] }),
+    (error: any) => error?.message === "unowned environment-suffixed Worker blocks cleanup completion",
+  );
+
+  await assertNoEnvironmentSuffixedWorker(inventory, journal, { listWorkerScripts: async () => [{ name: workerName }, { name: "unrelated" }] });
+});
+
+test("teardown proves the near-miss refusal runs before it records cleanup complete", async () => {
+  const source = await readFile(new URL("../../../tools/cloudflare/live-driver.mjs", import.meta.url), "utf8");
+  const guard = source.indexOf("await assertNoEnvironmentSuffixedWorker(");
+  const completion = source.indexOf('journal.phase = "cleanup-complete"', guard);
+  assert.ok(guard > 0, "teardown must call the near-miss refusal");
+  assert.ok(completion > guard, "the refusal must run before cleanup-complete is recorded");
 });
