@@ -504,6 +504,22 @@ async function workersDevEnabled(inventory, journal, tokenClient) {
   return (await tokenClient.inspectWorkersDev(inventory.staging.accountId, journal.identity.workerName)).enabled;
 }
 
+function confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now }) {
+  return confirmAbsence(() => workersDevEnabled(inventory, journal, tokenClient), { setTimer, clearTimer, now });
+}
+
+async function recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed = false } = {}) {
+  // Cloudflare publishes no read-after-write guarantee for the workers.dev subdomain, so
+  // an exhausted retry means unknown -- not absent, and not quarantine failure. Record what
+  // was checked and when, and whether the disable itself errored: "the disable failed and I
+  // could not confirm" is a different incident from "it succeeded and I could not confirm".
+  journal.incident = {
+    ...(journal.incident ?? {}),
+    originAbsence: { status: absence.outcome, checkedAt: absence.checkedAt, attempts: absence.attempts, disableFailed },
+  };
+  await persist(journalPath, journal);
+}
+
 function inventoryMatchesJournal(journalIdentity, inventoryIdentity) {
   for (const field of ["accountId", "databaseName", "workerName", "origin"]) if (journalIdentity[field] !== inventoryIdentity[field]) return false;
   return inventoryIdentity.databaseId === undefined || journalIdentity.databaseId === inventoryIdentity.databaseId;
@@ -1024,7 +1040,10 @@ async function applyWithIncidentCapture(options, dependencies) {
         const adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId });
         const privateAdapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: privateConfig.configPath });
         const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
-        await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
+        await quarantine({
+          adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
+          fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
+        });
       }
     } catch {
       quarantineFailed = true;
@@ -1039,7 +1058,7 @@ async function applyWithIncidentCapture(options, dependencies) {
   }
 }
 
-async function quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath, fetch }) {
+async function quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath, fetch, setTimer, clearTimer, now }) {
   const enabledBefore = await workersDevEnabled(inventory, journal, tokenClient);
   let intent = journal.mutations.find((item) => item?.kind === "workers-dev-disable");
   if (!intent) {
@@ -1056,10 +1075,25 @@ async function quarantine({ adapter, privateAdapter, tokenClient, journal, inven
       await privateAdapter.deploy(journal.identity.workerName);
     }
     catch (error) {
-      if (await workersDevEnabled(inventory, journal, tokenClient)) throw error;
+      const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
+      if (absence.outcome === "present") throw error;
+      if (absence.outcome === "could-not-confirm") {
+        await recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed: true });
+        return;
+      }
+      // Temporary regression check: mirror the pre-fix fall-through to the second proof.
     }
   }
-  if (await workersDevEnabled(inventory, journal, tokenClient)) throw new Error("origin quarantine absence proof failed");
+  const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, { setTimer, clearTimer, now });
+  if (absence.outcome === "present") throw new Error("origin quarantine absence proof failed");
+  if (absence.outcome === "could-not-confirm") {
+    await recordUnconfirmedOriginAbsence(journalPath, journal, absence);
+    return;
+  }
+  await settleQuarantine({ privateAdapter, journal, journalPath, intent });
+}
+
+async function settleQuarantine({ privateAdapter, journal, journalPath, intent }) {
   if (Array.isArray(intent.beforeDeploymentIds)) {
     const proof = await deploymentProof(privateAdapter, journal.identity.workerName);
     intent.deploymentId = newDeploymentId(intent.beforeDeploymentIds, proof);
@@ -1088,8 +1122,14 @@ async function verifyOperation(options, dependencies) {
   if (journal.phase === "verified") {
     const acceptanceFailed = journal.acceptance?.status !== "passed";
     const savedEvidence = journal.acceptanceEvidence;
-    await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
-    if (acceptanceFailed || !savedEvidence) throw new Error("deployed acceptance previously failed; origin is quarantined");
+    await quarantine({
+      adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
+      fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
+    });
+    if (acceptanceFailed || !savedEvidence) {
+      const originState = journal.phase === "quarantined" ? "origin is quarantined" : "origin absence could not be confirmed";
+      throw new Error(`deployed acceptance previously failed; ${originState}`);
+    }
     return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, wholeStackRollback: false };
   }
   const markerExpected = { sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] };
@@ -1138,7 +1178,10 @@ async function verifyOperation(options, dependencies) {
     journal.acceptanceEvidence = evidence;
     await persist(options.journalPath, journal);
   } finally {
-    await quarantine({ adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath, fetch: dependencies.fetch });
+    await quarantine({
+      adapter, privateAdapter, tokenClient, journal, inventory, journalPath: options.journalPath,
+      fetch: dependencies.fetch, setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now,
+    });
   }
   return { operation: "verify", phase: journal.phase, outcomes: evidence.outcomes, counts: evidence.counts, wholeStackRollback: false };
 }
@@ -1237,6 +1280,7 @@ async function teardownOperation(options, dependencies) {
   const deleteConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false, deleteDurableObject: true });
   let adapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: privateConfig.configPath });
   const tokenClient = dependencies.tokenClientFactory({ token: credentials.token });
+  const absenceOptions = { setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now };
   await assertOperatorTokenActive(tokenClient);
   assertSharedAccountInventory(inventory, await collectProtectedInventory({ adapter, inventory, tokenClient }));
   const expectedProtected = journal.preflight.protectedRevision;
@@ -1251,7 +1295,10 @@ async function teardownOperation(options, dependencies) {
   };
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
   const inspectResource = async (resource) => {
-    if (resource.domain === "route") return { exists: await workersDevEnabled(inventory, journal, tokenClient), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "route") {
+      const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
+      return { exists: absence.outcome !== "proven-absent", runId: journal.runId, owner: journal.owner };
+    }
     if (resource.domain === "credential") {
       if (!activeCredential(journal) || !journal.identity.databaseId) return { exists: false, runId: journal.runId, owner: journal.owner };
       const rows = d1Results(await adapter.d1Execute(journal.identity.databaseName, { command: `SELECT count(*) AS count FROM participant_sessions WHERE id_hash=${sql(activeCredential(journal))} AND revoked_at IS NULL` }));
@@ -1377,7 +1424,10 @@ async function teardownOperation(options, dependencies) {
     expectedRevision: expectedProtected,
     inspectRevision,
     listDependents: async (resource) => {
-      if (resource.domain === "worker" && await workersDevEnabled(inventory, journal, tokenClient)) return ["owned-origin-still-active"];
+      if (resource.domain === "worker") {
+        const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
+        if (absence.outcome !== "proven-absent") return ["owned-origin-still-active"];
+      }
       if (["durable-object", "d1"].includes(resource.domain) && await workerExists()) return ["owned-worker-still-present"];
       return [];
     },
@@ -1442,8 +1492,10 @@ async function absenceOperation(options, dependencies) {
   const d1Absent = !remote.databases.some((item) => item.id === journal.identity.databaseId || item.name === journal.identity.databaseName);
   const workerAbsent = !remote.workers.some((item) => item.name === journal.identity.workerName);
   const durableObjectDeletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && /^woodshed-staging-delete-[a-f0-9]{16}$/.test(item.tag ?? "") && /^[a-f0-9]{64}$/.test(item.configDigest ?? ""));
+  const absenceOptions = { setTimer: dependencies.setTimer, clearTimer: dependencies.clearTimer, now: dependencies.now };
+  const routeAbsence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
   const absent = {
-    route: !(await workersDevEnabled(inventory, journal, tokenClient)),
+    route: routeAbsence.outcome === "proven-absent",
     hostname: true,
     credential: d1Absent,
     secret: workerAbsent && !remote.secretNames.includes("LIVE_COMMAND_SECRET"),
