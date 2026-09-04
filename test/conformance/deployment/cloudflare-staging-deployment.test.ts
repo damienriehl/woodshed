@@ -565,3 +565,27 @@ test("deployment response loss is reconciled only after durable intent and remot
   assert.equal(result.deployment, deployed);
   assert.deepEqual(events, ["persist:pending", "deploy", "inspect-deployment", "verify-deployment", "persist:applied", "persist:applied"]);
 });
+
+test("the pinned Wrangler still resolves worker names the way the secret-family fix assumes", async () => {
+  // The secret family suppresses --env because wrangler resolves those commands through
+  // getLegacyScriptName, which appends the environment to --name, while deploy/delete/
+  // deployments/versions use getScriptName, which does not (cloudflare/workers-sdk#12300).
+  // That asymmetry is an upstream bug, not a contract -- so pin it. If a wrangler upgrade
+  // changes either resolver, this fails and someone re-derives whether suppressEnv is still
+  // right, instead of the driver silently addressing the wrong Worker again.
+  const { version } = JSON.parse(await readFile(new URL("../../../node_modules/wrangler/package.json", import.meta.url), "utf8"));
+  assert.equal(version, "4.28.1", "wrangler moved; re-check both name resolvers before changing this pin");
+
+  const bundle = await readFile(new URL("../../../node_modules/wrangler/wrangler-dist/cli.js", import.meta.url), "utf8");
+  const bodyOf = (name: string) => {
+    const start = bundle.indexOf(`function ${name}(args, config) {`);
+    assert.ok(start > 0, `${name} not found in the wrangler bundle`);
+    return bundle.slice(start, bundle.indexOf("\n}", start));
+  };
+
+  // deploy/delete/deployments/versions: --name wins outright, no environment suffix.
+  assert.match(bodyOf("getScriptName"), /return args\.name \?\? config\.name;/);
+  // secret put/list/delete and tail: --name plus --env becomes "<name>-<env>".
+  assert.match(bodyOf("getLegacyScriptName"), /args\.name && args\.env && isLegacyEnv\(config\)/);
+  assert.match(bodyOf("getLegacyScriptName"), /\$\{args\.name\}-\$\{args\.env\}/);
+});
