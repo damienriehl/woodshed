@@ -27,6 +27,7 @@ export interface StagingJournal {
   incident?: Record<string, unknown>; teardown?: Record<string, unknown>; retention?: Record<string, unknown>;
   absenceChecks?: Array<Record<string, unknown>>; createdAt: string; updatedAt: string;
 }
+export const TEARDOWN_ENTRY_PHASES: readonly string[];
 export function validateJournal(value: unknown): StagingJournal;
 export function createJournal(input: { runId: string; owner: string; sourceSha: string; identity: StagingIdentity; now?: string }): StagingJournal;
 export function attestMigration(journal: StagingJournal, migration: { filename: string; sha256: string; sourceSha: string }): StagingJournal;

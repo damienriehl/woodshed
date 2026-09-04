@@ -18,9 +18,13 @@ import {
   remoteSchema,
   runLiveOperation,
 } from "../../../tools/cloudflare/live-driver.mjs";
+import { runMigrationFirstDeployment } from "../../../tools/cloudflare/deployment.mjs";
 import { createJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { createEvidenceEnvelope } from "../../../tools/cloudflare/evidence.mjs";
 import { D1_MIGRATIONS } from "../../../tools/cloudflare/migrations.mjs";
+import { runStackTeardown } from "../../../tools/cloudflare/recovery.mjs";
+import { createSyntheticFixturePlan } from "../../../tools/cloudflare/staging-fixtures.mjs";
+import { runDeployedAcceptance } from "../../../tools/cloudflare/staging-smoke.mjs";
 import { publicErrorMessage } from "../../../tools/cloudflare-staging.mjs";
 
 const sourceSha = "a".repeat(40);
@@ -338,6 +342,143 @@ async function preWorkerTeardownFixture(t: any, durableCreateStatus: "pending" |
     now: () => new Date("2030-01-01T12:00:00.000Z"),
   };
   return { common, dependencies, journalPath, databasePresent: () => databasePresent, databaseDeletes: () => databaseDeletes };
+}
+
+async function postWriteTeardownFixture(t: any, phase: "bookmark-captured" | "schema-expanded" | "worker-deployed" = "worker-deployed") {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-post-write-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-post-write-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const revision = createIdentityRevision({ accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] });
+  const journal = createJournal({
+    runId: `run-post-write-${phase}`,
+    owner: "owner-post-write",
+    sourceSha,
+    identity: stagingInventory.staging,
+  });
+  journal.phase = "bookmark-captured";
+  journal.preflight = { protectedRevision: revision, targetRevision: revision, operatorTokenPresent: true };
+  journal.lease = { active: true, runId: journal.runId, owner: journal.owner, revision };
+  journal.acceptance = { status: "not-run", cleanupComplete: false };
+  for (const [domain, id, status] of [
+    ["route", "route-post-write", "planned"],
+    ["hostname", "hostname-post-write", "planned"],
+    ["credential", "credential-post-write", "planned"],
+    ["secret", "secret-post-write", "planned"],
+    ["worker", workerName, "planned"],
+    ["durable-object", "durable-post-write", "planned"],
+    ["d1", databaseId, "owned"],
+  ] as const) journal.resources.push({ domain, id, status, runId: journal.runId, owner: journal.owner });
+  journal.mutations.push(
+    { kind: "d1-create", domain: "d1", id: databaseId, status: "applied", providerAcceptance: { id: databaseId } },
+    { kind: "durable-object-create", domain: "durable-object", id: "durable-post-write", status: "pending" },
+  );
+  await saveJournal(journalPath, journal);
+
+  const state = {
+    databasePresent: true,
+    workerPresent: false,
+    deploymentSequence: 0,
+  };
+  if (phase !== "bookmark-captured") {
+    const deploymentFailure = new Error("synthetic deployment stopped after schema expansion");
+    const deployment = runMigrationFirstDeployment({
+      journal,
+      lease: journal.lease,
+      manifest: [],
+      expectedSnapshot: { revision },
+      inspectSnapshot: async () => ({ revision }),
+      inspectLedger: async () => [],
+      persistJournal: (value: any) => {
+        const workerIntent = value.mutations.find((item: any) => item.kind === "worker-deploy");
+        if (workerIntent?.status === "applied") {
+          assert.equal(value.mutations.find((item: any) => item.kind === "durable-object-create")?.status, "applied");
+        }
+        return saveJournal(journalPath, value);
+      },
+      applyMigration: async () => {},
+      verifyMigration: async () => true,
+      verifyFinalSchema: async () => {
+        journal.phase = "schema-expanded";
+        await saveJournal(journalPath, journal);
+      },
+      deployWorker: async () => {
+        if (phase === "schema-expanded") throw deploymentFailure;
+        state.workerPresent = true;
+        state.deploymentSequence += 1;
+        return { deploymentId: `deployment-post-write-${state.deploymentSequence}` };
+      },
+      verifyDeployment: async () => {},
+    });
+    if (phase === "schema-expanded") await assert.rejects(deployment, /deployment outcome is uncertain; no replay authorized/);
+    else await deployment;
+  }
+
+  const deployments = () => state.workerPresent
+    ? [{ id: `deployment-post-write-${state.deploymentSequence}`, script_name: workerName }]
+    : [];
+  const versions = () => state.workerPresent
+    ? [{ id: `version-post-write-${state.deploymentSequence}`, script_name: workerName }]
+    : [];
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => state.databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
+    deploymentsList: async () => deployments(),
+    versionsList: async () => versions(),
+    secretList: async () => [],
+    d1Execute: async () => [{ success: true, results: [{ count: 0 }] }],
+    deploy: async () => { state.workerPresent = true; state.deploymentSequence += 1; },
+    deleteWorker: async () => { state.workerPresent = false; },
+    d1Delete: async () => { state.databasePresent = false; },
+  };
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectWorkersDev: async () => ({ exists: state.workerPresent, enabled: false }),
+  };
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token" },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => tokenClient,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  };
+  return {
+    common,
+    dependencies,
+    journal,
+    journalPath,
+    revision,
+    removeWorker: () => { state.workerPresent = false; },
+  };
+}
+
+function directTeardownOptions(journal: any, revision: string) {
+  return {
+    journal,
+    lease: journal.lease,
+    expectedRevision: revision,
+    inspectRevision: async () => revision,
+    listDependents: async () => [],
+    inspectResource: async () => ({ exists: false, runId: journal.runId, owner: journal.owner }),
+    removeResource: async () => {},
+    verifyTokenInactive: async () => true,
+  };
 }
 
 async function d1ReconciliationFixture(t: any, intentStatus?: "pending" | "applied", {
@@ -717,6 +858,127 @@ test("teardown requires deleted_classes proof after Durable Object creation appl
   );
   assert.equal(fixture.databaseDeletes(), 0);
   assert.equal(fixture.databasePresent(), true);
+});
+
+test("a genuine worker-deployed journal passes both teardown gates and cleanup replays idempotently", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const deployedJournal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(deployedJournal.phase, "worker-deployed");
+
+  const direct = await runStackTeardown(directTeardownOptions(structuredClone(deployedJournal), fixture.revision));
+  assert.equal(direct.complete, true);
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "absence-check" }, fixture.dependencies),
+    (error: any) => error?.message === "completed teardown journal is required",
+  );
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+  assert.equal((await runLiveOperation({ ...fixture.common, operation: "teardown", processEnvironment: {} }, fixture.dependencies)).cleanupComplete, true);
+});
+
+test("worker-deployed teardown still requires an active ownership lease", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const journal = structuredClone(fixture.journal);
+  journal.lease!.active = false;
+
+  await assert.rejects(
+    runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+    (error: any) => error?.message === "active ownership lease is required",
+  );
+});
+
+test("worker-deployed teardown still refuses a changed identity revision", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+
+  await assert.rejects(
+    runStackTeardown({ ...directTeardownOptions(structuredClone(fixture.journal), fixture.revision), inspectRevision: async () => "changed" }),
+    (error: any) => error?.message === "last-write identity changed",
+  );
+});
+
+test("worker-deployed teardown still refuses resource ownership by another run or owner", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const wrongRun = structuredClone(fixture.journal);
+  wrongRun.resources[0]!.runId = "another-run";
+  const wrongOwner = structuredClone(fixture.journal);
+  wrongOwner.resources[0]!.owner = "another-owner";
+
+  for (const journal of [wrongRun, wrongOwner]) {
+    await assert.rejects(
+      runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+      (error: any) => error?.message === "journal resource identity mismatch",
+    );
+  }
+});
+
+test("worker-deployed teardown still requires every resource domain authority", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const journal = structuredClone(fixture.journal);
+  journal.resources = journal.resources.filter((resource: any) => resource.domain !== "credential");
+
+  await assert.rejects(
+    runStackTeardown(directTeardownOptions(journal, fixture.revision)),
+    (error: any) => error?.message === "missing credential teardown authority",
+  );
+});
+
+test("teardown completes from schema-expanded", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "schema-expanded");
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "schema-expanded");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});
+
+test("teardown completes from bookmark-captured", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "bookmark-captured");
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "bookmark-captured");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});
+
+test("teardown preserves a failed acceptance result from a verified journal", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const plan = createSyntheticFixturePlan({ runId: fixture.journal.runId, organizerToken: "organizer-synthetic", preFixtureBookmark: "bookmark-synthetic" });
+  await assert.rejects(runDeployedAcceptance({
+    origin,
+    journal: fixture.journal,
+    plan,
+    organizerToken: "organizer-synthetic",
+    persistJournal: (journal: any) => saveJournal(fixture.journalPath, journal),
+    inspectFixtures: async () => ({ complete: false, count: 0 }),
+    seedFixtures: async () => { throw new Error("synthetic acceptance failure"); },
+    fetch: async () => assert.fail("HTTP must not run after fixture failure"),
+    buildLiveCommand: () => assert.fail("live command must not be built after fixture failure"),
+  }), /fixture seed failed; run requires quarantine/);
+  assert.equal(fixture.journal.phase, "verified");
+  assert.equal(fixture.journal.acceptance?.status, "failed");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(journal.acceptance.status, "failed");
+  assert.equal(journal.acceptance.cleanupComplete, true);
+});
+
+test("worker-deployed teardown with an absent worker still requires deleted_classes proof", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const deployedJournal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(deployedJournal.mutations.find((item: any) => item.kind === "durable-object-create")?.status, "applied");
+  fixture.removeWorker();
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+    (error: any) => error?.message === "Durable Object absence is unproven without the deleted_classes lifecycle",
+  );
 });
 
 test("credentialed preflight calls no mutation and its public result contains no target identity", async (t) => {

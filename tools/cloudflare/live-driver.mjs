@@ -13,7 +13,7 @@ import {
 } from "./deployment.mjs";
 import { createFinalEvidencePacket, saveEvidencePacket } from "./evidence.mjs";
 import { validateStagingInventory } from "./inventory.mjs";
-import { createJournal, loadJournal, saveJournal, saveNewJournal } from "./journal.mjs";
+import { createJournal, loadJournal, saveJournal, saveNewJournal, TEARDOWN_ENTRY_PHASES } from "./journal.mjs";
 import { D1_MIGRATIONS, verifyMigrationDirectory } from "./migrations.mjs";
 import { assertRollbackCompatible, createJournalRetention, runStackTeardown } from "./recovery.mjs";
 import { createSyntheticFixturePlan } from "./staging-fixtures.mjs";
@@ -964,8 +964,6 @@ async function applyOperation(options, dependencies) {
       }
     },
   });
-  const durableIntent = journal.mutations.find((item) => item?.kind === "durable-object-create");
-  durableIntent.status = "applied";
   journal.deployment = { initialId: deployed.deployment.deploymentId, sourceSha: journal.sourceSha, configDigest: privateConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COORDINATOR"], rollback: "forward-fix-only", lifecycle: "legacy-sqlite-v1" };
   await persist(options.journalPath, journal);
 
@@ -1233,7 +1231,7 @@ async function teardownOperation(options, dependencies) {
     await rm(effectiveConfigDirectory(options.root, journal.runId), { recursive: true, force: true });
     return { operation: "teardown", phase: journal.phase, absenceCount: Object.keys(absence).length, cleanupComplete: true, wholeStackRollback: false };
   }
-  if (journal.phase !== "quarantined") throw new Error("origin must be quarantined before teardown");
+  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("teardown requires a post-write journal phase");
   const credentials = requireCredentials(options.credentialEnvironment, "teardown");
   const privateConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false });
   const deleteConfig = await generateEffectiveConfig({ root: options.root, runId: journal.runId, inventory, databaseId: journal.identity.databaseId, sourceSha: journal.sourceSha, workersDev: false, deleteDurableObject: true });

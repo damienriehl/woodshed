@@ -1,4 +1,5 @@
 import { redactEvidence } from "./evidence.mjs";
+import { TEARDOWN_ENTRY_PHASES } from "./journal.mjs";
 
 const RESOURCE_ORDER = Object.freeze(["route", "hostname", "credential", "secret", "worker", "durable-object", "d1", "token"]);
 const COMPATIBILITY_FIELDS = Object.freeze([
@@ -65,7 +66,7 @@ function ownedResource(resource, journal) {
 export async function runStackTeardown(options) {
   const { journal, lease, expectedRevision, inspectRevision, listDependents, inspectResource, removeResource, verifyTokenInactive } = options;
   assertLease(journal, lease);
-  if (journal.phase !== "quarantined") throw new Error("origin must be quarantined before teardown");
+  if (!TEARDOWN_ENTRY_PHASES.includes(journal.phase)) throw new Error("teardown requires a post-write journal phase");
   if (lease.revision !== expectedRevision || await inspectRevision() !== expectedRevision) throw new Error("last-write identity changed");
   if (!Array.isArray(journal.resources)) throw new Error("valid run-owned resource graph is required");
   const resources = journal.resources.map((resource) => {

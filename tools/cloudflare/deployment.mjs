@@ -428,6 +428,7 @@ export async function runMigrationFirstDeployment(options) {
   await verifyFinalSchema();
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before deploy");
   let intent = journal.mutations.find((item) => item?.kind === "worker-deploy");
+  const durableIntent = journal.mutations.find((item) => item?.kind === "durable-object-create");
   if (journal.mutations.filter((item) => item?.kind === "worker-deploy").length > 1) throw new Error("deployment journal contains duplicate intents");
   let deployment;
   if (intent) {
@@ -437,10 +438,13 @@ export async function runMigrationFirstDeployment(options) {
     deployment = await inspectDeployment();
     if (!deployment) throw new Error("deployment outcome is uncertain; no replay authorized");
     await verifyDeployment(deployment);
-    if (intent.status === "pending") {
+    const deploymentPending = intent.status === "pending";
+    const durableIntentPending = durableIntent?.status === "pending";
+    if (deploymentPending) {
       intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
-      await persistJournal(journal);
     }
+    if (durableIntentPending) durableIntent.status = "applied";
+    if (deploymentPending || durableIntentPending) await persistJournal(journal);
   } else {
     intent = { kind: "worker-deploy", status: "pending", sourceSha: journal.sourceSha };
     journal.mutations.push(intent);
@@ -455,6 +459,7 @@ export async function runMigrationFirstDeployment(options) {
     }
     await verifyDeployment(deployment);
     intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
+    if (durableIntent?.status === "pending") durableIntent.status = "applied";
     await persistJournal(journal);
   }
   journal.phase = "worker-deployed";

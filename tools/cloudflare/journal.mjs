@@ -3,6 +3,7 @@ import { link, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const PHASES = new Set(["pre-write", "resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"]);
+export const TEARDOWN_ENTRY_PHASES = Object.freeze(["resources-ready", "bookmark-captured", "schema-expanded", "worker-deployed", "alias-live", "verified", "quarantined"]);
 const REQUIRED_IDENTITY = ["accountId", "databaseName", "workerName", "origin"];
 const RESOURCE_DOMAINS = new Set(["route", "hostname", "credential", "secret", "worker", "durable-object", "d1", "token"]);
 const CLOSED_D1_REFUSAL_INCIDENTS = new Set(["d1-create-refused", "d1-acceptance-mismatch"]);
