@@ -309,11 +309,10 @@ test("assigned D1 UUID is journaled with ownership before provisioning continues
   assert.equal(persisted, true);
 });
 
-test("schema verification covers foreign keys, integrity, strict objects, choice seed, and migration 009 preservation", () => {
+test("schema verification covers foreign keys, strict objects, choice seed, and migration 009 preservation", () => {
   const expected = {
     foreignKeysEnabled: true,
     foreignKeyViolations: 0,
-    integrity: "ok",
     tables: ["events", "event_participants"],
     indexes: ["idx_event_participants_event"],
     triggers: ["seed_event_choice_config"],

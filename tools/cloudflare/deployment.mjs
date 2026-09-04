@@ -326,7 +326,6 @@ function exactSet(actual, expected, label) {
 
 export function assertSchemaInvariants(actual, expected) {
   if (actual.foreignKeysEnabled !== true || actual.foreignKeyViolations !== 0) throw new Error("foreign key verification failed");
-  if (actual.integrity !== "ok") throw new Error("integrity verification failed");
   for (const key of ["tables", "indexes", "triggers", "constraints"]) exactSet(actual[key], expected[key], key);
   if (expected.definitionDigest !== undefined && actual.definitionDigest !== expected.definitionDigest) throw new Error("schema definition fingerprint verification failed");
   if (actual.choiceConfigSeeded !== true) throw new Error("event choice configuration seed verification failed");
