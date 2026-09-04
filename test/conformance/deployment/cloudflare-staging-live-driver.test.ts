@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   collectRemoteInventory,
+  confirmAbsence,
   createApiTokenClient,
   createIdentityRevision,
   executeJournaledMutation,
@@ -27,6 +28,151 @@ const accountId = "b".repeat(32);
 const databaseId = "11111111-2222-4333-8444-555555555555";
 const workerName = "woodshed-staging-synthetic";
 const origin = `https://${workerName}.synthetic.workers.dev`;
+
+function fakeRetryTimers() {
+  const delays: number[] = [];
+  const callbacks: Array<() => void> = [];
+  let timerScheduled: (() => void) | undefined;
+  return {
+    delays,
+    setTimer(callback: () => void, delay: number) {
+      callbacks.push(callback);
+      delays.push(delay);
+      timerScheduled?.();
+      timerScheduled = undefined;
+      return callbacks.length;
+    },
+    clearTimer() {},
+    async fireNext() {
+      if (callbacks.length === 0) await new Promise<void>((resolve) => { timerScheduled = resolve; });
+      const callback = callbacks.shift();
+      assert.ok(callback);
+      callback();
+    },
+  };
+}
+
+test("confirmAbsence proves absence without scheduling a retry", async () => {
+  const timers = fakeRetryTimers();
+  const result = await confirmAbsence(async () => false, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  });
+
+  assert.deepEqual(result, {
+    outcome: "proven-absent",
+    attempts: 1,
+    checkedAt: "2030-01-01T12:00:00.000Z",
+    lastError: null,
+  });
+  assert.deepEqual(timers.delays, []);
+});
+
+test("confirmAbsence retries with non-decreasing full-jitter delays", async () => {
+  const timers = fakeRetryTimers();
+  let probeCalls = 0;
+  const confirmation = confirmAbsence(async () => {
+    probeCalls += 1;
+    return probeCalls < 3;
+  }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    random: () => 1,
+  });
+
+  await timers.fireNext();
+  await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "proven-absent");
+  assert.equal(result.attempts, 3);
+  assert.deepEqual(timers.delays, [500, 1_000]);
+  assert.ok(timers.delays.every((delay, index) => index === 0 || delay >= timers.delays[index - 1]!));
+});
+
+test("confirmAbsence cannot confirm after a multi-attempt budget is exhausted", async () => {
+  const timers = fakeRetryTimers();
+  const confirmation = confirmAbsence(async () => true, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+    attempts: 8,
+    random: () => 1,
+  });
+
+  for (let retry = 0; retry < 7; retry += 1) await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "could-not-confirm");
+  assert.notEqual(result.outcome, "proven-absent");
+  assert.equal(result.attempts, 8);
+});
+
+test("confirmAbsence stops when the wall-clock budget is exhausted", async () => {
+  const timers = fakeRetryTimers();
+  let probeCalls = 0;
+  const confirmation = confirmAbsence(async () => {
+    probeCalls += 1;
+    return true;
+  }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date(probeCalls < 2 ? 0 : 101),
+    attempts: 8,
+    initialDelayMs: 1,
+    budgetMs: 100,
+    random: () => 1,
+  });
+
+  await timers.fireNext();
+  const result = await confirmation;
+
+  assert.equal(result.outcome, "could-not-confirm");
+  assert.ok(result.attempts < 8);
+  assert.equal(result.attempts, 2);
+});
+
+test("confirmAbsence stops immediately on rate limiting", async () => {
+  const timers = fakeRetryTimers();
+  const rateLimitError = Object.assign(new Error("rate limited"), { status: 429 });
+  const result = await confirmAbsence(async () => { throw rateLimitError; }, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  });
+
+  assert.equal(result.outcome, "could-not-confirm");
+  assert.equal(result.attempts, 1);
+  assert.equal(result.lastError, rateLimitError);
+  assert.deepEqual(timers.delays, []);
+});
+
+test("confirmAbsence propagates non-rate-limit probe errors", async () => {
+  const error = Object.assign(new Error("bad request"), { status: 400 });
+  await assert.rejects(confirmAbsence(async () => { throw error; }, {
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  }), (thrown) => thrown === error);
+});
+
+test("confirmAbsence waits before retrying with real timers", async () => {
+  let probeCalls = 0;
+  const startedAt = Date.now();
+  const result = await confirmAbsence(async () => {
+    probeCalls += 1;
+    return probeCalls === 1;
+  }, {
+    initialDelayMs: 60,
+    attempts: 3,
+    random: () => 1,
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.outcome, "proven-absent");
+  assert.equal(probeCalls, 2);
+  assert.ok(elapsedMs >= 55, `expected a real delay of at least 55ms, received ${elapsedMs}ms`);
+});
 
 function inventory() {
   return {

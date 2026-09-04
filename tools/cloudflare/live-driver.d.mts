@@ -7,7 +7,30 @@ export interface LiveCliArguments {
   owner?: string;
 }
 
+export interface LiveDriverTimerDependencies {
+  setTimer?: (callback: () => void, delay: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
+  now?: () => Date;
+}
+
+export interface ConfirmAbsenceOptions extends LiveDriverTimerDependencies {
+  attempts?: number;
+  initialDelayMs?: number;
+  factor?: number;
+  maxDelayMs?: number;
+  budgetMs?: number;
+  random?: () => number;
+}
+
+export interface ConfirmAbsenceResult {
+  outcome: "proven-absent" | "present" | "could-not-confirm";
+  attempts: number;
+  checkedAt: string;
+  lastError: unknown | null;
+}
+
 export function parseLiveArguments(argv: string[]): LiveCliArguments;
+export function confirmAbsence(probe: () => Promise<boolean>, options?: ConfirmAbsenceOptions): Promise<ConfirmAbsenceResult>;
 export function generateEffectiveConfig(options: Record<string, any>): Promise<{ configPath: string; migrationsDirectory: string; configDigest: string; lifecycleTag: string; deletionTag?: string }>;
 export function collectRemoteInventory(options: Record<string, any>): Promise<Record<string, any>>;
 export function createIdentityRevision(remote: Record<string, any>): string;
@@ -29,6 +52,6 @@ export function executeJournaledMutation(options: {
 }): Promise<{ reconciled: boolean; state: any }>;
 export function inspectSourceState(root: string): { actualSourceSha: string; worktreeClean: boolean };
 export function createApiTokenClient(options: Record<string, any>): { inspect(): Promise<Record<string, any>>; inspectId(id: string): Promise<Record<string, any>>; revoke(id: string): Promise<true>; listWorkerScripts(accountId: string): Promise<Array<{ name: string }>>; listWorkerRoutes(accountId: string): Promise<Array<{ pattern: string; script: string | null }>>; listWorkerDomains(accountId: string): Promise<Array<{ hostname: string; script: string | null; environment: string | null }>>; inspectWorkersDev(accountId: string, workerName: string): Promise<{ exists: boolean; enabled: boolean }>; inspectAccountSubdomain(accountId: string): Promise<string> };
-export function runLiveOperation(input: Record<string, any>, overrides?: Record<string, any>): Promise<Record<string, any>>;
+export function runLiveOperation(input: Record<string, any>, overrides?: Record<string, any> & LiveDriverTimerDependencies): Promise<Record<string, any>>;
 export function publicOperationResult(result: Record<string, any>): Record<string, any>;
 export const LIVE_OPERATIONS: readonly string[];

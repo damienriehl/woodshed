@@ -49,6 +49,67 @@ function requiredString(value, label) {
   return value;
 }
 
+function confirmation(outcome, attempts, checkedAt, lastError = null) {
+  return { outcome, attempts, checkedAt: checkedAt.toISOString(), lastError };
+}
+
+function rateLimited(error) {
+  return error !== null
+    && (typeof error === "object" || typeof error === "function")
+    && (error.status === 429 || error.statusCode === 429);
+}
+
+function waitForRetry(delay, setTimer, clearTimer) {
+  return new Promise((resolve) => {
+    let handle = null;
+    handle = setTimer(() => {
+      clearTimer(handle);
+      resolve();
+    }, delay);
+  });
+}
+
+export async function confirmAbsence(probe, {
+  setTimer = (callback, delay) => setTimeout(callback, delay),
+  clearTimer = (handle) => clearTimeout(handle),
+  now = () => new Date(),
+  attempts: attemptLimit = 8,
+  initialDelayMs = 500,
+  factor = 2,
+  maxDelayMs = 8_000,
+  budgetMs = 45_000,
+  random = Math.random,
+} = {}) {
+  const startedAt = now().getTime();
+  let attempts = 0;
+
+  while (attempts < attemptLimit) {
+    attempts += 1;
+    let present;
+    try {
+      present = await probe();
+    } catch (error) {
+      if (rateLimited(error)) return confirmation("could-not-confirm", attempts, now(), error);
+      throw error;
+    }
+
+    if (!present) return confirmation("proven-absent", attempts, now());
+    if (attempts >= attemptLimit) {
+      return confirmation(attemptLimit === 1 ? "present" : "could-not-confirm", attempts, now());
+    }
+
+    const checkedAt = now();
+    const elapsedMs = checkedAt.getTime() - startedAt;
+    const delayMs = Math.min(maxDelayMs, initialDelayMs * factor ** (attempts - 1)) * random();
+    if (elapsedMs >= budgetMs || delayMs > budgetMs - elapsedMs) {
+      return confirmation("could-not-confirm", attempts, checkedAt);
+    }
+    await waitForRetry(delayMs, setTimer, clearTimer);
+  }
+
+  return confirmation("could-not-confirm", attempts, now());
+}
+
 function effectiveConfigDirectory(root, runId) {
   return path.join(root, ".cloudflare-staging", `run-${sha256(safeRunId(runId)).slice(0, 16)}`);
 }
@@ -688,6 +749,8 @@ function defaultDependencies(overrides = {}) {
     sourceState: overrides.sourceState,
     acceptance: overrides.acceptance ?? runDeployedAcceptance,
     now: overrides.now ?? (() => new Date()),
+    setTimer: overrides.setTimer ?? ((callback, delay) => setTimeout(callback, delay)),
+    clearTimer: overrides.clearTimer ?? ((handle) => clearTimeout(handle)),
   };
 }
 
