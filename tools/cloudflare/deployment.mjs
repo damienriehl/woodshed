@@ -92,7 +92,8 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
   if (!spawn) prepareWranglerHome(root);
   const inheritedNames = ["PATH", "USER", "SHELL", "TMPDIR", "TEMP", "TMP", "CI", "NO_COLOR", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
   const childEnv = Object.fromEntries(inheritedNames.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]));
-  Object.assign(childEnv, { HOME: isolatedHome, XDG_CONFIG_HOME: isolatedHome, CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false", CLOUDFLARE_INCLUDE_PROCESS_ENV: "false", WRANGLER_LOG: "none", WRANGLER_LOG_PATH: path.join(root, ".cloudflare-staging", "wrangler.log"), WRANGLER_SEND_METRICS: "false" });
+  // Wrangler "none"/"error" suppress --json payloads and the [code: ...] stderr needed for not-found tolerance.
+  Object.assign(childEnv, { HOME: isolatedHome, XDG_CONFIG_HOME: isolatedHome, CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false", CLOUDFLARE_INCLUDE_PROCESS_ENV: "false", WRANGLER_LOG: "log", WRANGLER_LOG_PATH: path.join(root, ".cloudflare-staging", "wrangler.log"), WRANGLER_SEND_METRICS: "false" });
   if (accountId) childEnv.CLOUDFLARE_ACCOUNT_ID = accountId;
   async function invoke(args, { input, allowNotFound = false } = {}) {
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) throw new Error("Wrangler arguments must be strings");
@@ -107,7 +108,8 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
       ? await spawn(binary, completeArgs, executionOptions)
       : await runBoundedSubprocess(binary, completeArgs, executionOptions);
     if (!result || result.exitCode !== 0) {
-      if (allowNotFound && /\[code:\s*10007\]/i.test(result?.stderr ?? "")) return { exitCode: result.exitCode, stdout: "[]", stderr: "" };
+      // Wrangler can emit its error block on stdout, so inspect both failed-command streams.
+      if (allowNotFound && /\[code:\s*10007\]/i.test(`${result?.stderr ?? ""}\n${result?.stdout ?? ""}`)) return { exitCode: result.exitCode, stdout: "[]", stderr: "" };
       throw new Error("Wrangler command failed");
     }
     return result;
