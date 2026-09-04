@@ -1923,3 +1923,35 @@ test("teardown proves the near-miss refusal runs before it records cleanup compl
   assert.ok(guard > 0, "teardown must call the near-miss refusal");
   assert.ok(completion > guard, "the refusal must run before cleanup-complete is recorded");
 });
+
+test("early-phase teardown refuses to delete a same-named Worker this run never deployed", async (t) => {
+  // The widened teardown entry accepts phases reached before the Worker is deployed. A Worker is
+  // matched by name alone, and inspectResource can only stamp the journal's own identity onto
+  // whatever is remotely present, so recovery's ownership check compares the journal against
+  // itself. Without this guard a run that crashed at resources-ready would delete a Worker a
+  // LATER run created at the same name -- in a shared account, someone else's live Worker.
+  const fixture = await postWriteTeardownFixture(t, "resources-ready");
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.phase, "resources-ready");
+  assert.equal(journal.mutations.some((item: any) => item.kind === "worker-deploy" && item.status === "applied"), false);
+
+  // A Worker exists at the run's name -- created by some LATER run, not this one.
+  let deleted = 0;
+  const base = fixture.dependencies.adapterFactory();
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...base,
+      deploymentsList: async () => [{ id: "deployment-from-another-run", script_name: workerName }],
+      versionsList: async () => [],
+      deleteWorker: async () => { deleted += 1; },
+    }),
+  };
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, dependencies),
+    /remote Worker predates this run's deployment; refusing to remove it/,
+  );
+  assert.equal(deleted, 0);
+  assert.notEqual(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});

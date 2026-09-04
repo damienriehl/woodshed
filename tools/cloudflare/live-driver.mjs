@@ -1317,6 +1317,19 @@ async function teardownOperation(options, dependencies) {
     return deployments.length > 0 || versions.length > 0;
   };
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
+  // A Worker is matched by name alone, so inspectResource can only stamp the journal's own
+  // identity onto whatever is remotely present -- which makes recovery's ownership check
+  // compare the journal against itself. That was safe while teardown required "quarantined",
+  // because reaching it implied this run had deployed. The widened entry accepts phases that
+  // carry no such implication, so a run that crashed before deploying could delete a same-named
+  // Worker a later run created. Require this run's own applied deploy before touching one.
+  const DEPLOYED_PHASES = ["worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"];
+  const deployedByThisRun = journal.mutations.some((item) => item?.kind === "worker-deploy" && item.status === "applied")
+    || DEPLOYED_PHASES.includes(journal.phase);
+  const assertRunDeployedIt = (present) => {
+    if (present && !deployedByThisRun) throw new Error("remote Worker predates this run's deployment; refusing to remove it");
+    return present;
+  };
   const inspectResource = async (resource) => {
     if (resource.domain === "route") {
       const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
@@ -1327,8 +1340,8 @@ async function teardownOperation(options, dependencies) {
       const rows = d1Results(await adapter.d1Execute(journal.identity.databaseName, { command: `SELECT count(*) AS count FROM participant_sessions WHERE id_hash=${sql(activeCredential(journal))} AND revoked_at IS NULL` }));
       return { exists: Number(rows[0]?.count ?? 0) > 0, runId: journal.runId, owner: journal.owner };
     }
-    if (resource.domain === "secret") return { exists: (await adapter.secretList(journal.identity.workerName)).some((item) => item?.name === "LIVE_COMMAND_SECRET"), runId: journal.runId, owner: journal.owner };
-    if (resource.domain === "worker") return { exists: await workerExists(), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "secret") return { exists: assertRunDeployedIt((await adapter.secretList(journal.identity.workerName)).some((item) => item?.name === "LIVE_COMMAND_SECRET")), runId: journal.runId, owner: journal.owner };
+    if (resource.domain === "worker") return { exists: assertRunDeployedIt(await workerExists()), runId: journal.runId, owner: journal.owner };
     if (resource.domain === "durable-object") {
       const deletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && item.tag === deleteConfig.deletionTag && item.configDigest === deleteConfig.configDigest);
       const creationApplied = journal.mutations.some((item) => item?.kind === "durable-object-create" && item.status === "applied");
