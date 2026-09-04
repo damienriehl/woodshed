@@ -11,6 +11,7 @@ import {
   assertCredentialedPreflight,
   assertSharedAccountInventory,
   assertSchemaInvariants,
+  composeWranglerArgs,
   createWranglerAdapter,
   persistAssignedDatabaseIdentity,
   reconcileMigrationLedger,
@@ -48,7 +49,24 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.deepEqual(await adapter.json(["secret", "list"], { workerName: "woodshed-staging-run-a" }), [{ id: "safe" }]);
   await adapter.secretPut("LIVE_COMMAND_SECRET", "r".repeat(32), { workerName: "woodshed-staging-run-a" });
   assert.equal(calls[0].file, "/repo/node_modules/.bin/wrangler");
-  assert.deepEqual(calls[0].args.slice(-4), ["--config", "/repo/deploy/cloudflare/wrangler.jsonc", "--env", "staging"]);
+  const composition = {
+    envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+    configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+  };
+  assert.deepEqual(calls[0].args, composeWranglerArgs({
+    args: ["d1", "list", "--json"],
+    ...composition,
+  }));
+  assert.deepEqual(calls[1].args, composeWranglerArgs({
+    args: ["secret", "list", "--name", "woodshed-staging-run-a", "--format", "json"],
+    ...composition,
+    suppressEnv: true,
+  }));
+  assert.deepEqual(calls[2].args, composeWranglerArgs({
+    args: ["secret", "put", "LIVE_COMMAND_SECRET", "--name", "woodshed-staging-run-a"],
+    ...composition,
+    suppressEnv: true,
+  }));
   assert.equal(calls[0].options.shell, false);
   assert.equal((calls[0].options as any).env.CLOUDFLARE_API_TOKEN, "private-token");
   assert.equal((calls[0].options as any).env.HOME, "/repo/.cloudflare-staging/wrangler-home");
@@ -61,6 +79,83 @@ test("Wrangler adapter uses the pinned local binary, args without a shell, expli
   assert.equal((adapter as any).invoke, undefined);
   await assert.rejects(adapter.json(["deploy", "--name", "production"]), /not allowlisted/);
   await assert.rejects(adapter.json(["secret", "list"], { workerName: "production" }), /safe staging Worker name/);
+});
+
+test("Worker commands use the Wrangler name resolver appropriate to their command family", async () => {
+  const calls: any[] = [];
+  const workerName = "woodshed-staging-synthetic";
+  const configPath = "/repo/.cloudflare-staging/run-safe/wrangler.json";
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    configPath,
+    spawn: async (file: string, args: string[], options: object) => {
+      calls.push({ file, args, options });
+      return { exitCode: 0, stdout: "[]", stderr: "" };
+    },
+  });
+
+  await adapter.deploy(workerName);
+  await adapter.deleteWorker(workerName);
+  await adapter.deploymentsList(workerName);
+  await adapter.versionsList(workerName);
+  await adapter.secretPut("LIVE_COMMAND_SECRET", "r".repeat(32), { workerName });
+  await adapter.secretDelete("LIVE_COMMAND_SECRET", workerName);
+  await adapter.secretList(workerName);
+  await adapter.json(["secret", "list"], { workerName });
+
+  for (const call of calls) {
+    const nameIndex = call.args.indexOf("--name");
+    const configIndex = call.args.indexOf("--config");
+    assert.equal(call.args[nameIndex + 1], workerName);
+    assert.equal(call.args[configIndex + 1], configPath);
+  }
+
+  // Wrangler's getScriptName resolves --name plus --env to the explicit, unsuffixed Worker name.
+  for (const call of calls.slice(0, 4)) {
+    assert.deepEqual(call.args.slice(call.args.indexOf("--env"), call.args.indexOf("--env") + 2), ["--env", "staging"]);
+  }
+  for (const call of calls.slice(4)) {
+    assert.equal(call.args.includes("--env"), false);
+    assert.equal(call.args.includes("-e"), false);
+  }
+});
+
+test("Wrangler argument composition rejects environment flags for secret-family commands", () => {
+  for (const environmentArgs of [["--env", "staging"], ["-e", "staging"]]) {
+    assert.throws(() => composeWranglerArgs({
+      args: ["secret", "list", "--name", "woodshed-staging-synthetic", ...environmentArgs],
+      envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+      configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+      suppressEnv: true,
+    }), /secret-family Wrangler invocation must not include an environment flag/);
+  }
+});
+
+test("Wrangler argument composition requires an explicit Worker name for secret-family commands", () => {
+  // Without --name, wrangler falls through to the config's top-level name, which is a
+  // different Worker entirely. Suppressing --env alone would not catch that.
+  assert.throws(() => composeWranglerArgs({
+    args: ["secret", "list"],
+    envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+    configPath: "/repo/deploy/cloudflare/wrangler.jsonc",
+    suppressEnv: true,
+  }), /secret-family Wrangler invocation must name its Worker explicitly/);
+});
+
+test("Wrangler adapter retains its caller-supplied environment and config flag guard", async () => {
+  const adapter = createWranglerAdapter({
+    root: "/repo",
+    token: "synthetic-private-token",
+    spawn: async () => ({ exitCode: 0, stdout: "[]", stderr: "" }),
+  });
+
+  for (const flag of ["--config", "--env", "-c", "-e"]) {
+    await assert.rejects(
+      adapter.d1Execute("woodshed-staging-synthetic-db", { command: flag }),
+      /Wrangler environment selection is owned by the staging adapter/,
+    );
+  }
 });
 
 test("adapter does not suppress Wrangler structured output", async () => {
@@ -181,8 +276,30 @@ test("live Wrangler methods remain staging-scoped, bounded, and keep credentials
   await adapter.deleteWorker("woodshed-staging-synthetic");
   await adapter.d1Delete("woodshed-staging-synthetic-db");
 
-  for (const call of calls) {
-    assert.deepEqual(call.args.slice(-4), ["--config", "/repo/.cloudflare-staging/run-safe/wrangler.json", "--env", "staging"]);
+  const expectedBaseArgs = [
+    ["whoami", "--account", "a".repeat(32)],
+    ["d1", "list", "--json"],
+    ["deployments", "list", "--name", "woodshed-staging-synthetic", "--json"],
+    ["versions", "list", "--name", "woodshed-staging-synthetic", "--json"],
+    ["secret", "list", "--name", "woodshed-staging-synthetic", "--format", "json"],
+    ["d1", "create", "woodshed-staging-synthetic-db"],
+    ["d1", "time-travel", "info", "woodshed-staging-synthetic-db", "--json"],
+    ["d1", "execute", "woodshed-staging-synthetic-db", "--remote", "--json", "--command", "SELECT 1"],
+    ["d1", "migrations", "apply", "woodshed-staging-synthetic-db", "--remote"],
+    ["deploy", "--name", "woodshed-staging-synthetic"],
+    ["secret", "delete", "LIVE_COMMAND_SECRET", "--name", "woodshed-staging-synthetic"],
+    ["delete", "--name", "woodshed-staging-synthetic"],
+    ["d1", "delete", "woodshed-staging-synthetic-db", "--skip-confirmation"],
+  ];
+  for (const [index, args] of expectedBaseArgs.entries()) {
+    const call = calls[index];
+    assert.ok(call);
+    assert.deepEqual(call.args, composeWranglerArgs({
+      args,
+      envFilePath: "/repo/.cloudflare-staging/wrangler-home/empty-environment",
+      configPath: "/repo/.cloudflare-staging/run-safe/wrangler.json",
+      suppressEnv: args[0] === "secret",
+    }));
     assert.equal(call.options.shell, false);
     assert.equal(call.options.env.CLOUDFLARE_API_TOKEN, "private-token-value");
     assert.equal(call.options.env.CLOUDFLARE_ACCOUNT_ID, "a".repeat(32));
