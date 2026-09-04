@@ -11,6 +11,8 @@ export function parseLiveArguments(argv: string[]): LiveCliArguments;
 export function generateEffectiveConfig(options: Record<string, any>): Promise<{ configPath: string; migrationsDirectory: string; configDigest: string; lifecycleTag: string; deletionTag?: string }>;
 export function collectRemoteInventory(options: Record<string, any>): Promise<Record<string, any>>;
 export function createIdentityRevision(remote: Record<string, any>): string;
+export function remoteSchema(adapter: any, databaseName: string, migration009: Record<string, any>): Promise<Record<string, any>>;
+export function recordVerifiedSchemaEvidence(journal: any, actual: Record<string, any>, expected: Record<string, any>): Record<string, any>;
 export function executeJournaledMutation(options: {
   journal: any;
   expectedRevision: string;

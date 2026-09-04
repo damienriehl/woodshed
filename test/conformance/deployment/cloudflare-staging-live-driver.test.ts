@@ -13,6 +13,8 @@ import {
   generateEffectiveConfig,
   parseLiveArguments,
   publicOperationResult,
+  recordVerifiedSchemaEvidence,
+  remoteSchema,
   runLiveOperation,
 } from "../../../tools/cloudflare/live-driver.mjs";
 import { createJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
@@ -38,6 +40,32 @@ function inventory() {
       workerNames: ["protected-worker"],
     },
   };
+}
+
+function schemaInspectionFixture(foreignKeyViolations: any[] = []) {
+  const commands: string[] = [];
+  const objects = [
+    { type: "table", name: "events", sql: "CREATE TABLE events (id TEXT PRIMARY KEY)" },
+    { type: "trigger", name: "event_choice_config_seed", sql: "CREATE TRIGGER event_choice_config_seed AFTER INSERT ON events BEGIN SELECT 1; END" },
+  ];
+  const adapter = {
+    d1Execute: async (_databaseName: string, { command }: { command: string }) => {
+      commands.push(command);
+      if (command.includes("SELECT type,name,sql FROM sqlite_schema")) return [{ success: true, results: objects }];
+      if (command === "PRAGMA foreign_keys") return [{ success: true, results: [{ foreign_keys: 1 }] }];
+      if (command === "PRAGMA foreign_key_check") return [{ success: true, results: foreignKeyViolations }];
+      throw new Error(`unexpected D1 command: ${command}`);
+    },
+  };
+  const migration009 = {
+    beforeRows: 2,
+    afterRows: 2,
+    beforeAssociations: 2,
+    afterAssociations: 2,
+    beforeAssociationDigest: "f".repeat(64),
+    afterAssociationDigest: "f".repeat(64),
+  };
+  return { adapter, commands, migration009 };
 }
 
 async function failedApplyFixture(t: any, { quarantineFails = false } = {}) {
@@ -92,6 +120,78 @@ async function failedApplyFixture(t: any, { quarantineFails = false } = {}) {
   };
   await runLiveOperation({ ...common, operation: "plan" }, dependencies);
   return { applyFailure, common, dependencies, journalPath, quarantineInspections: () => quarantineInspections };
+}
+
+async function preWorkerTeardownFixture(t: any, durableCreateStatus: "pending" | "applied") {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-pre-worker-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-pre-worker-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  let databasePresent = true;
+  let databaseDeletes = 0;
+  const remoteWithoutTarget = { accountId, databases: [], workers: [], routes: [], deployments: [], versions: [] };
+  const journal = createJournal({
+    runId: `run-pre-worker-${durableCreateStatus}`,
+    owner: "owner-pre-worker",
+    sourceSha,
+    identity: stagingInventory.staging,
+  });
+  journal.phase = "quarantined";
+  const revision = createIdentityRevision(remoteWithoutTarget);
+  journal.preflight = { protectedRevision: revision, targetRevision: revision, operatorTokenPresent: true };
+  journal.lease = { active: true, runId: journal.runId, owner: journal.owner, revision };
+  journal.acceptance = { status: "not-run", cleanupComplete: false };
+  for (const [domain, id, status] of [
+    ["route", "route-pre-worker", "planned"],
+    ["hostname", "hostname-pre-worker", "planned"],
+    ["credential", "credential-pre-worker", "planned"],
+    ["secret", "secret-pre-worker", "planned"],
+    ["worker", workerName, "planned"],
+    ["durable-object", "durable-pre-worker", durableCreateStatus === "applied" ? "owned" : "planned"],
+    ["d1", databaseId, "owned"],
+  ] as const) journal.resources.push({ domain, id, status, runId: journal.runId, owner: journal.owner });
+  journal.mutations.push(
+    { kind: "d1-create", domain: "d1", id: databaseId, status: "applied", providerAcceptance: { id: databaseId } },
+    { kind: "durable-object-create", domain: "durable-object", id: "durable-pre-worker", status: durableCreateStatus },
+  );
+  await saveJournal(journalPath, journal);
+
+  const adapter = {
+    whoami: async () => ({ accountId }),
+    d1List: async () => databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
+    deploymentsList: async () => [],
+    versionsList: async () => [],
+    secretList: async () => [],
+    d1Delete: async () => { databaseDeletes += 1; databasePresent = false; },
+  };
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectWorkersDev: async () => ({ exists: false, enabled: false }),
+  };
+  const common = {
+    root: testRoot,
+    environment: "staging",
+    inventoryPath,
+    journalPath,
+    runId: journal.runId,
+    owner: journal.owner,
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token" },
+  };
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory: () => adapter,
+    tokenClientFactory: () => tokenClient,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  };
+  return { common, dependencies, journalPath, databasePresent: () => databasePresent, databaseDeletes: () => databaseDeletes };
 }
 
 async function d1ReconciliationFixture(t: any, intentStatus?: "pending" | "applied", {
@@ -255,6 +355,55 @@ test("identity revisions are stable across provider ordering and duplicate entri
   assert.equal(createIdentityRevision(first), createIdentityRevision(second));
 });
 
+test("remote schema inspection omits unsupported D1 integrity checks", async () => {
+  const fixture = schemaInspectionFixture();
+  const actual = await remoteSchema(fixture.adapter, `${workerName}-db`, fixture.migration009);
+
+  assert.deepEqual(fixture.commands, [
+    "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' AND substr(name,1,4) <> '_cf_' AND name <> 'd1_migrations' AND sql IS NOT NULL ORDER BY type,name",
+    "PRAGMA foreign_keys",
+    "PRAGMA foreign_key_check",
+  ]);
+  assert.equal(actual.integrity, "unsupported-on-d1");
+});
+
+test("successful schema verification records D1 integrity as unavailable", async () => {
+  const fixture = schemaInspectionFixture();
+  const actual = await remoteSchema(fixture.adapter, `${workerName}-db`, fixture.migration009);
+  const expected = {
+    tables: actual.tables,
+    indexes: actual.indexes,
+    triggers: actual.triggers,
+    constraints: actual.constraints,
+    definitionDigest: actual.definitionDigest,
+  };
+  const journal: any = {};
+
+  recordVerifiedSchemaEvidence(journal, actual, expected);
+
+  assert.match(journal.schema.digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual({ ...journal.schema, digest: undefined }, {
+    digest: undefined,
+    foreignKeysEnabled: true,
+    foreignKeyViolations: 0,
+    integrity: "unsupported-on-d1",
+  });
+});
+
+test("schema verification still rejects foreign-key violations", async () => {
+  const fixture = schemaInspectionFixture([{ table: "event_participants", rowid: 1, parent: "events", fkid: 0 }]);
+  const actual = await remoteSchema(fixture.adapter, `${workerName}-db`, fixture.migration009);
+  const expected = {
+    tables: actual.tables,
+    indexes: actual.indexes,
+    triggers: actual.triggers,
+    constraints: actual.constraints,
+    definitionDigest: actual.definitionDigest,
+  };
+
+  assert.throws(() => recordVerifiedSchemaEvidence({}, actual, expected), /foreign key verification failed/);
+});
+
 test("journaled mutation persists intent before write, aborts drift, and reconciles response loss", async () => {
   const identity = inventory().staging;
   const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha, identity });
@@ -397,6 +546,31 @@ test("teardown of a refused d1-create run preserves the foreign database", async
     passed: true,
     refusedD1Create: true,
   });
+});
+
+test("teardown removes D1 when the Durable Object creation never applied", async (t) => {
+  const fixture = await preWorkerTeardownFixture(t, "pending");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.databaseDeletes(), 1);
+  assert.equal(fixture.databasePresent(), false);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.phase, "cleanup-complete");
+  assert.equal(journal.teardown.absence["durable-object:durable-pre-worker"], true);
+  assert.equal(journal.teardown.absence[`d1:${databaseId}`], true);
+});
+
+test("teardown requires deleted_classes proof after Durable Object creation applied", async (t) => {
+  const fixture = await preWorkerTeardownFixture(t, "applied");
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+    /Durable Object absence is unproven without the deleted_classes lifecycle/,
+  );
+  assert.equal(fixture.databaseDeletes(), 0);
+  assert.equal(fixture.databasePresent(), true);
 });
 
 test("credentialed preflight calls no mutation and its public result contains no target identity", async (t) => {
@@ -808,7 +982,6 @@ test("mocked live boundaries complete plan through teardown in dependency order 
       if (command.includes("SELECT type,name,sql FROM sqlite_schema")) return read([{ success: true, results: schemaObjects }]);
       if (command === "PRAGMA foreign_keys") return read([{ success: true, results: [{ foreign_keys: 1 }] }]);
       if (command === "PRAGMA foreign_key_check") return read([{ success: true, results: [] }]);
-      if (command === "PRAGMA integrity_check") return read([{ success: true, results: [{ integrity_check: "ok" }] }]);
       if (command.includes("participant_sessions") && command.includes("revoked_at IS NULL")) return read([{ success: true, results: [{ count: state.credentialActive ? 1 : 0 }] }]);
       if (command.includes("UNION ALL")) return read([{ success: true, results: state.fixtureRows ? [{ count: 1 }, { count: 1 }, { count: 2 }, { count: 2 }, { count: 1 }, { count: 1 }] : [{ count: 0 }] }]);
       return read([{ success: true, results: [] }]);
@@ -912,6 +1085,13 @@ test("mocked live boundaries complete plan through teardown in dependency order 
   state.tokenId = "replacement-operator-token-id";
   const applied = await runLiveOperation({ ...common, operation: "apply" }, dependencies);
   assert.equal(applied.phase, "alias-live");
+  const appliedJournal = JSON.parse(await readFile(journalPath, "utf8"));
+  assert.deepEqual({ ...appliedJournal.schema, digest: undefined }, {
+    digest: undefined,
+    foreignKeysEnabled: true,
+    foreignKeyViolations: 0,
+    integrity: "unsupported-on-d1",
+  });
   await runLiveOperation({ ...common, operation: "verify" }, dependencies);
   const tornDown = await runLiveOperation({ ...common, operation: "teardown" }, dependencies);
   assert.equal(tornDown.cleanupComplete, true);

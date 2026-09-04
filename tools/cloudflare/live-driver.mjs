@@ -33,6 +33,7 @@ const SAFE_RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const SAFE_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const DATABASE_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const D1_CREATE_REFUSAL_INCIDENTS = new Set(["d1-create-refused", "d1-acceptance-mismatch"]);
+const D1_INTEGRITY_UNAVAILABLE = "unsupported-on-d1";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -537,27 +538,36 @@ function schemaDefinitionDigest(objects) {
   return sha256(canonicalJson(objects.map(({ type, name, sql: definition }) => ({ type, name, definition: definition.replaceAll(/\s+/g, " ").trim() }))));
 }
 
-async function remoteSchema(adapter, databaseName, migration009) {
-  const [objectResult, foreignKeyResult, violationResult, integrityResult] = await Promise.all([
+export async function remoteSchema(adapter, databaseName, migration009) {
+  const [objectResult, foreignKeyResult, violationResult] = await Promise.all([
     adapter.d1Execute(databaseName, { command: "SELECT type,name,sql FROM sqlite_schema WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' AND substr(name,1,4) <> '_cf_' AND name <> 'd1_migrations' AND sql IS NOT NULL ORDER BY type,name" }),
     adapter.d1Execute(databaseName, { command: "PRAGMA foreign_keys" }),
     adapter.d1Execute(databaseName, { command: "PRAGMA foreign_key_check" }),
-    adapter.d1Execute(databaseName, { command: "PRAGMA integrity_check" }),
   ]);
   const objects = d1Results(objectResult);
   const foreignKeys = d1Results(foreignKeyResult);
   const violations = d1Results(violationResult);
-  const integrity = d1Results(integrityResult);
   const byType = (type) => objects.filter((item) => item.type === type).map((item) => item.name).sort();
   const triggers = byType("trigger");
   return {
     foreignKeysEnabled: Number(foreignKeys[0]?.foreign_keys) === 1,
     foreignKeyViolations: violations.length,
-    integrity: integrity[0]?.integrity_check,
+    integrity: D1_INTEGRITY_UNAVAILABLE,
     tables: byType("table"), indexes: byType("index"), triggers, constraints: [], definitionDigest: schemaDefinitionDigest(objects),
     choiceConfigSeeded: triggers.includes("event_choice_config_seed"),
     migration009,
   };
+}
+
+export function recordVerifiedSchemaEvidence(journal, actual, expected) {
+  assertSchemaInvariants(actual, { ...expected, constraints: [] });
+  journal.schema = {
+    digest: sha256(canonicalJson(expected)),
+    foreignKeysEnabled: actual.foreignKeysEnabled,
+    foreignKeyViolations: actual.foreignKeyViolations,
+    integrity: D1_INTEGRITY_UNAVAILABLE,
+  };
+  return journal.schema;
 }
 
 async function recoveryCredentialCounts(adapter, databaseName) {
@@ -875,8 +885,7 @@ async function applyOperation(options, dependencies) {
     verifyFinalSchema: async () => {
       journal.phase = "schema-expanded";
       const actual = await remoteSchema(adapter, journal.identity.databaseName, migration009);
-      assertSchemaInvariants(actual, { ...schemaExpected, constraints: [] });
-      journal.schema = { digest: sha256(canonicalJson(schemaExpected)), foreignKeys: true, integrity: true };
+      recordVerifiedSchemaEvidence(journal, actual, schemaExpected);
       await persist(options.journalPath, journal);
     },
     deployWorker: async () => { await adapter.deploy(journal.identity.workerName); return deploymentProof(adapter, journal.identity.workerName); },
@@ -1191,6 +1200,9 @@ async function teardownOperation(options, dependencies) {
     if (resource.domain === "worker") return { exists: await workerExists(), runId: journal.runId, owner: journal.owner };
     if (resource.domain === "durable-object") {
       const deletionProven = journal.mutations.some((item) => item?.kind === "durable-object-delete" && item.status === "applied" && item.tag === deleteConfig.deletionTag && item.configDigest === deleteConfig.configDigest);
+      const creationApplied = journal.mutations.some((item) => item?.kind === "durable-object-create" && item.status === "applied");
+      const neverCreated = resource.status === "planned" && !creationApplied;
+      if (neverCreated) return { exists: false, runId: journal.runId, owner: journal.owner };
       if (!await workerExists() && !deletionProven) throw new Error("Durable Object absence is unproven without the deleted_classes lifecycle");
       return { exists: !deletionProven, runId: journal.runId, owner: journal.owner };
     }
