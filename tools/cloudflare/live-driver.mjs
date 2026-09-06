@@ -1317,11 +1317,13 @@ async function teardownOperation(options, dependencies) {
     return deployments.length > 0 || versions.length > 0;
   };
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
-  // A Worker is matched by name alone, so inspectResource can only stamp the journal's own
-  // identity onto whatever is remotely present -- which makes recovery's ownership check
-  // compare the journal against itself. Resolve presence first: an absent Worker needs neither
-  // ownership reconciliation nor a changed intent, while a present Worker from a lost deploy
-  // response can be bound to this run only by the journaled baseline's single identity advance.
+  // A Worker is matched by name alone, and inspectResource stamps the journal's identity onto
+  // whatever is present, so recovery would otherwise compare the journal against itself. The
+  // widened teardown entry accepts phases with no deploy implication: a run that crashed before
+  // deploying could delete a same-named Worker created by a later run. Resolve presence before
+  // the ownership guard, because an absent Worker needs no ownership reconciliation. When a
+  // deploy response was lost, bind the present Worker to this run only when the pending intent
+  // matches the source and the journaled baseline has exactly one new deployment identity.
   const DEPLOYED_PHASES = ["worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"];
   const workerPresentAtEntry = await workerExists();
   const deployedByThisRun = await (async () => {
@@ -1330,10 +1332,12 @@ async function teardownOperation(options, dependencies) {
     if (!workerPresentAtEntry) return false;
     const deployIntent = journal.mutations.find((item) => item?.kind === "worker-deploy");
     if (deployIntent?.status !== "pending" || deployIntent.sourceSha !== journal.sourceSha || !Array.isArray(journal.deploymentBaseline)) return false;
+    const remoteProof = await deploymentProof(adapter, journal.identity.workerName);
     let reconciledDeploymentId;
     try {
-      reconciledDeploymentId = newDeploymentId(journal.deploymentBaseline, await deploymentProof(adapter, journal.identity.workerName));
-    } catch {
+      reconciledDeploymentId = newDeploymentId(journal.deploymentBaseline, remoteProof);
+    } catch (error) {
+      if (!(error instanceof Error) || !["deployment identity did not advance", "deployment identity advance is ambiguous"].includes(error.message)) throw error;
       return false;
     }
     deployIntent.status = "applied";

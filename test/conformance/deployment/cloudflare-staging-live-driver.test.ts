@@ -2158,6 +2158,37 @@ test("teardown reconciles a pending Worker deploy before the first probe or remo
   assert.equal(fixture.mutationCalls.length, mutationsAfterFirstRun);
 });
 
+test("pending Worker deploy reconciliation propagates deployment-list failures", async (t) => {
+  const fixture = await pendingDeployTeardownFixture(t);
+  const journalBefore = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const reconciliationError = new Error("synthetic reconciliation deployment-list failure");
+  const baseAdapter = fixture.dependencies.adapterFactory();
+  let deploymentsListCalls = 0;
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...baseAdapter,
+      deploymentsList: async (name: string) => {
+        deploymentsListCalls += 1;
+        if (deploymentsListCalls === 4) throw reconciliationError;
+        return baseAdapter.deploymentsList();
+      },
+    }),
+  };
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, dependencies),
+    (error: unknown) => error === reconciliationError,
+  );
+
+  assert.equal(deploymentsListCalls, 4);
+  assert.deepEqual(fixture.mutationCalls, []);
+  assert.equal(fixture.workersDevReads(), 0);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.deepEqual(journal, journalBefore);
+  assert.equal(journal.mutations.find((item: any) => item.kind === "worker-deploy")?.status, "pending");
+});
+
 for (const scenario of [
   {
     name: "a missing deployment baseline",
@@ -2197,14 +2228,14 @@ for (const scenario of [
   });
 }
 
-test("teardown skips pending deploy reconciliation when the Worker is absent", async (t) => {
+test("teardown skips pending deploy reconciliation and the route probe when the Worker is absent", async (t) => {
   const fixture = await pendingDeployTeardownFixture(t, { deploymentIds: [], versionIds: [] });
 
   const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
 
   assert.equal(result.cleanupComplete, true);
   assert.equal(fixture.mutationCalls.includes("deploy"), false);
-  assert.ok(fixture.workersDevReads() > 0, "U1 owns short-circuiting this probe when the Worker is absent");
+  assert.equal(fixture.workersDevReads(), 0, "a route is absent with its Worker, so teardown must not probe workers.dev");
   const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
   assert.equal(journal.phase, "cleanup-complete");
   assert.equal(journal.mutations.find((item: any) => item.kind === "worker-deploy")?.status, "pending");
