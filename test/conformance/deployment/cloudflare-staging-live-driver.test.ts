@@ -530,6 +530,48 @@ async function postWriteTeardownFixture(
   };
 }
 
+async function workerlessRateLimitedTeardownFixture(
+  t: any,
+  phase: "resources-ready" | "bookmark-captured",
+) {
+  const fixture = await postWriteTeardownFixture(t, phase);
+  const baseAdapter = fixture.dependencies.adapterFactory();
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  const timers = immediateRetryTimers();
+  let deployCalls = 0;
+  let exposureReads = 0;
+  const exposureClient = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    fetch: async () => {
+      exposureReads += 1;
+      return new Response(null, { status: 429 });
+    },
+  });
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...baseAdapter,
+      deploy: async () => {
+        deployCalls += 1;
+        await baseAdapter.deploy();
+      },
+    }),
+    tokenClientFactory: () => ({
+      ...baseTokenClient,
+      inspectWorkersDev: exposureClient.inspectWorkersDev,
+    }),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  };
+  return {
+    ...fixture,
+    dependencies,
+    deployCalls: () => deployCalls,
+    exposureReads: () => exposureReads,
+  };
+}
+
 function directTeardownOptions(journal: any, revision: string) {
   return {
     journal,
@@ -1011,6 +1053,28 @@ test("teardown completes from bookmark-captured", async (t) => {
   assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
 });
 
+for (const phase of ["bookmark-captured", "resources-ready"] as const) {
+  test(`workerless teardown from ${phase} skips workers.dev and never deploys`, async (t) => {
+    const fixture = await workerlessRateLimitedTeardownFixture(t, phase);
+    let result: Awaited<ReturnType<typeof runLiveOperation>> | undefined;
+    let operationError: unknown;
+
+    try {
+      result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+    } catch (error) {
+      operationError = error;
+    }
+
+    assert.equal(fixture.deployCalls(), 0, operationError instanceof Error ? operationError.message : "teardown must not deploy");
+    assert.equal(operationError, undefined);
+    assert.equal(result?.cleanupComplete, true);
+    assert.equal(fixture.exposureReads(), 0);
+    const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+    assert.equal(journal.phase, "cleanup-complete");
+    assert.equal(journal.teardown.absence["route:route-post-write"], true);
+  });
+}
+
 for (const phase of ["resources-ready", "alias-live"] as const) {
   test(`teardown completes from ${phase}`, async (t) => {
     const fixture = await postWriteTeardownFixture(t, phase);
@@ -1050,6 +1114,49 @@ for (const { name, exposures } of [
     assert.equal(timers.delays.length, 1);
   });
 }
+
+test("teardown propagates a route probe error when the Worker is present", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  let exposureReads = 0;
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, {
+      ...fixture.dependencies,
+      tokenClientFactory: () => ({
+        ...baseTokenClient,
+        inspectWorkersDev: async () => {
+          exposureReads += 1;
+          throw new Error("synthetic route probe failure");
+        },
+      }),
+    }),
+    (error: any) => error?.message === "synthetic route probe failure",
+  );
+  assert.equal(exposureReads, 1);
+});
+
+test("teardown propagates a dependent probe error when the Worker is present", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  let exposureReads = 0;
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, {
+      ...fixture.dependencies,
+      tokenClientFactory: () => ({
+        ...baseTokenClient,
+        inspectWorkersDev: async () => {
+          exposureReads += 1;
+          if (exposureReads === 3) throw new Error("synthetic dependent probe failure");
+          return { exists: true, enabled: false };
+        },
+      }),
+    }),
+    (error: any) => error?.message === "synthetic dependent probe failure",
+  );
+  assert.equal(exposureReads, 3);
+});
 
 test("teardown preserves a failed acceptance result from a verified journal", async (t) => {
   const fixture = await postWriteTeardownFixture(t);

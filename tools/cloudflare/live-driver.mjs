@@ -1332,6 +1332,7 @@ async function teardownOperation(options, dependencies) {
   };
   const inspectResource = async (resource) => {
     if (resource.domain === "route") {
+      if (!await workerExists()) return { exists: false, runId: journal.runId, owner: journal.owner };
       const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
       return { exists: absence.outcome !== "proven-absent", runId: journal.runId, owner: journal.owner };
     }
@@ -1466,6 +1467,7 @@ async function teardownOperation(options, dependencies) {
     inspectRevision,
     listDependents: async (resource) => {
       if (resource.domain === "worker") {
+        if (!await workerExists()) return [];
         const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
         if (absence.outcome !== "proven-absent") return ["owned-origin-still-active"];
       }
