@@ -572,6 +572,99 @@ async function workerlessRateLimitedTeardownFixture(
   };
 }
 
+type PendingDeployTeardownOptions = {
+  deploymentBaseline?: readonly string[];
+  recordDeploymentBaseline?: boolean;
+  deploymentIds?: readonly string[];
+  versionIds?: readonly string[];
+  intentSourceSha?: string;
+};
+
+async function pendingDeployTeardownFixture(t: any, {
+  deploymentBaseline = [],
+  recordDeploymentBaseline = true,
+  deploymentIds = ["deployment-lost-response"],
+  versionIds = ["version-lost-response"],
+  intentSourceSha = sourceSha,
+}: PendingDeployTeardownOptions = {}) {
+  const fixture = await postWriteTeardownFixture(t, "schema-expanded");
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const workerIntent = journal.mutations.find((item: any) => item.kind === "worker-deploy");
+  const durableIntent = journal.mutations.find((item: any) => item.kind === "durable-object-create");
+  assert.equal(journal.phase, "schema-expanded");
+  assert.equal(workerIntent?.status, "pending");
+  assert.equal(durableIntent?.status, "pending");
+  workerIntent.sourceSha = intentSourceSha;
+  if (recordDeploymentBaseline) journal.deploymentBaseline = [...deploymentBaseline];
+  else delete journal.deploymentBaseline;
+  await saveJournal(fixture.journalPath, journal);
+
+  const remote = {
+    present: deploymentIds.length > 0 || versionIds.length > 0,
+    deployments: deploymentIds.map((id) => ({ id, script_name: workerName })),
+    versions: versionIds.map((id) => ({ id, script_name: workerName })),
+    removalSequence: 0,
+  };
+  const mutationCalls: string[] = [];
+  const readEvents: string[] = [];
+  let workersDevReads = 0;
+  let journalAtFirstMutation: any;
+  let journalAtFirstWorkersDevRead: any;
+  const captureFirstMutation = async (name: string) => {
+    mutationCalls.push(name);
+    journalAtFirstMutation ??= JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  };
+  const baseAdapter = fixture.dependencies.adapterFactory();
+  const adapterFactory = () => ({
+    ...baseAdapter,
+    deploymentsList: async () => {
+      readEvents.push("deployments");
+      return remote.present ? remote.deployments : [];
+    },
+    versionsList: async () => {
+      readEvents.push("versions");
+      return remote.present ? remote.versions : [];
+    },
+    deploy: async (name: string) => {
+      await captureFirstMutation("deploy");
+      remote.present = true;
+      remote.removalSequence += 1;
+      remote.deployments = [...remote.deployments, { id: `deployment-removal-${remote.removalSequence}`, script_name: workerName }];
+      remote.versions = [...remote.versions, { id: `version-removal-${remote.removalSequence}`, script_name: workerName }];
+      await baseAdapter.deploy();
+    },
+    deleteWorker: async (name: string) => {
+      await captureFirstMutation("worker-delete");
+      remote.present = false;
+      await baseAdapter.deleteWorker();
+    },
+    d1Delete: async (name: string) => {
+      await captureFirstMutation("d1-delete");
+      await baseAdapter.d1Delete();
+    },
+  });
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  const tokenClientFactory = () => ({
+    ...baseTokenClient,
+    inspectWorkersDev: async () => {
+      readEvents.push("workers-dev");
+      workersDevReads += 1;
+      journalAtFirstWorkersDevRead ??= JSON.parse(await readFile(fixture.journalPath, "utf8"));
+      return { exists: remote.present, enabled: false };
+    },
+  });
+
+  return {
+    ...fixture,
+    dependencies: { ...fixture.dependencies, adapterFactory, tokenClientFactory },
+    mutationCalls,
+    readEvents,
+    workersDevReads: () => workersDevReads,
+    journalAtFirstMutation: () => journalAtFirstMutation,
+    journalAtFirstWorkersDevRead: () => journalAtFirstWorkersDevRead,
+  };
+}
+
 function directTeardownOptions(journal: any, revision: string) {
   return {
     journal,
@@ -2029,6 +2122,92 @@ test("teardown proves the near-miss refusal runs before it records cleanup compl
   const completion = source.indexOf('journal.phase = "cleanup-complete"', guard);
   assert.ok(guard > 0, "teardown must call the near-miss refusal");
   assert.ok(completion > guard, "the refusal must run before cleanup-complete is recorded");
+});
+
+test("teardown reconciles a pending Worker deploy before the first probe or removal", async (t) => {
+  const fixture = await pendingDeployTeardownFixture(t);
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  const beforeRemoval = fixture.journalAtFirstMutation();
+  assert.ok(beforeRemoval, "teardown must capture the journal before its first removal");
+  assert.equal(beforeRemoval.phase, "schema-expanded");
+  assert.deepEqual(
+    beforeRemoval.mutations.find((item: any) => item.kind === "worker-deploy"),
+    {
+      kind: "worker-deploy",
+      status: "applied",
+      sourceSha,
+      deploymentId: "deployment-lost-response",
+      reconciledBy: "teardown",
+    },
+  );
+  assert.equal(beforeRemoval.mutations.find((item: any) => item.kind === "durable-object-create")?.status, "applied");
+  const beforeWorkersDev = fixture.journalAtFirstWorkersDevRead();
+  assert.equal(beforeWorkersDev.mutations.find((item: any) => item.kind === "worker-deploy")?.status, "applied");
+  const firstWorkersDevRead = fixture.readEvents.indexOf("workers-dev");
+  assert.ok(firstWorkersDevRead > 0);
+  assert.equal(fixture.readEvents.slice(0, firstWorkersDevRead).every((event) => ["deployments", "versions"].includes(event)), true);
+  const completed = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(completed.phase, "cleanup-complete");
+
+  const mutationsAfterFirstRun = fixture.mutationCalls.length;
+  const replay = await runLiveOperation({ ...fixture.common, operation: "teardown", processEnvironment: {} }, fixture.dependencies);
+  assert.equal(replay.cleanupComplete, true);
+  assert.equal(fixture.mutationCalls.length, mutationsAfterFirstRun);
+});
+
+for (const scenario of [
+  {
+    name: "a missing deployment baseline",
+    fixture: { recordDeploymentBaseline: false },
+  },
+  {
+    name: "no remote deployment identity advance",
+    fixture: {
+      deploymentBaseline: ["deployment-lost-response", "version-lost-response"],
+    },
+  },
+  {
+    name: "an ambiguous remote deployment identity advance",
+    fixture: {
+      deploymentIds: ["deployment-lost-response-1", "deployment-lost-response-2"],
+      versionIds: ["version-lost-response-1", "version-lost-response-2"],
+    },
+  },
+  {
+    name: "a mismatched intent source SHA",
+    fixture: { intentSourceSha: "c".repeat(40) },
+  },
+] as const) {
+  test(`pending Worker deploy reconciliation refuses ${scenario.name}`, async (t) => {
+    const fixture = await pendingDeployTeardownFixture(t, scenario.fixture);
+
+    await assert.rejects(
+      runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+      (error: any) => error?.message === "remote Worker predates this run's deployment; refusing to remove it",
+    );
+
+    assert.deepEqual(fixture.mutationCalls, []);
+    assert.equal(fixture.workersDevReads(), 0);
+    const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+    assert.equal(journal.mutations.find((item: any) => item.kind === "worker-deploy")?.status, "pending");
+    assert.notEqual(journal.phase, "cleanup-complete");
+  });
+}
+
+test("teardown skips pending deploy reconciliation when the Worker is absent", async (t) => {
+  const fixture = await pendingDeployTeardownFixture(t, { deploymentIds: [], versionIds: [] });
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.mutationCalls.includes("deploy"), false);
+  assert.ok(fixture.workersDevReads() > 0, "U1 owns short-circuiting this probe when the Worker is absent");
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.phase, "cleanup-complete");
+  assert.equal(journal.mutations.find((item: any) => item.kind === "worker-deploy")?.status, "pending");
 });
 
 test("early-phase teardown refuses to delete a same-named Worker this run never deployed", async (t) => {

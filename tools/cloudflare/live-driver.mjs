@@ -1319,13 +1319,31 @@ async function teardownOperation(options, dependencies) {
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
   // A Worker is matched by name alone, so inspectResource can only stamp the journal's own
   // identity onto whatever is remotely present -- which makes recovery's ownership check
-  // compare the journal against itself. That was safe while teardown required "quarantined",
-  // because reaching it implied this run had deployed. The widened entry accepts phases that
-  // carry no such implication, so a run that crashed before deploying could delete a same-named
-  // Worker a later run created. Require this run's own applied deploy before touching one.
+  // compare the journal against itself. Resolve presence first: an absent Worker needs neither
+  // ownership reconciliation nor a changed intent, while a present Worker from a lost deploy
+  // response can be bound to this run only by the journaled baseline's single identity advance.
   const DEPLOYED_PHASES = ["worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"];
-  const deployedByThisRun = journal.mutations.some((item) => item?.kind === "worker-deploy" && item.status === "applied")
-    || DEPLOYED_PHASES.includes(journal.phase);
+  const workerPresentAtEntry = await workerExists();
+  const deployedByThisRun = await (async () => {
+    if (journal.mutations.some((item) => item?.kind === "worker-deploy" && item.status === "applied")
+      || DEPLOYED_PHASES.includes(journal.phase)) return true;
+    if (!workerPresentAtEntry) return false;
+    const deployIntent = journal.mutations.find((item) => item?.kind === "worker-deploy");
+    if (deployIntent?.status !== "pending" || deployIntent.sourceSha !== journal.sourceSha || !Array.isArray(journal.deploymentBaseline)) return false;
+    let reconciledDeploymentId;
+    try {
+      reconciledDeploymentId = newDeploymentId(journal.deploymentBaseline, await deploymentProof(adapter, journal.identity.workerName));
+    } catch {
+      return false;
+    }
+    deployIntent.status = "applied";
+    deployIntent.deploymentId = reconciledDeploymentId;
+    deployIntent.reconciledBy = "teardown";
+    const durableIntent = journal.mutations.find((item) => item?.kind === "durable-object-create");
+    if (durableIntent?.status === "pending") durableIntent.status = "applied";
+    await persist(options.journalPath, journal);
+    return true;
+  })();
   const assertRunDeployedIt = (present) => {
     if (present && !deployedByThisRun) throw new Error("remote Worker predates this run's deployment; refusing to remove it");
     return present;
@@ -1458,7 +1476,7 @@ async function teardownOperation(options, dependencies) {
   // Refuse before ANY removal, not per-domain: RESOURCE_ORDER processes the route first, and
   // that branch redeploys this run's config over whatever Worker is present. A per-resource
   // guard would fire only after that mutation had already landed on a foreign Worker.
-  assertRunDeployedIt(await workerExists());
+  assertRunDeployedIt(workerPresentAtEntry);
   await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   const result = await runStackTeardown({
     journal,
