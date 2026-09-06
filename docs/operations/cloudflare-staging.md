@@ -22,7 +22,7 @@ Every post-write failure is a partial-deployment incident. Quarantine the origin
 
 When no Worker exists at the run's name, teardown records the `workers.dev` route absent without probing it and never redeploys the route; a route is a property of its Worker.
 
-A `worker-deploy` intent left pending by a lost deploy response is reconciled before removal. With a Worker present, a matching source SHA, a recorded deployment baseline, and exactly one new deployment identity, the driver marks the intent applied with `reconciledBy: "teardown"` and removes the Worker as this run's. Otherwise the existing refusal, `remote Worker predates this run's deployment; refusing to remove it`, stands and a person decides.
+A failed or lost deploy leaves its `worker-deploy` intent pending. With a Worker present, a recorded deployment baseline, and exactly one new deployment identity, teardown reconciles the intent and removes the Worker as this run's. Until teardown runs, a foreign single-deployment Worker at the run's name would satisfy that rule; `apply` refusing an existing same-named D1 keeps a second driver run from producing that state. Otherwise the existing refusal, `remote Worker predates this run's deployment; refusing to remove it`, stands and a person decides.
 
 ### Unconfirmed origin absence
 

@@ -1168,6 +1168,46 @@ for (const phase of ["bookmark-captured", "resources-ready"] as const) {
   });
 }
 
+test("teardown refuses a foreign Worker that appears after the entry ownership guard", async (t) => {
+  const fixture = await postWriteTeardownFixture(t, "resources-ready");
+  const baseAdapter = fixture.dependencies.adapterFactory();
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  const timers = immediateRetryTimers();
+  let deploymentsListCalls = 0;
+  let deployCalls = 0;
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...baseAdapter,
+      deploymentsList: async () => {
+        deploymentsListCalls += 1;
+        return deploymentsListCalls >= 4
+          ? [{ id: "deployment-from-another-run", script_name: workerName }]
+          : [];
+      },
+      versionsList: async () => [],
+      deploy: async () => {
+        deployCalls += 1;
+        await baseAdapter.deploy();
+      },
+    }),
+    tokenClientFactory: () => ({
+      ...baseTokenClient,
+      inspectWorkersDev: async () => ({ exists: true, enabled: true }),
+    }),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  };
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, dependencies),
+    /remote Worker predates this run's deployment; refusing to remove it/,
+  );
+
+  assert.equal(deployCalls, 0);
+  assert.notEqual(JSON.parse(await readFile(fixture.journalPath, "utf8")).phase, "cleanup-complete");
+});
+
 for (const phase of ["resources-ready", "alias-live"] as const) {
   test(`teardown completes from ${phase}`, async (t) => {
     const fixture = await postWriteTeardownFixture(t, phase);

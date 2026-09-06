@@ -691,12 +691,19 @@ async function deploymentProof(adapter, workerName) {
   return { deploymentId: deploymentId(deployments, versions), deploymentIds: deploymentIds(deployments, versions), workerDeploymentIds: collectionIds(deployments), versionIds: collectionIds(versions) };
 }
 
+const DEPLOYMENT_IDENTITY_DID_NOT_ADVANCE = "deployment identity did not advance";
+const DEPLOYMENT_IDENTITY_ADVANCE_IS_AMBIGUOUS = "deployment identity advance is ambiguous";
+
+function isDeploymentIdentityUnresolved(error) {
+  return error instanceof Error && [DEPLOYMENT_IDENTITY_DID_NOT_ADVANCE, DEPLOYMENT_IDENTITY_ADVANCE_IS_AMBIGUOUS].includes(error.message);
+}
+
 function newDeploymentId(beforeIds, proof) {
   const newDeployments = proof.workerDeploymentIds.filter((id) => !beforeIds.includes(id));
   if (newDeployments.length === 1) return newDeployments[0];
-  if (newDeployments.length > 1) throw new Error("deployment identity advance is ambiguous");
+  if (newDeployments.length > 1) throw new Error(DEPLOYMENT_IDENTITY_ADVANCE_IS_AMBIGUOUS);
   const newVersions = proof.versionIds.filter((id) => !beforeIds.includes(id));
-  if (newVersions.length !== 1) throw new Error(newVersions.length > 1 ? "deployment identity advance is ambiguous" : "deployment identity did not advance");
+  if (newVersions.length !== 1) throw new Error(newVersions.length > 1 ? DEPLOYMENT_IDENTITY_ADVANCE_IS_AMBIGUOUS : DEPLOYMENT_IDENTITY_DID_NOT_ADVANCE);
   return newVersions[0];
 }
 
@@ -1322,8 +1329,10 @@ async function teardownOperation(options, dependencies) {
   // widened teardown entry accepts phases with no deploy implication: a run that crashed before
   // deploying could delete a same-named Worker created by a later run. Resolve presence before
   // the ownership guard, because an absent Worker needs no ownership reconciliation. When a
-  // deploy response was lost, bind the present Worker to this run only when the pending intent
-  // matches the source and the journaled baseline has exactly one new deployment identity.
+  // deploy failed or its response was lost, a foreign single-deployment Worker at this name can
+  // be reconciled until teardown runs; apply's same-named D1 refusal prevents another driver run
+  // from creating that state. The sourceSha equality catches only a hand-edited journal because
+  // apply copies intent.sourceSha from journal.sourceSha.
   const DEPLOYED_PHASES = ["worker-deployed", "alias-live", "verified", "quarantined", "cleanup-complete"];
   const workerPresentAtEntry = await workerExists();
   const deployedByThisRun = await (async () => {
@@ -1337,7 +1346,7 @@ async function teardownOperation(options, dependencies) {
     try {
       reconciledDeploymentId = newDeploymentId(journal.deploymentBaseline, remoteProof);
     } catch (error) {
-      if (!(error instanceof Error) || !["deployment identity did not advance", "deployment identity advance is ambiguous"].includes(error.message)) throw error;
+      if (!isDeploymentIdentityUnresolved(error)) throw error;
       return false;
     }
     deployIntent.status = "applied";
@@ -1354,7 +1363,7 @@ async function teardownOperation(options, dependencies) {
   };
   const inspectResource = async (resource) => {
     if (resource.domain === "route") {
-      if (!await workerExists()) return { exists: false, runId: journal.runId, owner: journal.owner };
+      if (!assertRunDeployedIt(await workerExists())) return { exists: false, runId: journal.runId, owner: journal.owner };
       const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
       return { exists: absence.outcome !== "proven-absent", runId: journal.runId, owner: journal.owner };
     }
@@ -1489,7 +1498,7 @@ async function teardownOperation(options, dependencies) {
     inspectRevision,
     listDependents: async (resource) => {
       if (resource.domain === "worker") {
-        if (!await workerExists()) return [];
+        if (!assertRunDeployedIt(await workerExists())) return [];
         const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
         if (absence.outcome !== "proven-absent") return ["owned-origin-still-active"];
       }
