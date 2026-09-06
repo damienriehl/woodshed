@@ -20,6 +20,10 @@ Every post-write failure is a partial-deployment incident. Quarantine the origin
 
 `teardown` accepts any post-write phase — `resources-ready` through `quarantined` — so a run that failed before quarantine could finish is still closeable by the driver. Widening the entry phase changes no per-resource proof: ownership, identity revision, lease, forbidden-identity, and dependent checks are identical on every path, and a run that cannot satisfy them is still refused.
 
+When no Worker exists at the run's name, teardown records the `workers.dev` route absent without probing it and never redeploys the route; a route is a property of its Worker.
+
+A `worker-deploy` intent left pending by a lost deploy response is reconciled before removal. With a Worker present, a matching source SHA, a recorded deployment baseline, and exactly one new deployment identity, the driver marks the intent applied with `reconciledBy: "teardown"` and removes the Worker as this run's. Otherwise the existing refusal, `remote Worker predates this run's deployment; refusing to remove it`, stands and a person decides.
+
 ### Unconfirmed origin absence
 
 Cloudflare publishes no read-after-write consistency guarantee for the `workers.dev` subdomain endpoint, in either direction. Quarantine therefore retries the absence proof on a bounded schedule, and can still finish without an answer. When that happens the journal records `incident.originAbsence` with `status: "could-not-confirm"`, the attempt count, the timestamp, and whether the disable itself errored (`disableFailed`).
