@@ -578,6 +578,12 @@ export async function assertNoEnvironmentSuffixedWorker(inventory, journal, toke
   if (scripts.some((script) => script?.name === suffixed)) throw new Error("unowned environment-suffixed Worker blocks cleanup completion");
 }
 
+async function accountWideWorkerExists(inventory, journal, tokenClient) {
+  if (typeof tokenClient?.listWorkerScripts !== "function") throw new Error("account-wide Worker inventory is required");
+  const scripts = array(await tokenClient.listWorkerScripts(inventory.staging.accountId), "account-wide Worker");
+  return scripts.some((script) => script?.name === journal.identity.workerName);
+}
+
 async function recordUnconfirmedOriginAbsence(journalPath, journal, absence, { disableFailed = false } = {}) {
   // Cloudflare publishes no read-after-write guarantee for the workers.dev subdomain, so
   // an exhausted retry means unknown -- not absent, and not quarantine failure. Record what
@@ -1454,10 +1460,11 @@ async function teardownOperation(options, dependencies) {
   const assertWriteIdentity = async () => {
     if (await inspectRevision() !== expectedProtected) throw new Error("remote identity changed");
   };
-  const workerExists = async () => {
-    const [deployments, versions] = await Promise.all([adapter.deploymentsList(journal.identity.workerName), adapter.versionsList(journal.identity.workerName)]);
-    return deployments.length > 0 || versions.length > 0;
-  };
+  // Wrangler's deployments/versions commands are deployment-history proxies, not an
+  // account-wide Worker existence proof. In particular the adapter may normalize a
+  // not-found-shaped command failure to an empty list. Only the authenticated scripts
+  // listing is allowed to certify that the Worker is absent.
+  const workerExists = () => accountWideWorkerExists(inventory, journal, tokenClient);
   const credentialRevocation = await writeCredentialRevocation(privateConfig, journal, dependencies.now().toISOString());
   // A Worker is matched by name alone, and inspectResource stamps the journal's identity onto
   // whatever is present, so recovery would otherwise compare the journal against itself. The
@@ -1500,7 +1507,9 @@ async function teardownOperation(options, dependencies) {
     if (resource.domain === "route") {
       if (!assertRunDeployedIt(await workerExists())) return { exists: false, runId: journal.runId, owner: journal.owner };
       const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
-      return { exists: absence.outcome !== "proven-absent", runId: journal.runId, owner: journal.owner };
+      if (absence.outcome === "proven-absent") return { exists: false, runId: journal.runId, owner: journal.owner };
+      if (absence.outcome === "present") return { exists: true, runId: journal.runId, owner: journal.owner };
+      return { exists: null, deferAbsenceUntil: "worker", runId: journal.runId, owner: journal.owner };
     }
     if (resource.domain === "credential") {
       if (!activeCredential(journal) || !journal.identity.databaseId) return { exists: false, runId: journal.runId, owner: journal.owner };
@@ -1607,19 +1616,24 @@ async function teardownOperation(options, dependencies) {
   const removeResource = async (resource) => {
     const kind = `teardown-${resource.domain}`;
     let intent = journal.mutations.find((item) => item?.kind === kind && item?.id === resource.id);
+    const freshIntent = !intent;
     if (!intent) {
       intent = { kind, domain: resource.domain, id: resource.id, status: "pending" };
       journal.mutations.push(intent);
       await persist(options.journalPath, journal);
     }
     try {
-      await performRemoval(resource);
+      // A persisted route intent means its one private-config remediation may already
+      // have reached Cloudflare. Never replay that deploy for the same intent.
+      if (resource.domain !== "route" || freshIntent) await performRemoval(resource);
     } catch (error) {
       const reconciled = await inspectResource(resource);
       if (reconciled?.exists !== false) throw new Error("teardown mutation outcome is uncertain; no retry authorized", { cause: error });
     }
-    intent.status = "applied";
-    await persist(options.journalPath, journal);
+    if (!["route", "worker"].includes(resource.domain)) {
+      intent.status = "applied";
+      await persist(options.journalPath, journal);
+    }
   };
   // Refuse before ANY removal, not per-domain: RESOURCE_ORDER processes the route first, and
   // that branch redeploys this run's config over whatever Worker is present. A per-resource
@@ -1631,9 +1645,10 @@ async function teardownOperation(options, dependencies) {
     lease: journal.lease,
     expectedRevision: expectedProtected,
     inspectRevision,
-    listDependents: async (resource) => {
+    listDependents: async (resource, { deferredRouteProof } = {}) => {
       if (resource.domain === "worker") {
         if (!assertRunDeployedIt(await workerExists())) return [];
+        if (deferredRouteProof === true) return [];
         const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
         if (absence.outcome !== "proven-absent") return ["owned-origin-still-active"];
       }

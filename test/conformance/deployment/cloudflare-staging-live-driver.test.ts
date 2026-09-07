@@ -1026,7 +1026,7 @@ async function postWriteTeardownFixture(
   };
   const tokenClient = {
     inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
-    listWorkerScripts: async () => [],
+    listWorkerScripts: async () => state.workerPresent ? [{ name: workerName }] : [],
     listWorkerRoutes: async () => [],
     listWorkerDomains: async () => [],
     inspectWorkersDev: async () => ({ exists: state.workerPresent, enabled: false }),
@@ -1052,39 +1052,122 @@ async function postWriteTeardownFixture(
     journal,
     journalPath,
     revision,
+    state,
     removeWorker: () => { state.workerPresent = false; },
   };
 }
 
-async function workerlessRateLimitedTeardownFixture(
+type ExposureTeardownOptions = {
+  accountWorkerPresent?: boolean;
+  deleteOutcome?: "absent" | "absent-throw" | "present-throw";
+  exposureResults?: readonly ("absent" | "present" | "rate-limited")[];
+  wranglerWorkerPresent?: boolean;
+};
+
+async function rateLimitedTeardownFixture(
   t: any,
-  phase: "resources-ready" | "bookmark-captured",
+  phase: "resources-ready" | "bookmark-captured" | "worker-deployed" = "worker-deployed",
+  {
+    accountWorkerPresent,
+    deleteOutcome = "absent",
+    exposureResults = ["rate-limited"],
+    wranglerWorkerPresent = true,
+  }: ExposureTeardownOptions = {},
 ) {
   const fixture = await postWriteTeardownFixture(t, phase);
-  const baseAdapter = fixture.dependencies.adapterFactory();
   const baseTokenClient = fixture.dependencies.tokenClientFactory();
   const timers = immediateRetryTimers();
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const ownedLaterResourcesPresent = phase === "worker-deployed";
+  if (ownedLaterResourcesPresent) {
+    journal.acceptance = {
+      status: "not-run",
+      cleanupComplete: false,
+      fixturePlan: createSyntheticFixturePlan({
+        runId: journal.runId,
+        organizerToken: "organizer-synthetic",
+        preFixtureBookmark: "bookmark-synthetic",
+      }),
+    };
+  }
+  await saveJournal(fixture.journalPath, journal);
+
+  let accountPresent = accountWorkerPresent ?? fixture.state.workerPresent;
+  let credentialPresent = ownedLaterResourcesPresent;
+  let secretPresent = ownedLaterResourcesPresent;
   let deployCalls = 0;
+  let workerDeleteCalls = 0;
   let exposureReads = 0;
+  let accountWorkerReads = 0;
+  const removalCalls: string[] = [];
+  const scriptReadSnapshots: Array<{ afterWorkerDelete: boolean; workerPresent: boolean; routeIntentStatus?: string; routeAbsence?: boolean }> = [];
   const exposureClient = createApiTokenClient({
     token: "synthetic-cloud-token",
     accountApiBase: "https://api.synthetic.invalid/accounts",
     fetch: async () => {
+      const result = exposureResults[Math.min(exposureReads, exposureResults.length - 1)] ?? "rate-limited";
       exposureReads += 1;
-      return new Response(null, { status: 429 });
+      if (result === "rate-limited") return new Response(null, { status: 429 });
+      return Response.json({ success: true, result: { enabled: result === "present", previews_enabled: false } });
     },
   });
   const dependencies = {
     ...fixture.dependencies,
-    adapterFactory: () => ({
-      ...baseAdapter,
-      deploy: async () => {
-        deployCalls += 1;
-        await baseAdapter.deploy();
-      },
-    }),
+    adapterFactory: (adapterOptions: any = {}) => {
+      const baseAdapter = fixture.dependencies.adapterFactory();
+      return {
+        ...baseAdapter,
+        deploymentsList: async () => wranglerWorkerPresent ? baseAdapter.deploymentsList() : [],
+        versionsList: async () => wranglerWorkerPresent ? baseAdapter.versionsList() : [],
+        secretList: async () => secretPresent ? [{ name: "LIVE_COMMAND_SECRET" }] : [],
+        d1Execute: async (_name: string, options: { command?: string; file?: string }) => {
+          if (options.file?.endsWith("revoke-organizer.sql")) {
+            credentialPresent = false;
+            removalCalls.push("credential");
+            return [{ success: true, results: [] }];
+          }
+          if (options.command?.includes("participant_sessions")) return [{ success: true, results: [{ count: credentialPresent ? 1 : 0 }] }];
+          return baseAdapter.d1Execute();
+        },
+        deploy: async () => {
+          deployCalls += 1;
+          const config = JSON.parse(await readFile(adapterOptions.configPath, "utf8"));
+          const deletingDurableObject = config.env.staging.migrations.some((item: any) => Array.isArray(item.deleted_classes));
+          removalCalls.push(deletingDurableObject ? "durable-object" : "route");
+          accountPresent = true;
+          await baseAdapter.deploy();
+        },
+        secretDelete: async () => {
+          secretPresent = false;
+          removalCalls.push("secret");
+        },
+        deleteWorker: async () => {
+          workerDeleteCalls += 1;
+          removalCalls.push("worker");
+          if (deleteOutcome === "present-throw") throw new Error("synthetic Worker delete response lost while Worker remained present");
+          accountPresent = false;
+          await baseAdapter.deleteWorker();
+          if (deleteOutcome === "absent-throw") throw new Error("synthetic Worker delete response lost after deletion");
+        },
+        d1Delete: async () => {
+          removalCalls.push("d1");
+          return baseAdapter.d1Delete();
+        },
+      };
+    },
     tokenClientFactory: () => ({
       ...baseTokenClient,
+      listWorkerScripts: async () => {
+        accountWorkerReads += 1;
+        const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+        scriptReadSnapshots.push({
+          afterWorkerDelete: workerDeleteCalls > 0,
+          workerPresent: accountPresent,
+          routeIntentStatus: saved.mutations.find((item: any) => item.kind === "teardown-route")?.status,
+          routeAbsence: saved.teardown?.absence?.["route:route-post-write"],
+        });
+        return accountPresent ? [{ name: workerName }] : [];
+      },
       inspectWorkersDev: exposureClient.inspectWorkersDev,
     }),
     setTimer: timers.setTimer,
@@ -1094,7 +1177,11 @@ async function workerlessRateLimitedTeardownFixture(
     ...fixture,
     dependencies,
     deployCalls: () => deployCalls,
+    workerDeleteCalls: () => workerDeleteCalls,
     exposureReads: () => exposureReads,
+    accountWorkerReads: () => accountWorkerReads,
+    removalCalls,
+    scriptReadSnapshots,
   };
 }
 
@@ -1172,6 +1259,7 @@ async function pendingDeployTeardownFixture(t: any, {
   const baseTokenClient = fixture.dependencies.tokenClientFactory();
   const tokenClientFactory = () => ({
     ...baseTokenClient,
+    listWorkerScripts: async () => remote.present ? [{ name: workerName }] : [],
     inspectWorkersDev: async () => {
       readEvents.push("workers-dev");
       workersDevReads += 1;
@@ -1674,7 +1762,7 @@ test("teardown completes from bookmark-captured", async (t) => {
 
 for (const phase of ["bookmark-captured", "resources-ready"] as const) {
   test(`workerless teardown from ${phase} skips workers.dev and never deploys`, async (t) => {
-    const fixture = await workerlessRateLimitedTeardownFixture(t, phase);
+    const fixture = await rateLimitedTeardownFixture(t, phase);
     let result: Awaited<ReturnType<typeof runLiveOperation>> | undefined;
     let operationError: unknown;
 
@@ -1694,12 +1782,134 @@ for (const phase of ["bookmark-captured", "resources-ready"] as const) {
   });
 }
 
+test("an unconfirmable route defers only until authenticated Worker absence", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t);
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.removalCalls.filter((call) => call === "route").length, 1, "the private route config deploys exactly once");
+  assert.equal(fixture.exposureReads(), 1, "the deferred route is not re-probed as a Worker dependent");
+  assert.equal(fixture.workerDeleteCalls(), 1);
+  assert.deepEqual(fixture.removalCalls, ["route", "credential", "secret", "durable-object", "worker", "d1"]);
+  const postDeleteProof = fixture.scriptReadSnapshots.find((snapshot) => snapshot.afterWorkerDelete && !snapshot.workerPresent);
+  assert.ok(postDeleteProof, "authenticated account-wide script listing must prove post-delete Worker absence");
+  assert.equal(postDeleteProof.routeIntentStatus, "pending");
+  assert.equal(postDeleteProof.routeAbsence, undefined, "the private config deploy must not record route absence");
+  const completed = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(completed.teardown.absence["route:route-post-write"], true);
+  assert.equal(completed.teardown.absence[`worker:${workerName}`], true);
+  assert.equal(completed.mutations.find((item: any) => item.kind === "teardown-route")?.status, "applied");
+});
+
+for (const scenario of [
+  {
+    name: "remains present",
+    exposureResults: Array(8).fill("present") as "present"[],
+  },
+  {
+    name: "becomes unreadable",
+    exposureResults: [...Array(8).fill("present"), "rate-limited"] as ("present" | "rate-limited")[],
+  },
+]) {
+  test(`a confirmed-present route that ${scenario.name} after remediation refuses before later deletion`, async (t) => {
+    const fixture = await rateLimitedTeardownFixture(t, "worker-deployed", { exposureResults: scenario.exposureResults });
+
+    await assert.rejects(
+      runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+      (error: any) => error?.message === "route absence proof failed",
+    );
+
+    assert.equal(fixture.removalCalls.filter((call) => call === "route").length, 1);
+    assert.equal(fixture.removalCalls.some((call) => ["credential", "secret", "worker", "d1"].includes(call)), false);
+    assert.equal(fixture.workerDeleteCalls(), 0);
+    const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+    assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-route")?.status, "pending");
+    assert.equal(saved.teardown?.absence?.["route:route-post-write"], undefined);
+  });
+}
+
+test("an account-wide foreign Worker refuses before any deletion even when Wrangler sees no deployment", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t, "resources-ready", {
+    accountWorkerPresent: true,
+    wranglerWorkerPresent: false,
+  });
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+    /remote Worker predates this run's deployment; refusing to remove it/,
+  );
+
+  assert.deepEqual(fixture.removalCalls, []);
+  assert.equal(fixture.workerDeleteCalls(), 0);
+  assert.equal(JSON.parse(await readFile(fixture.journalPath, "utf8")).mutations.some((item: any) => item.kind?.startsWith("teardown-")), false);
+});
+
+test("a thrown Worker delete reconciles both Worker and deferred route from account-wide absence", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t, "worker-deployed", { deleteOutcome: "absent-throw" });
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.workerDeleteCalls(), 1);
+  assert.ok(fixture.scriptReadSnapshots.some((snapshot) => snapshot.afterWorkerDelete && !snapshot.workerPresent));
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(saved.teardown.absence[`worker:${workerName}`], true);
+  assert.equal(saved.teardown.absence["route:route-post-write"], true);
+  assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-worker")?.status, "applied");
+  assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-route")?.status, "applied");
+});
+
+test("a Worker delete whose account-wide listing remains present leaves both proofs pending", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t, "worker-deployed", { deleteOutcome: "present-throw" });
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies),
+    /teardown mutation outcome is uncertain; no retry authorized/,
+  );
+
+  assert.equal(fixture.workerDeleteCalls(), 1);
+  assert.ok(fixture.scriptReadSnapshots.some((snapshot) => snapshot.afterWorkerDelete && snapshot.workerPresent));
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-worker")?.status, "pending");
+  assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-route")?.status, "pending");
+  assert.equal(saved.teardown?.absence?.[`worker:${workerName}`], undefined);
+  assert.equal(saved.teardown?.absence?.["route:route-post-write"], undefined);
+});
+
+test("an empty Wrangler deployment proxy cannot certify deferred route absence", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t, "worker-deployed", { wranglerWorkerPresent: false });
+
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies));
+
+  assert.equal(fixture.exposureReads(), 1, "account-wide Worker presence must force route remediation despite the empty Wrangler proxy");
+  assert.equal(fixture.removalCalls.filter((call) => call === "route").length, 1);
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(saved.mutations.find((item: any) => item.kind === "teardown-route")?.status, "pending");
+  assert.equal(saved.teardown?.absence?.["route:route-post-write"], undefined);
+});
+
+test("re-entered teardown proves an already-absent Worker and route without workers.dev", async (t) => {
+  const fixture = await rateLimitedTeardownFixture(t, "resources-ready");
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  assert.equal(fixture.exposureReads(), 0);
+  assert.equal(fixture.removalCalls.includes("route"), false);
+  assert.equal(fixture.workerDeleteCalls(), 0);
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(saved.teardown.absence["route:route-post-write"], true);
+  assert.equal(saved.teardown.absence[`worker:${workerName}`], true);
+});
+
 test("teardown refuses a foreign Worker that appears after the entry ownership guard", async (t) => {
   const fixture = await postWriteTeardownFixture(t, "resources-ready");
   const baseAdapter = fixture.dependencies.adapterFactory();
   const baseTokenClient = fixture.dependencies.tokenClientFactory();
   const timers = immediateRetryTimers();
   let deploymentsListCalls = 0;
+  let accountWorkerReads = 0;
   let deployCalls = 0;
   const dependencies = {
     ...fixture.dependencies,
@@ -1719,6 +1929,10 @@ test("teardown refuses a foreign Worker that appears after the entry ownership g
     }),
     tokenClientFactory: () => ({
       ...baseTokenClient,
+      listWorkerScripts: async () => {
+        accountWorkerReads += 1;
+        return accountWorkerReads >= 5 ? [{ name: workerName }] : [];
+      },
       inspectWorkersDev: async () => ({ exists: true, enabled: true }),
     }),
     setTimer: timers.setTimer,
@@ -1759,11 +1973,15 @@ for (const { name, exposures } of [
   test(name, async (t) => {
     const fixture = await postWriteTeardownFixture(t);
     const exposure = statefulExposureTokenClient(exposures);
+    const baseTokenClient = fixture.dependencies.tokenClientFactory();
     const timers = immediateRetryTimers();
 
     const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, {
       ...fixture.dependencies,
-      tokenClientFactory: () => exposure.tokenClient,
+      tokenClientFactory: () => ({
+        ...exposure.tokenClient,
+        listWorkerScripts: baseTokenClient.listWorkerScripts,
+      }),
       setTimer: timers.setTimer,
       clearTimer: timers.clearTimer,
     });
@@ -2326,7 +2544,7 @@ test("an unconfirmable quarantine is recorded and can still be torn down", async
   });
   const tokenClient = {
     inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
-    listWorkerScripts: async () => [],
+    listWorkerScripts: async () => state.workerPresent ? [{ name: workerName }] : [],
     listWorkerRoutes: async () => [],
     listWorkerDomains: async () => [],
     inspectWorkersDev: exposureClient.inspectWorkersDev,
@@ -2582,7 +2800,7 @@ test("mocked live boundaries complete plan through teardown in dependency order 
   const tokenClient = {
     inspect: async () => state.tokenActive ? { exists: true, active: true, id: state.tokenId } : { exists: false, active: false },
     inspectId: async (id: string) => state.tokenActive && id === state.tokenId ? { exists: true, active: true, id } : { exists: false, active: false },
-    listWorkerScripts: async () => read([]),
+    listWorkerScripts: async () => read(state.deployments.length > 0 ? [{ name: workerName }] : []),
     listWorkerRoutes: async () => read([]),
     listWorkerDomains: async () => { lastRemoteAction = "identity-read"; return []; },
     inspectWorkersDev: async () => read({ exists: state.deployments.length > 0, enabled: state.active }),
@@ -2736,7 +2954,7 @@ test("pending Worker deploy reconciliation propagates deployment-list failures",
       ...baseAdapter,
       deploymentsList: async (name: string) => {
         deploymentsListCalls += 1;
-        if (deploymentsListCalls === 4) throw reconciliationError;
+        if (deploymentsListCalls === 3) throw reconciliationError;
         return baseAdapter.deploymentsList();
       },
     }),
@@ -2747,7 +2965,7 @@ test("pending Worker deploy reconciliation propagates deployment-list failures",
     (error: unknown) => error === reconciliationError,
   );
 
-  assert.equal(deploymentsListCalls, 4);
+  assert.equal(deploymentsListCalls, 3);
   assert.deepEqual(fixture.mutationCalls, []);
   assert.equal(fixture.workersDevReads(), 0);
   const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
@@ -2821,6 +3039,7 @@ test("early-phase teardown refuses to delete a same-named Worker this run never 
   // A Worker exists at the run's name -- created by some LATER run, not this one.
   let deleted = 0;
   const base = fixture.dependencies.adapterFactory();
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
   const dependencies = {
     ...fixture.dependencies,
     adapterFactory: () => ({
@@ -2828,6 +3047,10 @@ test("early-phase teardown refuses to delete a same-named Worker this run never 
       deploymentsList: async () => [{ id: "deployment-from-another-run", script_name: workerName }],
       versionsList: async () => [],
       deleteWorker: async () => { deleted += 1; },
+    }),
+    tokenClientFactory: () => ({
+      ...baseTokenClient,
+      listWorkerScripts: async () => [{ name: workerName }],
     }),
   };
 
