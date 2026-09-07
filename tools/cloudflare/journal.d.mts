@@ -16,6 +16,9 @@ export interface StagingFixturePlan {
   songIds: string[]; deviceInstallationId: string; durableObjectIdentity: string; operationIds: Record<string, string>;
   tokenHash: string; rows: Array<{ table: string; key: string }>; parentChildTables: string[];
 }
+export const STAGING_FAILURE_CAUSES: readonly ["wrangler-command-failed", "edge-timeout", "edge-rate-limited", "marker-missing", "marker-mismatch", "marker-unreadable", "postcondition-failed"];
+export type StagingFailureCause = (typeof STAGING_FAILURE_CAUSES)[number];
+export interface StagingCauseRecord { code: StagingFailureCause }
 export interface StagingJournal {
   version: 1; runId: string; owner: string; sourceSha: string; phase: string; identity: StagingIdentity;
   resources: StagingResource[]; mutations: StagingMutation[]; migrations: MigrationAttestation[];
@@ -24,7 +27,7 @@ export interface StagingJournal {
   governance?: Record<string, unknown>; lease?: { active: boolean; runId: string; owner: string; revision: string };
   recovery?: Record<string, unknown>; config?: Record<string, unknown>; schema?: Record<string, unknown>; deployment?: Record<string, unknown>;
   deploymentBaseline?: string[]; rollback?: Record<string, unknown>; acceptanceEvidence?: Record<string, unknown>;
-  incident?: Record<string, unknown>; teardown?: Record<string, unknown>; retention?: Record<string, unknown>;
+  incident?: Record<string, unknown> & { cause?: StagingCauseRecord }; teardown?: Record<string, unknown>; retention?: Record<string, unknown>;
   absenceChecks?: Array<Record<string, unknown>>; createdAt: string; updatedAt: string;
 }
 export const TEARDOWN_ENTRY_PHASES: readonly string[];

@@ -72,7 +72,7 @@ function waitForRetry(delay, setTimer, clearTimer) {
   });
 }
 
-export async function confirmAbsence(probe, {
+async function runRetryLadder(probe, evaluate, {
   setTimer = defaultSetTimer,
   clearTimer = defaultClearTimer,
   now = () => new Date(),
@@ -82,37 +82,50 @@ export async function confirmAbsence(probe, {
   maxDelayMs = 8_000,
   budgetMs = 45_000,
   random = Math.random,
+  boundProbeToBudget = false,
 } = {}) {
   const startedAt = now().getTime();
+  const observations = [];
   let attempts = 0;
 
   while (attempts < attemptLimit) {
-    attempts += 1;
-    let present;
-    try {
-      present = await probe();
-    } catch (error) {
-      if (rateLimited(error)) return confirmation("could-not-confirm", attempts, now(), error);
-      throw error;
+    const remainingMs = budgetMs - (now().getTime() - startedAt);
+    if (boundProbeToBudget && remainingMs <= 0) {
+      return (await evaluate({ observations, attempts, checkedAt: now(), exhausted: true, exhaustion: "budget" })).result;
     }
-
-    if (!present) return confirmation("proven-absent", attempts, now());
-    // Every attempt observed it and nothing errored: that is the strongest evidence available
-    // that it really is present. Only running out of wall-clock or hitting a rate limit leaves
-    // the question genuinely open.
-    if (attempts >= attemptLimit) return confirmation("present", attempts, now());
-
+    attempts += 1;
+    let value; let error;
+    try { value = await (boundProbeToBudget ? probe({ remainingMs }) : probe()); } catch (caught) { error = caught; }
     const checkedAt = now();
+    const decision = await evaluate({ value, error, observations, attempts, checkedAt, exhausted: false });
+    if (decision?.done) return decision.result;
+    observations.push(decision?.observation ?? value);
+
+    if (attempts >= attemptLimit) {
+      return (await evaluate({ observations, attempts, checkedAt, exhausted: true, exhaustion: "attempts" })).result;
+    }
     const elapsedMs = checkedAt.getTime() - startedAt;
     const backoffMs = Math.min(maxDelayMs, initialDelayMs * factor ** (attempts - 1));
     const delayMs = backoffMs / 2 + (backoffMs / 2) * random();
     if (elapsedMs >= budgetMs || delayMs > budgetMs - elapsedMs) {
-      return confirmation("could-not-confirm", attempts, checkedAt);
+      return (await evaluate({ observations, attempts, checkedAt, exhausted: true, exhaustion: "budget" })).result;
     }
     await waitForRetry(delayMs, setTimer, clearTimer);
   }
 
-  return confirmation("could-not-confirm", attempts, now());
+  return (await evaluate({ observations, attempts, checkedAt: now(), exhausted: true, exhaustion: "attempts" })).result;
+}
+
+export async function confirmAbsence(probe, options = {}) {
+  return runRetryLadder(probe, ({ value: present, error, attempts, checkedAt, exhausted, exhaustion }) => {
+    if (exhausted) return { done: true, result: confirmation(exhaustion === "attempts" ? "present" : "could-not-confirm", attempts, checkedAt) };
+    if (error) {
+      if (rateLimited(error)) return { done: true, result: confirmation("could-not-confirm", attempts, checkedAt, error) };
+      throw error;
+    }
+    if (!present) return { done: true, result: confirmation("proven-absent", attempts, checkedAt) };
+    return { observation: true };
+  }, options);
 }
 
 function effectiveConfigDirectory(root, runId) {
@@ -276,10 +289,16 @@ function sameResource(left, right) {
   return left?.domain === right.domain && left?.id === right.id;
 }
 
+async function persistIncidentCause(journal, persistJournal, code) {
+  journal.incident = { ...(journal.incident ?? {}), cause: { code } };
+  await persistJournal(journal);
+}
+
 export async function executeJournaledMutation(options) {
-  const { journal, expectedRevision, inspectRevision, resource, kind, persistJournal, inspect, mutate, owns, reconcileExisting, finalize, intentMetadata = {} } = options;
+  const { journal, expectedRevision, inspectRevision, resource, kind, persistJournal, inspect, mutate, owns, reconcileExisting, confirmAfterMutation, finalize, intentMetadata = {} } = options;
   if (![inspectRevision, persistJournal, inspect, mutate, owns].every((value) => typeof value === "function")) throw new Error("journaled mutation boundaries are required");
   if (reconcileExisting !== undefined && typeof reconcileExisting !== "function") throw new Error("journaled mutation reconciliation is invalid");
+  if (confirmAfterMutation !== undefined && typeof confirmAfterMutation !== "function") throw new Error("journaled mutation confirmation is invalid");
   if (await inspectRevision() !== expectedRevision) throw new Error("remote identity changed");
   if (!resource || typeof resource.domain !== "string" || typeof resource.id !== "string" || !resource.id) throw new Error("resource ownership is required");
   let owned = journal.resources.find((item) => sameResource(item, resource));
@@ -298,7 +317,14 @@ export async function executeJournaledMutation(options) {
     throw new Error("mutation intent cannot be reconciled");
   }
   await persistJournal(journal);
-  const before = await inspect();
+  let before;
+  try { before = await inspect(); }
+  catch (error) {
+    if (error?.stagingCause) {
+      await persistIncidentCause(journal, persistJournal, error.stagingCause);
+    }
+    throw error;
+  }
   let result;
   if (before?.exists) {
     const reconciled = reconcileExisting === undefined
@@ -308,26 +334,53 @@ export async function executeJournaledMutation(options) {
     result = { reconciled: true, state: before };
   } else {
     if (existingIntent) throw new Error("pending mutation is absent remotely; no replay authorized");
-    try {
-      if (await inspectRevision() !== expectedRevision) throw new Error("remote identity changed");
-      await mutate();
-      const after = await inspect();
-      if (!after?.exists || !owns(after)) throw new Error("mutation postcondition failed");
-      result = { reconciled: false, state: after };
-    } catch (error) {
-      const afterLoss = await inspect();
-      const reconciled = afterLoss?.exists && (reconcileExisting === undefined
-        ? owns(afterLoss)
-        : await reconcileExisting({ intent, state: afterLoss }));
-      if (!reconciled) throw new Error("mutation outcome is uncertain; no retry authorized", { cause: error });
-      result = { reconciled: true, state: afterLoss };
+    if (await inspectRevision() !== expectedRevision) throw new Error("remote identity changed");
+    if (confirmAfterMutation) {
+      let mutationError = null;
+      try { await mutate(); } catch (error) { mutationError = error; }
+      let observation;
+      try { observation = await confirmAfterMutation(); }
+      catch (error) {
+        const code = error?.stagingCause ?? "marker-unreadable";
+        await persistIncidentCause(journal, persistJournal, code);
+        throw error;
+      }
+      if (observation?.outcome === "proven-owned") {
+        result = { reconciled: mutationError !== null, state: { exists: true, id: resource.id, marker: observation.marker }, observation };
+      } else {
+        const code = mutationError?.stagingCause ?? (mutationError ? "postcondition-failed" : observation?.cause ?? "postcondition-failed");
+        await persistIncidentCause(journal, persistJournal, code);
+        const error = mutationError ?? new Error(observation?.outcome === "could-not-confirm"
+          ? "mutation outcome is uncertain; no retry authorized"
+          : "mutation postcondition failed");
+        throw classifiedStagingError(error, code, { observation });
+      }
+    } else {
+      try {
+        await mutate();
+        const after = await inspect();
+        if (!after?.exists || !owns(after)) throw new Error("mutation postcondition failed");
+        result = { reconciled: false, state: after };
+      } catch (error) {
+        const afterLoss = await inspect();
+        const reconciled = afterLoss?.exists && (reconcileExisting === undefined
+          ? owns(afterLoss)
+          : await reconcileExisting({ intent, state: afterLoss }));
+        if (!reconciled) throw new Error("mutation outcome is uncertain; no retry authorized", { cause: error });
+        result = { reconciled: true, state: afterLoss };
+      }
     }
   }
   intent.status = "applied";
   owned.status = "owned";
   if (finalize !== undefined) {
     if (typeof finalize !== "function") throw new Error("mutation finalizer is invalid");
-    await finalize({ journal, intent, owned, result });
+    try { await finalize({ journal, intent, owned, result }); }
+    catch (error) {
+      const code = error?.stagingCause ?? "postcondition-failed";
+      await persistIncidentCause(journal, persistJournal, code);
+      throw classifiedStagingError(error, code);
+    }
   }
   await persistJournal(journal);
   return result;
@@ -707,23 +760,80 @@ function newDeploymentId(beforeIds, proof) {
   return newVersions[0];
 }
 
-async function releaseMarker(fetch, origin) {
+function classifiedStagingError(error, stagingCause, fields = {}) {
+  const classified = new Error(error instanceof Error ? error.message : "staging operation failed", { cause: error });
+  return Object.assign(classified, { stagingCause, ...fields });
+}
+
+function markerReadError(message, { status, aborted = false, unreadable = false, cause } = {}) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  if (Number.isInteger(status)) error.status = status;
+  error.aborted = aborted;
+  if (unreadable) error.markerUnreadable = true;
+  error.stagingCause = aborted ? "edge-timeout" : "marker-unreadable";
+  return error;
+}
+
+export async function readReleaseMarker(fetch, origin, { timeoutMs = 5_000 } = {}) {
   let response;
-  try { response = await fetch(new URL("/api/staging-release", origin), { redirect: "error", signal: AbortSignal.timeout(30_000) }); }
-  catch { throw new Error("served release marker reachability is unknown"); }
+  try { response = await fetch(new URL("/api/staging-release", origin), { redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (cause) {
+    const aborted = cause?.name === "AbortError" || cause?.name === "TimeoutError";
+    throw markerReadError("served release marker reachability is unknown", { status: cause?.status ?? cause?.statusCode, aborted, cause });
+  }
   if (response.status === 404) return null;
-  if (!response.ok) throw new Error("served release marker request failed");
+  if (!response.ok) throw markerReadError("served release marker request failed", { status: response.status });
   let marker;
-  try { marker = await response.json(); } catch { throw new Error("served release marker is unreadable"); }
-  if (!marker || typeof marker.sourceSha !== "string" || typeof marker.configDigest !== "string" || marker.lifecycle !== "legacy-sqlite-v1" || !Array.isArray(marker.bindings)) throw new Error("served release marker is unreadable");
+  try { marker = await response.json(); } catch (cause) { throw markerReadError("served release marker is unreadable", { status: response.status, unreadable: true, cause }); }
+  if (!marker || typeof marker.sourceSha !== "string" || typeof marker.configDigest !== "string" || marker.lifecycle !== "legacy-sqlite-v1" || !Array.isArray(marker.bindings) || marker.bindings.some((binding) => typeof binding !== "string")) {
+    throw markerReadError("served release marker is unreadable", { status: response.status, unreadable: true });
+  }
   return marker;
 }
 
-function assertMarker(expected, actual) {
+export function releaseMarkerMatches(expected, actual) {
   const bindingsMatch = Array.isArray(expected.bindings) && expected.bindings.length === actual?.bindings?.length && expected.bindings.every((binding) => actual.bindings.includes(binding));
-  if (!actual || actual.sourceSha !== expected.sourceSha || actual.configDigest !== expected.configDigest || actual.lifecycle !== "legacy-sqlite-v1" || !bindingsMatch) {
+  return Boolean(actual && actual.sourceSha === expected.sourceSha && actual.configDigest === expected.configDigest && actual.lifecycle === expected.lifecycle && bindingsMatch);
+}
+
+function assertMarker(expected, actual) {
+  if (!releaseMarkerMatches(expected, actual)) {
     throw new Error("served release does not match frozen source and configuration");
   }
+}
+
+function markerConfirmation(outcome, attempts, checkedAt, cause, marker) {
+  return { outcome, attempts, checkedAt: checkedAt.toISOString(), cause, ...(marker === undefined ? {} : { marker }) };
+}
+
+export async function confirmReleaseMarker(fetch, origin, expected, options = {}) {
+  const { fetchTimeoutMs = 5_000, ...retryOptions } = options;
+  return runRetryLadder(
+    ({ remainingMs }) => readReleaseMarker(fetch, origin, { timeoutMs: Math.min(fetchTimeoutMs, Math.max(1, Math.floor(remainingMs))) }),
+    ({ value: marker, error, observations, attempts, checkedAt, exhausted }) => {
+      if (!exhausted) {
+        if (error) {
+          if (error.markerUnreadable) throw error;
+          if (rateLimited(error)) return { done: true, result: markerConfirmation("could-not-confirm", attempts, checkedAt, "edge-rate-limited") };
+          if (error.aborted) return { done: true, result: markerConfirmation("could-not-confirm", attempts, checkedAt, "edge-timeout") };
+          return { observation: { kind: "unreadable" } };
+        }
+        if (marker && releaseMarkerMatches(expected, marker)) return { done: true, result: markerConfirmation("proven-owned", attempts, checkedAt, null, marker) };
+        if (marker === null) return { observation: { kind: "missing" } };
+        return { observation: { kind: "mismatch", fingerprint: sha256(canonicalJson(marker)) } };
+      }
+
+      const kinds = new Set(observations.map((observation) => observation.kind));
+      if (kinds.size === 1 && kinds.has("missing")) return { done: true, result: markerConfirmation("proven-not-owned", attempts, checkedAt, "marker-missing") };
+      if (kinds.size === 1 && kinds.has("mismatch")) {
+        const fingerprints = new Set(observations.map((observation) => observation.fingerprint));
+        return { done: true, result: markerConfirmation(fingerprints.size === 1 ? "proven-not-owned" : "could-not-confirm", attempts, checkedAt, "marker-mismatch") };
+      }
+      if (kinds.has("unreadable")) return { done: true, result: markerConfirmation("could-not-confirm", attempts, checkedAt, "marker-unreadable") };
+      return { done: true, result: markerConfirmation("could-not-confirm", attempts, checkedAt, "postcondition-failed") };
+    },
+    { ...retryOptions, boundProbeToBudget: true },
+  );
 }
 
 async function copyMigration(root, target, filename) {
@@ -791,6 +901,8 @@ function defaultDependencies(overrides = {}) {
     now: overrides.now ?? (() => new Date()),
     setTimer: overrides.setTimer ?? defaultSetTimer,
     clearTimer: overrides.clearTimer ?? defaultClearTimer,
+    markerFetchTimeoutMs: overrides.markerFetchTimeoutMs ?? 5_000,
+    markerBudgetMs: overrides.markerBudgetMs ?? 45_000,
   };
 }
 
@@ -1031,17 +1143,32 @@ async function applyOperation(options, dependencies) {
     intentMetadata: { beforeDeploymentIds: privateDeploymentIds },
     persistJournal: (value) => persist(options.journalPath, value),
     inspect: async () => {
-      const marker = await releaseMarker(dependencies.fetch, journal.identity.origin);
+      const marker = await readReleaseMarker(dependencies.fetch, journal.identity.origin, { timeoutMs: dependencies.markerFetchTimeoutMs });
       return marker ? { exists: true, id: resourceId(journal, "route"), marker } : { exists: false };
     },
-    mutate: () => activeAdapter.deploy(journal.identity.workerName),
-    owns: (state) => state.id === resourceId(journal, "route") && state.marker?.sourceSha === journal.sourceSha && state.marker?.configDigest === activeConfig.configDigest,
+    mutate: async () => {
+      try { return await activeAdapter.deploy(journal.identity.workerName); }
+      catch (error) { throw classifiedStagingError(error, "wrangler-command-failed"); }
+    },
+    owns: (state) => state.id === resourceId(journal, "route") && releaseMarkerMatches(activeExpected, state.marker),
+    confirmAfterMutation: () => confirmReleaseMarker(dependencies.fetch, journal.identity.origin, activeExpected, {
+      fetchTimeoutMs: dependencies.markerFetchTimeoutMs,
+      budgetMs: dependencies.markerBudgetMs,
+      setTimer: dependencies.setTimer,
+      clearTimer: dependencies.clearTimer,
+      now: dependencies.now,
+    }),
   });
-  const marker = activation.state?.marker ?? await releaseMarker(dependencies.fetch, journal.identity.origin);
+  const marker = activation.state?.marker;
   assertMarker(activeExpected, marker);
-  const finalDeployment = await deploymentProof(activeAdapter, journal.identity.workerName);
-  const activationIntent = journal.mutations.find((item) => item?.kind === "workers-dev-enable");
-  journal.deployment.activeId = newDeploymentId(activationIntent?.beforeDeploymentIds ?? privateDeploymentIds, finalDeployment);
+  try {
+    const finalDeployment = await deploymentProof(activeAdapter, journal.identity.workerName);
+    const activationIntent = journal.mutations.find((item) => item?.kind === "workers-dev-enable");
+    journal.deployment.activeId = newDeploymentId(activationIntent?.beforeDeploymentIds ?? privateDeploymentIds, finalDeployment);
+  } catch (error) {
+    await persistIncidentCause(journal, (value) => persist(options.journalPath, value), "postcondition-failed");
+    throw classifiedStagingError(error, "postcondition-failed");
+  }
   journal.phase = "alias-live";
   await persist(options.journalPath, journal);
   return { operation: "apply", phase: journal.phase, migrationCount: journal.migrations.length, rollback: "forward-fix-only", wholeStackRollback: false };
@@ -1056,7 +1183,8 @@ async function applyWithIncidentCapture(options, dependencies) {
       const journal = await loadOwnedJournal(options);
       if (journal.identity.databaseId && !["quarantined", "cleanup-complete"].includes(journal.phase)) {
         const failedPhase = journal.phase;
-        journal.incident = { failedPhase, owner: journal.owner, nextAction: "reconcile-and-forward-fix-or-teardown", wholeStackRollback: false };
+        const cause = error?.stagingCause;
+        journal.incident = { failedPhase, owner: journal.owner, nextAction: "reconcile-and-forward-fix-or-teardown", wholeStackRollback: false, ...(cause ? { cause: { code: cause } } : {}) };
         await persist(options.journalPath, journal);
         const credentials = requireCredentials(options.credentialEnvironment, "apply");
         const inventory = validateStagingInventory(await readPrivateJson(options.root, options.inventoryPath), dependencies.sourceState?.(options.root) ?? inspectSourceState(options.root));
@@ -1095,7 +1223,7 @@ async function quarantine(options, dependencies, { adapter, privateAdapter, toke
   }
   if (enabledBefore) {
     if (await currentProtectedRevision(adapter, inventory, journal.identity, tokenClient) !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
-    assertMarker({ sourceSha: journal.sourceSha, configDigest: journal.config?.activeDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] }, await releaseMarker(fetch, journal.identity.origin));
+    assertMarker({ sourceSha: journal.sourceSha, configDigest: journal.config?.activeDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"], lifecycle: "legacy-sqlite-v1" }, await readReleaseMarker(fetch, journal.identity.origin));
     try {
       if (await currentProtectedRevision(adapter, inventory, journal.identity, tokenClient) !== journal.preflight?.protectedRevision) throw new Error("remote identity changed");
       await privateAdapter.deploy(journal.identity.workerName);
@@ -1161,10 +1289,10 @@ async function verifyOperation(options, dependencies) {
     return { operation: "verify", phase: journal.phase, outcomes: savedEvidence.outcomes, counts: savedEvidence.counts, originAbsence: replayAbsence, wholeStackRollback: false };
   }
   let originAbsence;
-  const markerExpected = { sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"] };
+  const markerExpected = { sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"], lifecycle: "legacy-sqlite-v1" };
   const assertActiveOrigin = async () => {
     if (!await workersDevEnabled(inventory, journal, tokenClient)) throw new Error("authenticated workers.dev exposure is inactive");
-    assertMarker(markerExpected, await releaseMarker(dependencies.fetch, journal.identity.origin));
+    assertMarker(markerExpected, await readReleaseMarker(dependencies.fetch, journal.identity.origin));
   };
   await assertActiveOrigin();
   const preFixtureBookmark = parseBookmark(await adapter.d1TimeTravelInfo(journal.identity.databaseName));
