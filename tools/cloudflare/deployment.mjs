@@ -34,6 +34,29 @@ const WORKER_JSON_COMMANDS = new Map([
   ["secret list", ["--format", "json"]],
 ]);
 
+export function isSecretFamily(args) {
+  return Array.isArray(args) && args[0] === "secret";
+}
+
+export function composeWranglerArgs({ args, envFilePath, configPath, suppressEnv = false }) {
+  const completeArgs = [
+    ...args,
+    "--env-file", envFilePath,
+    "--config", configPath,
+    ...(suppressEnv ? [] : ["--env", "staging"]),
+  ];
+  if (isSecretFamily(completeArgs)) {
+    // Wrangler resolves secret commands through getLegacyScriptName, which appends the
+    // environment to --name. Suppressing --env is only half the guarantee: with no
+    // --name it falls through to the config's top-level name, a different Worker.
+    if (completeArgs.includes("--env") || completeArgs.includes("-e")) {
+      throw new Error("secret-family Wrangler invocation must not include an environment flag");
+    }
+    if (!completeArgs.includes("--name")) throw new Error("secret-family Wrangler invocation must name its Worker explicitly");
+  }
+  return completeArgs;
+}
+
 export function runBoundedSubprocess(file, args, options) {
   const {
     cwd, env, input, timeoutMs,
@@ -99,7 +122,9 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) throw new Error("Wrangler arguments must be strings");
     if (args.includes("--config") || args.includes("--env") || args.includes("-c") || args.includes("-e")) throw new Error("Wrangler environment selection is owned by the staging adapter");
     if (args.some((arg) => /(?:route|domain|dns)/i.test(arg))) throw new Error("route mutation commands are not supported");
-    const completeArgs = [...args, "--env-file", emptyEnvironment, "--config", config, "--env", "staging"];
+    // Derived here, not asked of callers: a fifth secret subcommand added later would otherwise
+    // have to remember, and forgetting is precisely the defect this suppression exists to fix.
+    const completeArgs = composeWranglerArgs({ args, envFilePath: emptyEnvironment, configPath: config, suppressEnv: isSecretFamily(args) });
     const executionOptions = {
       cwd: root, env: childEnv,
       input, timeoutMs, killGraceMs, maxOutputBytes, shell: false,
@@ -116,7 +141,7 @@ export function createWranglerAdapter({ root, token, accountId, configPath, spaw
   }
   async function workerJson(command, workerName) {
     if (!safeWorkerName(workerName)) throw new Error("safe staging Worker name is required");
-    const result = await invoke([...command, "--name", workerName, ...(command[0] === "secret" ? ["--format", "json"] : ["--json"])], { allowNotFound: true });
+    const result = await invoke([...command, "--name", workerName, ...(isSecretFamily(command) ? ["--format", "json"] : ["--json"])], { allowNotFound: true });
     return parseJson(result.stdout);
   }
   const adapter = {
@@ -405,6 +430,12 @@ export async function runMigrationFirstDeployment(options) {
   await verifyFinalSchema();
   if (!sameSnapshot(await inspectSnapshot(), expectedSnapshot)) throw new Error("Cloudflare inventory changed before deploy");
   let intent = journal.mutations.find((item) => item?.kind === "worker-deploy");
+  const durableIntent = journal.mutations.find((item) => item?.kind === "durable-object-create");
+  const settleDurableIntent = async () => {
+    if (durableIntent?.status !== "pending") return;
+    durableIntent.status = "applied";
+    await persistJournal(journal);
+  };
   if (journal.mutations.filter((item) => item?.kind === "worker-deploy").length > 1) throw new Error("deployment journal contains duplicate intents");
   let deployment;
   if (intent) {
@@ -413,6 +444,7 @@ export async function runMigrationFirstDeployment(options) {
     }
     deployment = await inspectDeployment();
     if (!deployment) throw new Error("deployment outcome is uncertain; no replay authorized");
+    await settleDurableIntent();
     await verifyDeployment(deployment);
     if (intent.status === "pending") {
       intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
@@ -430,6 +462,7 @@ export async function runMigrationFirstDeployment(options) {
       deployment = await inspectDeployment();
       if (!deployment) throw new Error("deployment outcome is uncertain; no replay authorized", { cause: error });
     }
+    await settleDurableIntent();
     await verifyDeployment(deployment);
     intent.status = "applied"; intent.deploymentId = deployment.deploymentId;
     await persistJournal(journal);
