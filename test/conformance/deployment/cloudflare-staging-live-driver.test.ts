@@ -442,8 +442,46 @@ test("a failed Wrangler deploy that is proven not owned is never replayed", asyn
 });
 
 test("a failed active Wrangler deploy proven not owned records its cause and ends in quarantine", async (t) => {
-  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-active-failure-private-"));
-  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-active-failure-root-"));
+  const fixture = await activeEnableSettlementFixture(t, { activeDeployError: new Error("Wrangler command failed") });
+
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies), (error: any) => error.message === "Wrangler command failed" && error.stagingCause === "wrangler-command-failed");
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(fixture.state.activeDeployCalls, 1);
+  assert.equal(saved.phase, "quarantined");
+  assert.equal(saved.incident.cause.code, "wrangler-command-failed");
+  assert.equal(saved.mutations.find((item: any) => item.kind === "workers-dev-enable").status, "pending");
+});
+
+test("a full marker assertion failure during settlement leaves the enable pending and phase unadvanced", async () => {
+  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, bindings: expectedReleaseMarker.bindings.slice(1) }), false);
+  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, lifecycle: "another-lifecycle" }), false);
+  let captured: any;
+  try {
+    await markerMutationFixture([
+      new Response(null, { status: 404 }),
+      markerResponse(expectedReleaseMarker),
+    ], { finalizeError: new Error("served release does not match frozen source and configuration") });
+  } catch (error: any) {
+    captured = error;
+  }
+  assert.ok(captured);
+  assert.equal(captured.stagingCause, "postcondition-failed");
+  assert.equal(captured.journal.incident.cause.code, "postcondition-failed");
+  assert.equal(captured.journal.phase, "pre-write");
+  assert.equal(captured.journal.mutations.find((item: any) => item.kind === "workers-dev-enable").status, "pending");
+  assert.equal(captured.mutations, 1);
+});
+
+async function activeEnableSettlementFixture(
+  t: any,
+  options: {
+    pendingActivation?: boolean;
+    activeDeploymentIds?: string[];
+    activeDeployError?: Error;
+  } = {},
+) {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-enable-settlement-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-enable-settlement-root-"));
   t.after(() => rm(privateDirectory, { recursive: true, force: true }));
   t.after(() => rm(testRoot, { recursive: true, force: true }));
   await mkdir(path.join(testRoot, "migrations", "d1"), { recursive: true });
@@ -453,8 +491,9 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
   const inventoryPath = path.join(privateDirectory, "inventory.json");
   const journalPath = path.join(privateDirectory, "journal.json");
   const stagingInventory = inventory();
-  delete (stagingInventory.staging as Partial<typeof stagingInventory.staging>).databaseId;
-  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+  const freshInventory = structuredClone(stagingInventory);
+  delete (freshInventory.staging as Partial<typeof freshInventory.staging>).databaseId;
+  await writeFile(inventoryPath, JSON.stringify(freshInventory));
 
   const schemaDatabase = new DatabaseSync(":memory:");
   t.after(() => schemaDatabase.close());
@@ -462,18 +501,26 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
   for (const migration of D1_MIGRATIONS) schemaDatabase.exec(await readFile(path.resolve("migrations/d1", migration.filename), "utf8"));
   const schemaObjects = schemaDatabase.prepare("SELECT type,name,sql FROM sqlite_schema WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' AND substr(name,1,4) <> '_cf_' AND name <> 'd1_migrations' AND sql IS NOT NULL ORDER BY type,name").all();
 
+  const newDeploymentIds = options.activeDeploymentIds ?? ["deployment-active"];
   const state = {
     databasePresent: false,
     secretPresent: false,
+    active: false,
+    activeDeployCalls: 0,
+    activeDigest: "",
     deployments: [] as Array<{ id: string; script_name: string }>,
     versions: [] as Array<{ id: string; script_name: string }>,
-    activeDeployCalls: 0,
+    settlementSnapshots: [] as any[],
+    captureSettlement: false,
+  };
+  const captureSettlement = async () => {
+    if (state.captureSettlement) state.settlementSnapshots.push(JSON.parse(await readFile(journalPath, "utf8")));
   };
   const adapterFactory = ({ configPath }: { configPath?: string } = {}) => ({
     whoami: async () => ({ accountId }),
     d1List: async () => state.databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
-    deploymentsList: async () => state.deployments,
-    versionsList: async () => state.versions,
+    deploymentsList: async () => { await captureSettlement(); return state.deployments; },
+    versionsList: async () => { await captureSettlement(); return state.versions; },
     secretList: async () => state.secretPresent ? [{ name: "LIVE_COMMAND_SECRET" }] : [],
     d1Execute: async (_name: string, { command }: { command: string }) => {
       if (command.includes("name='d1_migrations'")) return [{ success: true, results: [{ name: "d1_migrations" }] }];
@@ -488,9 +535,14 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
       const config = JSON.parse(await readFile(configPath!, "utf8"));
       if (config.env.staging.workers_dev) {
         state.activeDeployCalls += 1;
-        throw new Error("Wrangler command failed");
+        if (options.activeDeployError) throw options.activeDeployError;
+        state.active = true;
+        state.activeDigest = config.env.staging.vars.WOODSHED_CONFIG_DIGEST;
+        state.deployments.push(...newDeploymentIds.map((id) => ({ id, script_name: workerName })));
+        return;
       }
-      assert.fail("quarantine must not issue a deploy when exposure is already absent");
+      state.active = false;
+      state.deployments.push({ id: "deployment-private-after-quarantine", script_name: workerName });
     },
   });
   const tokenClient = {
@@ -499,11 +551,11 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
     listWorkerRoutes: async () => [],
     listWorkerDomains: async () => [],
     inspectAccountSubdomain: async () => "synthetic",
-    inspectWorkersDev: async () => ({ exists: true, enabled: false }),
+    inspectWorkersDev: async () => ({ exists: true, enabled: state.active }),
   };
   const common = {
     root: testRoot, environment: "staging", inventoryPath, journalPath,
-    runId: "run-active-deploy-failure", owner: "owner-active-deploy-failure",
+    runId: "run-enable-settlement", owner: "owner-enable-settlement",
     processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", LIVE_COMMAND_SECRET: "s".repeat(32) },
   };
   const timers = immediateRetryTimers();
@@ -511,12 +563,26 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
     sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
     adapterFactory,
     tokenClientFactory: () => tokenClient,
-    fetch: async () => new Response(null, { status: 404 }),
+    fetch: async () => {
+      state.captureSettlement = true;
+      return state.active
+        ? markerResponse({ ...expectedReleaseMarker, configDigest: state.activeDigest })
+        : new Response(null, { status: 404 });
+    },
     setTimer: timers.setTimer,
     clearTimer: timers.clearTimer,
     now: () => new Date("2030-01-01T12:00:00.000Z"),
   };
   await runLiveOperation({ ...common, operation: "plan" }, dependencies);
+  const activeConfig = await generateEffectiveConfig({
+    root: testRoot,
+    runId: common.runId,
+    inventory: stagingInventory,
+    databaseId,
+    sourceSha,
+    workersDev: true,
+  });
+  state.activeDigest = activeConfig.configDigest;
   const journal = JSON.parse(await readFile(journalPath, "utf8"));
   journal.phase = "worker-deployed";
   journal.identity.databaseId = databaseId;
@@ -538,37 +604,145 @@ test("a failed active Wrangler deploy proven not owned records its cause and end
     { kind: "worker-deploy", status: "applied", sourceSha, deploymentId: "deployment-private" },
     { kind: "secret-put", domain: "secret", id: "LIVE_COMMAND_SECRET", status: "applied" },
   );
-  state.deployments = [{ id: "deployment-private", script_name: workerName }];
-  state.versions = [{ id: "version-private", script_name: workerName }];
+  if (options.pendingActivation) {
+    journal.mutations.push({
+      kind: "workers-dev-enable", domain: "route", id: journal.resources.find((item: any) => item.domain === "route").id,
+      status: "pending", beforeDeploymentIds: ["deployment-private", "version-private"],
+    });
+  }
   state.databasePresent = true;
   state.secretPresent = true;
+  state.active = options.pendingActivation === true;
+  state.deployments = [
+    { id: "deployment-private", script_name: workerName },
+    ...(options.pendingActivation ? newDeploymentIds.map((id) => ({ id, script_name: workerName })) : []),
+  ];
+  state.versions = [{ id: "version-private", script_name: workerName }];
   await saveJournal(journalPath, journal);
+  return { common, dependencies, journalPath, state };
+}
 
-  await assert.rejects(runLiveOperation({ ...common, operation: "apply" }, dependencies), (error: any) => error.message === "Wrangler command failed" && error.stagingCause === "wrangler-command-failed");
-  const saved = JSON.parse(await readFile(journalPath, "utf8"));
-  assert.equal(state.activeDeployCalls, 1);
-  assert.equal(saved.phase, "quarantined");
-  assert.equal(saved.incident.cause.code, "wrangler-command-failed");
-  assert.equal(saved.mutations.find((item: any) => item.kind === "workers-dev-enable").status, "pending");
+test("a reconciled enable persists marker proof, deployment identity, applied intent, and alias-live together", async (t) => {
+  const fixture = await activeEnableSettlementFixture(t, { pendingActivation: true });
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies);
+
+  assert.equal(result.phase, "alias-live");
+  assert.equal(fixture.state.activeDeployCalls, 0);
+  assert.ok(fixture.state.settlementSnapshots.length >= 2);
+  for (const snapshot of fixture.state.settlementSnapshots) {
+    const intent = snapshot.mutations.find((item: any) => item.kind === "workers-dev-enable");
+    assert.equal(snapshot.phase, "worker-deployed");
+    assert.equal(intent.status, "pending");
+    assert.equal(intent.markerProof, undefined);
+    assert.equal(snapshot.deployment?.activeId, undefined);
+  }
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const intent = saved.mutations.find((item: any) => item.kind === "workers-dev-enable");
+  assert.equal(saved.phase, "alias-live");
+  assert.equal(intent.status, "applied");
+  assert.equal(intent.deploymentId, "deployment-active");
+  assert.equal(saved.deployment.activeId, "deployment-active");
+  assert.deepEqual(intent.markerProof, { ...expectedReleaseMarker, configDigest: fixture.state.activeDigest });
 });
 
-test("a full-marker postcondition failure journals postcondition-failed and does not advance", async () => {
-  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, bindings: expectedReleaseMarker.bindings.slice(1) }), false);
-  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, lifecycle: "another-lifecycle" }), false);
-  let captured: any;
-  try {
-    await markerMutationFixture([
-      new Response(null, { status: 404 }),
-      markerResponse(expectedReleaseMarker),
-    ], { finalizeError: new Error("deployment identity did not advance") });
-  } catch (error: any) {
-    captured = error;
-  }
-  assert.ok(captured);
-  assert.equal(captured.stagingCause, "postcondition-failed");
-  assert.equal(captured.journal.incident.cause.code, "postcondition-failed");
-  assert.equal(captured.journal.phase, "pre-write");
-  assert.equal(captured.mutations, 1);
+test("an ambiguous enable deployment identity refuses without applying the intent or reaching alias-live", async (t) => {
+  const fixture = await activeEnableSettlementFixture(t, { activeDeploymentIds: ["deployment-active-a", "deployment-active-b"] });
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "apply" }, fixture.dependencies),
+    /deployment identity advance is ambiguous/,
+  );
+
+  assert.equal(fixture.state.activeDeployCalls, 1);
+  const saved = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  const intent = saved.mutations.find((item: any) => item.kind === "workers-dev-enable");
+  assert.notEqual(saved.phase, "alias-live");
+  assert.equal(intent.status, "pending");
+  assert.equal(intent.markerProof, undefined);
+  assert.equal(intent.deploymentId, undefined);
+  assert.equal(saved.deployment.activeId, undefined);
+});
+
+async function acceptancePhaseFixture(t: any, phase: "alias-live" | "quarantined") {
+  const fixture = await postWriteTeardownFixture(t, phase === "alias-live" ? "alias-live" : "worker-deployed");
+  const stagingInventory = inventory();
+  const activeConfig = await generateEffectiveConfig({
+    root: fixture.common.root,
+    runId: fixture.common.runId,
+    inventory: stagingInventory,
+    databaseId,
+    sourceSha,
+    workersDev: true,
+  });
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  journal.phase = phase;
+  journal.config = { ...(journal.config ?? {}), activeDigest: activeConfig.configDigest };
+  journal.schema = { digest: "e".repeat(64) };
+  await saveJournal(fixture.journalPath, journal);
+  const baseAdapter = fixture.dependencies.adapterFactory();
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  let acceptanceCalls = 0;
+  let exposureReads = 0;
+  const dependencies = {
+    ...fixture.dependencies,
+    adapterFactory: () => ({
+      ...baseAdapter,
+      d1TimeTravelInfo: async () => ({ bookmark: "bookmark-before-acceptance" }),
+    }),
+    tokenClientFactory: () => ({
+      ...baseTokenClient,
+      inspectWorkersDev: async () => ({ exists: true, enabled: exposureReads++ === 0 }),
+    }),
+    fetch: async () => markerResponse({ ...expectedReleaseMarker, configDigest: activeConfig.configDigest }),
+    acceptance: async ({ journal: acceptanceJournal, plan, persistJournal }: any) => {
+      acceptanceCalls += 1;
+      acceptanceJournal.phase = "verified";
+      acceptanceJournal.acceptance = { status: "passed", cleanupComplete: false, fixturePlan: plan };
+      await persistJournal(acceptanceJournal);
+      const evidence = createEvidenceEnvelope({
+        runId: acceptanceJournal.runId,
+        sourceSha: acceptanceJournal.sourceSha,
+        phase: acceptanceJournal.phase,
+        outcomes: { acceptance: true },
+        counts: { fixtureRows: plan.rows.length },
+      });
+      acceptanceJournal.acceptanceEvidence = evidence;
+      await persistJournal(acceptanceJournal);
+      return evidence;
+    },
+  };
+  const common = {
+    ...fixture.common,
+    processEnvironment: {
+      ...fixture.common.processEnvironment,
+      WOODSHED_STAGING_ORGANIZER_TOKEN: "organizer-synthetic",
+    },
+  };
+  return { common, dependencies, acceptanceCalls: () => acceptanceCalls };
+}
+
+test("verify runs acceptance from alias-live and refuses quarantined with the existing phase message", async (t) => {
+  const live = await acceptancePhaseFixture(t, "alias-live");
+  await runLiveOperation({ ...live.common, operation: "verify" }, live.dependencies);
+  assert.equal(live.acceptanceCalls(), 1);
+
+  const quarantined = await acceptancePhaseFixture(t, "quarantined");
+  await assert.rejects(
+    runLiveOperation({ ...quarantined.common, operation: "verify" }, quarantined.dependencies),
+    /active exact staging release is required before verification/,
+  );
+});
+
+test("a quarantined journal has no verify path to acceptance", async (t) => {
+  const fixture = await acceptancePhaseFixture(t, "quarantined");
+
+  await assert.rejects(
+    runLiveOperation({ ...fixture.common, operation: "verify" }, fixture.dependencies),
+    /active exact staging release is required before verification/,
+  );
+
+  assert.equal(fixture.acceptanceCalls(), 0);
 });
 
 function inventory() {
