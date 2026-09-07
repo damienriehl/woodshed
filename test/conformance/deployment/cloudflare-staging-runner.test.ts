@@ -4,11 +4,50 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createEvidenceEnvelope, createFinalEvidencePacket, redactEvidence } from "../../../tools/cloudflare/evidence.mjs";
+import { createEvidenceEnvelope, createFinalEvidencePacket, redactEvidence, saveEvidencePacket } from "../../../tools/cloudflare/evidence.mjs";
 import { createJournal, loadJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { executeStep, publicErrorMessage, publicFailureOutput, runLiveOperation, runStagingOperation } from "../../../tools/cloudflare-staging.mjs";
 
 const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", databaseName: "woodshed-staging-run-a", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
+
+// Captured by writing a packet with the unmodified 0a558a4 evidence implementation.
+// Keeping the serialized artifact intact makes this a compatibility replay, not a
+// fixture reconstructed from the current packet shape.
+const PRE_U4_EVIDENCE_PACKET = JSON.parse(String.raw`{
+  "contract": "woodshed-cloudflare-staging-final-evidence/v1",
+  "runId": "run-pre-u4",
+  "sourceSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "phase": "cleanup-complete",
+  "configDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "schemaDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "nonImpact": {
+    "protectedInventoryStable": true,
+    "beforeDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "afterDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "migrationCount": 11,
+  "absence": {
+    "route": { "count": 1, "absent": true },
+    "hostname": { "count": 1, "absent": true },
+    "credential": { "count": 1, "absent": true },
+    "secret": { "count": 1, "absent": true },
+    "worker": { "count": 1, "absent": true },
+    "durable-object": { "count": 1, "absent": true },
+    "d1": { "count": 1, "absent": true }
+  },
+  "rollback": {
+    "workerCode": "same-lifecycle-only",
+    "initialLifecycle": "forward-fix-only",
+    "d1": "quarantined-bookmark-only",
+    "durableObject": "forward-fix-only",
+    "wholeStackRollback": false
+  },
+  "completedAt": "2030-01-01T12:00:00.000Z",
+  "cleanupComplete": true,
+  "productionAuthority": false,
+  "target": "experimental Cloudflare subset",
+  "nonImpactClaim": "production and Hootenanny were not deployed or re-pointed"
+}`);
 
 test("a journal is atomic, owner-bound, and corrupt state authorizes no teardown", async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), "woodshed-journal-"));
@@ -304,11 +343,13 @@ test("shareable evidence accepts only allowlisted fields with exact types", () =
 
 test("final evidence reduces exact teardown identities to domain counts and refuses whole-stack rollback claims", () => {
   const privateResourceId = "private-resource-identity";
+  const secondPrivateRouteId = "second-private-route-identity";
   const input = {
     runId: "run-a", sourceSha: "a".repeat(40), phase: "cleanup-complete",
     configDigest: "b".repeat(64), schemaDigest: "c".repeat(64), protectedRevisionBefore: "d".repeat(64), protectedRevisionAfter: "d".repeat(64), migrationCount: 11,
     absence: {
       [`route:${privateResourceId}`]: true,
+      [`route:${secondPrivateRouteId}`]: true,
       [`hostname:${privateResourceId}`]: true,
       [`credential:${privateResourceId}`]: true,
       [`secret:${privateResourceId}`]: true,
@@ -317,15 +358,58 @@ test("final evidence reduces exact teardown identities to domain counts and refu
       [`d1:${privateResourceId}`]: true,
       [`token:${privateResourceId}`]: true,
     },
+    routeAbsenceProofMethods: {
+      [`route:${privateResourceId}`]: "provider-read",
+      [`route:${secondPrivateRouteId}`]: "owning-worker-deletion",
+    } as const,
     rollback: { workerCode: "same-lifecycle-only", initialLifecycle: "forward-fix-only", d1: "quarantined-bookmark-only", durableObject: "forward-fix-only", wholeStackRollback: false },
     completedAt: "2030-01-01T12:00:00.000Z",
   };
   const packet = createFinalEvidencePacket(input);
   assert.equal(packet.cleanupComplete, true);
   assert.equal(packet.productionAuthority, false);
-  assert.doesNotMatch(JSON.stringify(packet), new RegExp(privateResourceId));
+  assert.doesNotMatch(JSON.stringify(packet), new RegExp(`${privateResourceId}|${secondPrivateRouteId}`));
+  assert.deepEqual(packet.absence.route, { count: 2, absent: true, proofMethod: "owning-worker-deletion" });
   assert.deepEqual(packet.absence.worker, { count: 1, absent: true });
   assert.equal(packet.nonImpact.protectedInventoryStable, true);
+  const providerReadPacket = createFinalEvidencePacket({
+    ...input,
+    routeAbsenceProofMethods: Object.fromEntries(Object.keys(input.routeAbsenceProofMethods).map((key) => [key, "provider-read"])) as Record<string, "provider-read">,
+  });
+  assert.equal(providerReadPacket.absence.route.proofMethod, "provider-read");
+  assert.throws(() => createFinalEvidencePacket({
+    ...input,
+    routeAbsenceProofMethods: { ...input.routeAbsenceProofMethods, [`route:${secondPrivateRouteId}`]: "untrusted-provider-output" },
+  } as any), /route absence proof method is invalid/);
   assert.throws(() => createFinalEvidencePacket({ ...input, absence: { ...input.absence, [`hostname:${privateResourceId}`]: undefined } }), /complete absence/);
   assert.throws(() => createFinalEvidencePacket({ ...input, rollback: { ...input.rollback, wholeStackRollback: true } }), /must not be claimed/);
+});
+
+test("the final evidence validator accepts allowlisted route proof methods and rejects unknown values", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-final-evidence-method-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, "evidence.json");
+  const packet = {
+    ...PRE_U4_EVIDENCE_PACKET,
+    absence: {
+      ...PRE_U4_EVIDENCE_PACKET.absence,
+      route: { ...PRE_U4_EVIDENCE_PACKET.absence.route, proofMethod: "provider-read" },
+    },
+  };
+
+  await saveEvidencePacket(file, packet);
+  await assert.rejects(
+    saveEvidencePacket(file, { ...packet, absence: { ...packet.absence, route: { ...packet.absence.route, proofMethod: "untrusted-provider-output" } } }),
+    /final evidence packet route absence proof method is invalid/,
+  );
+});
+
+test("a final evidence packet written before route proof provenance still validates", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-final-evidence-replay-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, "evidence.json");
+
+  await saveEvidencePacket(file, PRE_U4_EVIDENCE_PACKET);
+
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), PRE_U4_EVIDENCE_PACKET);
 });

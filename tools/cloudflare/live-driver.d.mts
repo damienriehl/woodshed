@@ -30,6 +30,7 @@ export interface ConfirmAbsenceResult {
 }
 
 export type { DeferredRouteInspection } from "./recovery.mjs";
+export type { RouteAbsenceProofMethod } from "./evidence.mjs";
 
 export interface ReleaseMarker {
   sourceSha: string;

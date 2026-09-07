@@ -1503,12 +1503,22 @@ async function teardownOperation(options, dependencies) {
     if (present && !deployedByThisRun) throw new Error("remote Worker predates this run's deployment; refusing to remove it");
     return present;
   };
+  const routeAbsenceProofMethods = {};
+  const deferredRouteKeys = new Set();
   const inspectResource = async (resource) => {
     if (resource.domain === "route") {
-      if (!assertRunDeployedIt(await workerExists())) return { exists: false, runId: journal.runId, owner: journal.owner };
+      const absenceKey = `route:${resource.id}`;
+      if (!assertRunDeployedIt(await workerExists())) {
+        routeAbsenceProofMethods[absenceKey] = "owning-worker-deletion";
+        return { exists: false, runId: journal.runId, owner: journal.owner };
+      }
       const absence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
-      if (absence.outcome === "proven-absent") return { exists: false, runId: journal.runId, owner: journal.owner };
+      if (absence.outcome === "proven-absent") {
+        routeAbsenceProofMethods[absenceKey] = "provider-read";
+        return { exists: false, runId: journal.runId, owner: journal.owner };
+      }
       if (absence.outcome === "present") return { exists: true, runId: journal.runId, owner: journal.owner };
+      deferredRouteKeys.add(absenceKey);
       return { exists: null, deferAbsenceUntil: "worker", runId: journal.runId, owner: journal.owner };
     }
     if (resource.domain === "credential") {
@@ -1665,13 +1675,18 @@ async function teardownOperation(options, dependencies) {
       return state.active === false || (state.unauthorized === true && acceptedRevocation);
     },
   });
+  for (const absenceKey of deferredRouteKeys) {
+    if (result.absence[absenceKey] === true) routeAbsenceProofMethods[absenceKey] = "owning-worker-deletion";
+  }
+  const routeAbsenceKeys = Object.keys(result.absence).filter((key) => key.startsWith("route:"));
+  if (routeAbsenceKeys.some((key) => routeAbsenceProofMethods[key] === undefined)) throw new Error("route absence proof method is missing");
   for (const intent of journal.mutations.filter((item) => item?.kind?.startsWith("teardown-") && item.status === "pending")) {
     if (result.absence[`${intent.domain}:${intent.id}`] === true) intent.status = "applied";
   }
   await assertNoEnvironmentSuffixedWorker(inventory, journal, tokenClient);
   journal.phase = "cleanup-complete";
   journal.acceptance = { ...(journal.acceptance ?? { status: "not-run" }), cleanupComplete: true };
-  journal.teardown = { absence: result.absence, completedAt: dependencies.now().toISOString(), durableObjectStateRemovedWithNamespace: result.durableObjectStateRemovedWithNamespace };
+  journal.teardown = { absence: result.absence, routeAbsenceProofMethods, completedAt: dependencies.now().toISOString(), durableObjectStateRemovedWithNamespace: result.durableObjectStateRemovedWithNamespace };
   journal.retention = createJournalRetention({ completedAt: journal.teardown.completedAt });
   const packet = createFinalEvidencePacket({
     runId: journal.runId,
@@ -1683,6 +1698,7 @@ async function teardownOperation(options, dependencies) {
     protectedRevisionAfter: result.protectedRevision,
     migrationCount: journal.migrations.length,
     absence: result.absence,
+    routeAbsenceProofMethods,
     rollback: journal.rollback ?? { workerCode: "not-deployed-or-forward-fix-only", initialLifecycle: "forward-fix-only", d1: "quarantined-bookmark-only", durableObject: "forward-fix-only", wholeStackRollback: false },
     completedAt: journal.teardown.completedAt,
   });
@@ -1723,7 +1739,7 @@ async function absenceOperation(options, dependencies) {
   if (!d1Absent || !workerAbsent) throw new Error("delayed absence proof failed");
   const routeAbsence = await confirmWorkersDevAbsence(inventory, journal, tokenClient, absenceOptions);
   const absent = {
-    route: routeAbsence.outcome === "proven-absent",
+    route: routeAbsence.outcome !== "present",
     hostname: true,
     credential: d1Absent,
     secret: workerAbsent && !remote.secretNames.includes("LIVE_COMMAND_SECRET"),
