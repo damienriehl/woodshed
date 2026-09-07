@@ -371,8 +371,6 @@ export async function executeJournaledMutation(options) {
       }
     }
   }
-  intent.status = "applied";
-  owned.status = "owned";
   if (finalize !== undefined) {
     if (typeof finalize !== "function") throw new Error("mutation finalizer is invalid");
     try { await finalize({ journal, intent, owned, result }); }
@@ -382,6 +380,8 @@ export async function executeJournaledMutation(options) {
       throw classifiedStagingError(error, code);
     }
   }
+  intent.status = "applied";
+  owned.status = "owned";
   await persistJournal(journal);
   return result;
 }
@@ -1135,12 +1135,15 @@ async function applyOperation(options, dependencies) {
   const activeAdapter = dependencies.adapterFactory({ root: options.root, token: credentials.token, accountId: inventory.staging.accountId, configPath: activeConfig.configPath });
   remote = await collectProtectedInventory({ adapter, inventory, tokenClient });
   const activeExpected = { workerName: journal.identity.workerName, sourceSha: journal.sourceSha, configDigest: activeConfig.configDigest, bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"], lifecycle: "legacy-sqlite-v1" };
-  const privateDeploymentIds = (await deploymentProof(adapter, journal.identity.workerName)).deploymentIds;
-  const activation = await executeJournaledMutation({
+  const existingActivationIntent = journal.mutations.find((item) => item?.kind === "workers-dev-enable");
+  const activationBaseline = existingActivationIntent
+    ? existingActivationIntent.beforeDeploymentIds
+    : (await deploymentProof(adapter, journal.identity.workerName)).deploymentIds;
+  await executeJournaledMutation({
     journal, expectedRevision: createIdentityRevision(remote),
     inspectRevision: () => currentIdentityRevision(adapter, inventory, tokenClient),
     resource: { domain: "route", id: resourceId(journal, "route") }, kind: "workers-dev-enable",
-    intentMetadata: { beforeDeploymentIds: privateDeploymentIds },
+    intentMetadata: { beforeDeploymentIds: activationBaseline },
     persistJournal: (value) => persist(options.journalPath, value),
     inspect: async () => {
       const marker = await readReleaseMarker(dependencies.fetch, journal.identity.origin, { timeoutMs: dependencies.markerFetchTimeoutMs });
@@ -1158,19 +1161,23 @@ async function applyOperation(options, dependencies) {
       clearTimer: dependencies.clearTimer,
       now: dependencies.now,
     }),
+    finalize: async ({ intent, result }) => {
+      const marker = result.state?.marker;
+      assertMarker(activeExpected, marker);
+      const finalDeployment = await deploymentProof(activeAdapter, journal.identity.workerName);
+      const activeId = newDeploymentId(intent.beforeDeploymentIds, finalDeployment);
+      const markerProof = {
+        sourceSha: marker.sourceSha,
+        configDigest: marker.configDigest,
+        lifecycle: marker.lifecycle,
+        bindings: [...marker.bindings],
+      };
+      intent.markerProof = markerProof;
+      intent.deploymentId = activeId;
+      journal.deployment.activeId = activeId;
+      journal.phase = "alias-live";
+    },
   });
-  const marker = activation.state?.marker;
-  assertMarker(activeExpected, marker);
-  try {
-    const finalDeployment = await deploymentProof(activeAdapter, journal.identity.workerName);
-    const activationIntent = journal.mutations.find((item) => item?.kind === "workers-dev-enable");
-    journal.deployment.activeId = newDeploymentId(activationIntent?.beforeDeploymentIds ?? privateDeploymentIds, finalDeployment);
-  } catch (error) {
-    await persistIncidentCause(journal, (value) => persist(options.journalPath, value), "postcondition-failed");
-    throw classifiedStagingError(error, "postcondition-failed");
-  }
-  journal.phase = "alias-live";
-  await persist(options.journalPath, journal);
   return { operation: "apply", phase: journal.phase, migrationCount: journal.migrations.length, rollback: "forward-fix-only", wholeStackRollback: false };
 }
 

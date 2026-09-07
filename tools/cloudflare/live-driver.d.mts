@@ -48,6 +48,12 @@ export interface ConfirmReleaseMarkerResult {
   marker?: ReleaseMarker;
 }
 
+export interface JournaledMutationResult {
+  reconciled: boolean;
+  state: any;
+  observation?: ConfirmReleaseMarkerResult;
+}
+
 export function parseLiveArguments(argv: string[]): LiveCliArguments;
 export function confirmAbsence(probe: () => Promise<boolean>, options?: ConfirmAbsenceOptions): Promise<ConfirmAbsenceResult>;
 export function readReleaseMarker(fetch: typeof globalThis.fetch, origin: string, options?: { timeoutMs?: number }): Promise<ReleaseMarker | null>;
@@ -72,8 +78,8 @@ export function executeJournaledMutation(options: {
   reconcileExisting?: (context: { intent: any; state: any }) => Promise<boolean> | boolean;
   confirmAfterMutation?: () => Promise<ConfirmReleaseMarkerResult>;
   intentMetadata?: Record<string, unknown>;
-  finalize?: (context: { journal: any; intent: any; owned: any; result: { reconciled: boolean; state: any } }) => Promise<void> | void;
-}): Promise<{ reconciled: boolean; state: any; observation?: ConfirmReleaseMarkerResult }>;
+  finalize?: (context: { journal: any; intent: any; owned: any; result: JournaledMutationResult }) => Promise<void> | void;
+}): Promise<JournaledMutationResult>;
 export function inspectSourceState(root: string): { actualSourceSha: string; worktreeClean: boolean };
 export function createApiTokenClient(options: Record<string, any>): { inspect(): Promise<Record<string, any>>; inspectId(id: string): Promise<Record<string, any>>; revoke(id: string): Promise<true>; listWorkerScripts(accountId: string): Promise<Array<{ name: string }>>; listWorkerRoutes(accountId: string): Promise<Array<{ pattern: string; script: string | null }>>; listWorkerDomains(accountId: string): Promise<Array<{ hostname: string; script: string | null; environment: string | null }>>; inspectWorkersDev(accountId: string, workerName: string): Promise<{ exists: boolean; enabled: boolean }>; inspectAccountSubdomain(accountId: string): Promise<string> };
 export function runLiveOperation(input: Record<string, any>, overrides?: Record<string, any> & LiveDriverTimerDependencies): Promise<Record<string, any>>;
