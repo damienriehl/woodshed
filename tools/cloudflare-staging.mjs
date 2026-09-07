@@ -5,7 +5,7 @@ export { assertRollbackCompatible, buildFailureReport, createJournalRetention, r
 export { collectRemoteInventory, createApiTokenClient, createIdentityRevision, executeJournaledMutation, generateEffectiveConfig, parseLiveArguments, publicOperationResult, runLiveOperation } from "./cloudflare/live-driver.mjs";
 import { pathToFileURL } from "node:url";
 import { redactEvidence } from "./cloudflare/evidence.mjs";
-import { loadJournal } from "./cloudflare/journal.mjs";
+import { loadJournal, STAGING_FAILURE_CAUSES } from "./cloudflare/journal.mjs";
 import { LIVE_OPERATIONS, parseLiveArguments, publicOperationResult, runLiveOperation } from "./cloudflare/live-driver.mjs";
 
 const OPERATIONS = new Set(LIVE_OPERATIONS);
@@ -53,6 +53,19 @@ export function publicErrorMessage(error, environment = process.env) {
   return redactEvidence({ message: error instanceof Error ? error.message : "staging operation failed" }, configuredSecrets).message;
 }
 
+function publicFailureCause(error) {
+  let current = error;
+  for (let depth = 0; depth < 8 && current !== null && (typeof current === "object" || typeof current === "function"); depth += 1) {
+    if (STAGING_FAILURE_CAUSES.includes(current.stagingCause)) return current.stagingCause;
+    current = current.cause;
+  }
+  return "postcondition-failed";
+}
+
+export function publicFailureOutput(error, environment = process.env) {
+  return `${publicErrorMessage(error, environment)}\ncause: ${publicFailureCause(error)}`;
+}
+
 async function main(argv) {
   const parsed = parseLiveArguments(argv);
   const result = await runLiveOperation({ ...parsed, processEnvironment: process.env });
@@ -60,6 +73,6 @@ async function main(argv) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main(process.argv.slice(2)).catch((error) => {
-  process.stderr.write(`${publicErrorMessage(error)}\n`);
+  process.stderr.write(`${publicFailureOutput(error)}\n`);
   process.exitCode = 1;
 });

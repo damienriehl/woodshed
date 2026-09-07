@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { createEvidenceEnvelope, createFinalEvidencePacket, redactEvidence } from "../../../tools/cloudflare/evidence.mjs";
 import { createJournal, loadJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
-import { executeStep, runLiveOperation, runStagingOperation } from "../../../tools/cloudflare-staging.mjs";
+import { executeStep, publicErrorMessage, publicFailureOutput, runLiveOperation, runStagingOperation } from "../../../tools/cloudflare-staging.mjs";
 
 const identity = { accountId: "a".repeat(32), databaseId: "11111111-1111-4111-8111-111111111111", databaseName: "woodshed-staging-run-a", workerName: "woodshed-staging-run-a", origin: "https://woodshed-staging.invalid" };
 
@@ -88,6 +88,29 @@ test("journal validation rejects malformed D1 provider acceptance", () => {
     journal.mutations.push(mutation as any);
     assert.throws(() => validateJournal(journal), /D1 provider acceptance/);
   }
+});
+
+test("journal validation rejects every cause outside the closed taxonomy and free-text cause fields", () => {
+  const validCauses = [
+    "wrangler-command-failed", "edge-timeout", "edge-rate-limited", "marker-missing",
+    "marker-mismatch", "marker-unreadable", "postcondition-failed",
+  ] as const;
+  for (const code of validCauses) {
+    const journal = createJournal({ runId: `run-${code}`, owner: "owner-a", sourceSha: "a".repeat(40), identity });
+    journal.incident = { cause: { code } };
+    assert.doesNotThrow(() => validateJournal(journal));
+  }
+  for (const cause of [{ code: "network-failed" }, { code: "edge-timeout", message: "private detail" }, "edge-timeout"]) {
+    const journal = createJournal({ runId: "run-invalid-cause", owner: "owner-a", sourceSha: "a".repeat(40), identity });
+    journal.incident = { cause } as any;
+    assert.throws(() => validateJournal(journal), /journal.*cause/i);
+  }
+});
+
+test("failure output appends only the safe cause after the byte-stable refusal line", () => {
+  const failure = Object.assign(new Error("mutation outcome is uncertain; no retry authorized"), { stagingCause: "edge-timeout" });
+  assert.equal(publicFailureOutput(failure, {}), "mutation outcome is uncertain; no retry authorized\ncause: edge-timeout");
+  assert.equal(publicErrorMessage(failure, {}), "mutation outcome is uncertain; no retry authorized");
 });
 
 test("mismatched applied D1 acceptance records an incident and preserves the foreign database through cleanup", async (t) => {

@@ -9,16 +9,20 @@ import {
   collectRemoteInventory,
   assertNoEnvironmentSuffixedWorker,
   confirmAbsence,
+  confirmReleaseMarker,
   createApiTokenClient,
   createIdentityRevision,
   executeJournaledMutation,
   generateEffectiveConfig,
   parseLiveArguments,
   publicOperationResult,
+  readReleaseMarker,
   recordVerifiedSchemaEvidence,
+  releaseMarkerMatches,
   remoteSchema,
   runLiveOperation,
 } from "../../../tools/cloudflare/live-driver.mjs";
+import type { ReleaseMarker } from "../../../tools/cloudflare/live-driver.mjs";
 import { runMigrationFirstDeployment } from "../../../tools/cloudflare/deployment.mjs";
 import { createJournal, saveJournal, validateJournal } from "../../../tools/cloudflare/journal.mjs";
 import { createEvidenceEnvelope } from "../../../tools/cloudflare/evidence.mjs";
@@ -217,6 +221,354 @@ test("confirmAbsence waits before retrying with real timers", async () => {
   assert.equal(result.outcome, "proven-absent");
   assert.equal(probeCalls, 2);
   assert.ok(elapsedMs >= 55, `expected a real delay of at least 55ms, received ${elapsedMs}ms`);
+});
+
+const expectedReleaseMarker: ReleaseMarker = {
+  sourceSha,
+  configDigest: "d".repeat(64),
+  lifecycle: "legacy-sqlite-v1",
+  bindings: ["APP_ORIGIN", "DB", "LIVE_COMMAND_SECRET", "LIVE_COORDINATOR"],
+};
+
+function markerResponse(marker: unknown) {
+  return Response.json(marker);
+}
+
+async function markerMutationFixture(responses: Array<Response | Error>, options: { mutateError?: Error; finalizeError?: Error } = {}) {
+  const journal = createJournal({ runId: "run-marker", owner: "owner-marker", sourceSha, identity: inventory().staging });
+  let fetchCalls = 0;
+  let mutations = 0;
+  const fetch = async () => {
+    const response = responses[Math.min(fetchCalls, responses.length - 1)];
+    fetchCalls += 1;
+    assert.ok(response);
+    if (response instanceof Error) throw response;
+    return response.clone();
+  };
+  const operation = executeJournaledMutation({
+    journal,
+    expectedRevision: "revision-marker",
+    inspectRevision: async () => "revision-marker",
+    resource: { domain: "route", id: "route-marker" },
+    kind: "workers-dev-enable",
+    persistJournal: async () => {},
+    inspect: async () => {
+      const marker = await readReleaseMarker(fetch, origin, { timeoutMs: 5_000 });
+      return marker ? { exists: true, id: "route-marker", marker } : { exists: false };
+    },
+    mutate: async () => {
+      mutations += 1;
+      if (options.mutateError) throw options.mutateError;
+    },
+    owns: (state: any) => releaseMarkerMatches(expectedReleaseMarker, state.marker),
+    confirmAfterMutation: () => confirmReleaseMarker(fetch, origin, expectedReleaseMarker, {
+      setTimer: immediateRetryTimers().setTimer,
+      clearTimer: immediateRetryTimers().clearTimer,
+      now: () => new Date("2030-01-01T12:00:00.000Z"),
+      random: () => 0,
+    }),
+    finalize: async () => {
+      if (options.finalizeError) throw options.finalizeError;
+    },
+  });
+  try {
+    return { result: await operation, journal, fetchCalls: () => fetchCalls, mutations: () => mutations };
+  } catch (error: any) {
+    error.journal = journal;
+    error.mutations = mutations;
+    throw error;
+  }
+}
+
+test("a missing marker followed by the exact marker is proven owned after exactly one deploy", async () => {
+  const fixture = await markerMutationFixture([
+    new Response(null, { status: 404 }),
+    new Response(null, { status: 404 }),
+    markerResponse(expectedReleaseMarker),
+  ]);
+  assert.equal(fixture.result.observation?.outcome, "proven-owned");
+  assert.equal(fixture.mutations(), 1);
+});
+
+test("a wrong-source marker followed by the exact marker is proven owned after exactly one deploy", async () => {
+  const wrong = { ...expectedReleaseMarker, sourceSha: "f".repeat(40) };
+  const fixture = await markerMutationFixture([
+    new Response(null, { status: 404 }),
+    markerResponse(wrong),
+    markerResponse(expectedReleaseMarker),
+  ]);
+  assert.equal(fixture.result.observation?.outcome, "proven-owned");
+  assert.equal(fixture.mutations(), 1);
+});
+
+for (const scenario of [
+  {
+    name: "all missing marker reads are proven not owned and journal marker-missing",
+    responses: [new Response(null, { status: 404 })],
+    outcome: "proven-not-owned",
+    cause: "marker-missing",
+  },
+  {
+    name: "one stable wrong marker is proven not owned and journals marker-mismatch",
+    responses: [markerResponse({ ...expectedReleaseMarker, sourceSha: "f".repeat(40) })],
+    outcome: "proven-not-owned",
+    cause: "marker-mismatch",
+  },
+  {
+    name: "mixed missing and wrong markers remain unconfirmed",
+    responses: [
+      new Response(null, { status: 404 }),
+      markerResponse({ ...expectedReleaseMarker, sourceSha: "f".repeat(40) }),
+    ],
+    outcome: "could-not-confirm",
+    cause: "postcondition-failed",
+  },
+  {
+    name: "a marker read timeout remains unconfirmed and journals edge-timeout",
+    responses: [Object.assign(new Error("synthetic timeout"), { name: "TimeoutError" })],
+    outcome: "could-not-confirm",
+    cause: "edge-timeout",
+  },
+  {
+    name: "a rate-limited marker read remains unconfirmed and journals edge-rate-limited",
+    responses: [new Response(null, { status: 429 })],
+    outcome: "could-not-confirm",
+    cause: "edge-rate-limited",
+  },
+] as const) {
+  test(scenario.name, async () => {
+    let captured: any;
+    try {
+      await markerMutationFixture([
+        new Response(null, { status: 404 }),
+        ...scenario.responses,
+      ]);
+    } catch (error: any) {
+      captured = error;
+    }
+    assert.ok(captured);
+    assert.equal(captured.observation?.outcome, scenario.outcome);
+    assert.equal(captured.stagingCause, scenario.cause);
+    assert.equal(captured.journal?.incident?.cause?.code, scenario.cause);
+    assert.equal(captured.mutations, 1);
+  });
+}
+
+test("presence confirmation does not begin another marker fetch after its wall budget", async () => {
+  const timers = immediateRetryTimers();
+  const clock = [0, 0, 0, 45_000, 45_000];
+  let fetchCalls = 0;
+  const result = await confirmReleaseMarker(async () => {
+    fetchCalls += 1;
+    return markerResponse({ ...expectedReleaseMarker, sourceSha: "f".repeat(40) });
+  }, origin, expectedReleaseMarker, {
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date(clock.shift() ?? 45_000),
+    budgetMs: 45_000,
+  });
+  assert.equal(result.outcome, "proven-not-owned");
+  assert.equal(result.attempts, 1);
+  assert.equal(fetchCalls, 1);
+});
+
+test("a malformed marker body propagates marker-unreadable instead of becoming an outcome", async () => {
+  let mutations = 0;
+  const journal = createJournal({ runId: "run-malformed", owner: "owner-marker", sourceSha, identity: inventory().staging });
+  const fetch = async () => markerResponse({ sourceSha, configDigest: expectedReleaseMarker.configDigest });
+  await assert.rejects(executeJournaledMutation({
+    journal,
+    expectedRevision: "revision-marker",
+    inspectRevision: async () => "revision-marker",
+    resource: { domain: "route", id: "route-marker" }, kind: "workers-dev-enable",
+    persistJournal: async () => {},
+    inspect: async () => {
+      const marker = await readReleaseMarker(fetch, origin);
+      return marker ? { exists: true, id: "route-marker", marker } : { exists: false };
+    },
+    mutate: async () => { mutations += 1; },
+    owns: () => false,
+    confirmAfterMutation: () => confirmReleaseMarker(fetch, origin, expectedReleaseMarker),
+  }), (error: any) => error.stagingCause === "marker-unreadable" && error.observation === undefined);
+  assert.equal(mutations, 0);
+  assert.equal(journal.incident?.cause?.code, "marker-unreadable");
+});
+
+test("marker reader errors preserve HTTP status and the abort-timeout flag", async () => {
+  await assert.rejects(readReleaseMarker(async () => new Response(null, { status: 429 }), origin), (error: any) => {
+    assert.equal(error.status, 429);
+    assert.equal(error.aborted, false);
+    return true;
+  });
+  await assert.rejects(readReleaseMarker(async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); }, origin), (error: any) => {
+    assert.equal(error.status, undefined);
+    assert.equal(error.aborted, true);
+    return true;
+  });
+});
+
+test("a malformed post-mutation marker records marker-unreadable without a second observation ladder", async () => {
+  let captured: any;
+  try {
+    await markerMutationFixture([
+      new Response(null, { status: 404 }),
+      markerResponse({ sourceSha, configDigest: expectedReleaseMarker.configDigest }),
+    ]);
+  } catch (error: any) {
+    captured = error;
+  }
+  assert.ok(captured);
+  assert.equal(captured.stagingCause, "marker-unreadable");
+  assert.equal(captured.observation, undefined);
+  assert.equal(captured.journal.incident.cause.code, "marker-unreadable");
+  assert.equal(captured.mutations, 1);
+  assert.equal(captured.journal.mutations.find((item: any) => item.kind === "workers-dev-enable").status, "pending");
+});
+
+test("a failed Wrangler deploy that is proven not owned is never replayed", async () => {
+  let captured: any;
+  try {
+    await markerMutationFixture([
+      new Response(null, { status: 404 }),
+      new Response(null, { status: 404 }),
+    ], { mutateError: Object.assign(new Error("Wrangler command failed"), { stagingCause: "wrangler-command-failed" }) });
+  } catch (error: any) {
+    captured = error;
+  }
+  assert.ok(captured);
+  assert.equal(captured.stagingCause, "wrangler-command-failed");
+  assert.equal(captured.journal.incident.cause.code, "wrangler-command-failed");
+  assert.equal(captured.mutations, 1);
+});
+
+test("a failed active Wrangler deploy proven not owned records its cause and ends in quarantine", async (t) => {
+  const privateDirectory = await mkdtemp(path.join(tmpdir(), "woodshed-live-active-failure-private-"));
+  const testRoot = await mkdtemp(path.join(tmpdir(), "woodshed-live-active-failure-root-"));
+  t.after(() => rm(privateDirectory, { recursive: true, force: true }));
+  t.after(() => rm(testRoot, { recursive: true, force: true }));
+  await mkdir(path.join(testRoot, "migrations", "d1"), { recursive: true });
+  for (const migration of D1_MIGRATIONS) {
+    await copyFile(path.resolve("migrations/d1", migration.filename), path.join(testRoot, "migrations", "d1", migration.filename));
+  }
+  const inventoryPath = path.join(privateDirectory, "inventory.json");
+  const journalPath = path.join(privateDirectory, "journal.json");
+  const stagingInventory = inventory();
+  delete (stagingInventory.staging as Partial<typeof stagingInventory.staging>).databaseId;
+  await writeFile(inventoryPath, JSON.stringify(stagingInventory));
+
+  const schemaDatabase = new DatabaseSync(":memory:");
+  t.after(() => schemaDatabase.close());
+  schemaDatabase.exec("PRAGMA foreign_keys=ON");
+  for (const migration of D1_MIGRATIONS) schemaDatabase.exec(await readFile(path.resolve("migrations/d1", migration.filename), "utf8"));
+  const schemaObjects = schemaDatabase.prepare("SELECT type,name,sql FROM sqlite_schema WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%' AND substr(name,1,4) <> '_cf_' AND name <> 'd1_migrations' AND sql IS NOT NULL ORDER BY type,name").all();
+
+  const state = {
+    databasePresent: false,
+    secretPresent: false,
+    deployments: [] as Array<{ id: string; script_name: string }>,
+    versions: [] as Array<{ id: string; script_name: string }>,
+    activeDeployCalls: 0,
+  };
+  const adapterFactory = ({ configPath }: { configPath?: string } = {}) => ({
+    whoami: async () => ({ accountId }),
+    d1List: async () => state.databasePresent ? [{ uuid: databaseId, name: stagingInventory.staging.databaseName }] : [],
+    deploymentsList: async () => state.deployments,
+    versionsList: async () => state.versions,
+    secretList: async () => state.secretPresent ? [{ name: "LIVE_COMMAND_SECRET" }] : [],
+    d1Execute: async (_name: string, { command }: { command: string }) => {
+      if (command.includes("name='d1_migrations'")) return [{ success: true, results: [{ name: "d1_migrations" }] }];
+      if (command.includes("FROM d1_migrations")) return [{ success: true, results: D1_MIGRATIONS.map(({ filename }) => ({ name: filename })) }];
+      if (command.includes("SELECT type,name,sql FROM sqlite_schema")) return [{ success: true, results: schemaObjects }];
+      if (command === "PRAGMA foreign_keys") return [{ success: true, results: [{ foreign_keys: 1 }] }];
+      if (command === "PRAGMA foreign_key_check") return [{ success: true, results: [] }];
+      if (command.includes("count(*) AS count FROM sqlite_schema")) return [{ success: true, results: [{ count: schemaObjects.length }] }];
+      return [{ success: true, results: [] }];
+    },
+    deploy: async () => {
+      const config = JSON.parse(await readFile(configPath!, "utf8"));
+      if (config.env.staging.workers_dev) {
+        state.activeDeployCalls += 1;
+        throw new Error("Wrangler command failed");
+      }
+      assert.fail("quarantine must not issue a deploy when exposure is already absent");
+    },
+  });
+  const tokenClient = {
+    inspect: async () => ({ exists: true, active: true, id: "synthetic-token-id" }),
+    listWorkerScripts: async () => [],
+    listWorkerRoutes: async () => [],
+    listWorkerDomains: async () => [],
+    inspectAccountSubdomain: async () => "synthetic",
+    inspectWorkersDev: async () => ({ exists: true, enabled: false }),
+  };
+  const common = {
+    root: testRoot, environment: "staging", inventoryPath, journalPath,
+    runId: "run-active-deploy-failure", owner: "owner-active-deploy-failure",
+    processEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-cloud-token", LIVE_COMMAND_SECRET: "s".repeat(32) },
+  };
+  const timers = immediateRetryTimers();
+  const dependencies = {
+    sourceState: () => ({ actualSourceSha: sourceSha, worktreeClean: true }),
+    adapterFactory,
+    tokenClientFactory: () => tokenClient,
+    fetch: async () => new Response(null, { status: 404 }),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    now: () => new Date("2030-01-01T12:00:00.000Z"),
+  };
+  await runLiveOperation({ ...common, operation: "plan" }, dependencies);
+  const journal = JSON.parse(await readFile(journalPath, "utf8"));
+  journal.phase = "worker-deployed";
+  journal.identity.databaseId = databaseId;
+  journal.recovery = { bookmark: "bookmark-synthetic" };
+  journal.deploymentBaseline = [];
+  journal.migrations = D1_MIGRATIONS.map(({ filename, sha256 }) => ({ filename, sha256, sourceSha, status: "applied" }));
+  const migration009 = journal.migrations.find((item: any) => item.filename === "009_multiple_recovery_credentials.sql");
+  migration009.postcondition = { migration009: {
+    beforeRows: 0, afterRows: 0, beforeAssociations: 0, afterAssociations: 0,
+    beforeAssociationDigest: "f".repeat(64), afterAssociationDigest: "f".repeat(64),
+  } };
+  const d1Resource = journal.resources.find((item: any) => item.domain === "d1");
+  d1Resource.id = databaseId;
+  d1Resource.status = "owned";
+  for (const domain of ["worker", "durable-object", "secret"]) journal.resources.find((item: any) => item.domain === domain).status = "owned";
+  journal.mutations.push(
+    { kind: "d1-create", domain: "d1", id: databaseId, status: "applied", providerAcceptance: { id: databaseId } },
+    { kind: "durable-object-create", domain: "durable-object", id: journal.resources.find((item: any) => item.domain === "durable-object").id, status: "applied" },
+    { kind: "worker-deploy", status: "applied", sourceSha, deploymentId: "deployment-private" },
+    { kind: "secret-put", domain: "secret", id: "LIVE_COMMAND_SECRET", status: "applied" },
+  );
+  state.deployments = [{ id: "deployment-private", script_name: workerName }];
+  state.versions = [{ id: "version-private", script_name: workerName }];
+  state.databasePresent = true;
+  state.secretPresent = true;
+  await saveJournal(journalPath, journal);
+
+  await assert.rejects(runLiveOperation({ ...common, operation: "apply" }, dependencies), (error: any) => error.message === "Wrangler command failed" && error.stagingCause === "wrangler-command-failed");
+  const saved = JSON.parse(await readFile(journalPath, "utf8"));
+  assert.equal(state.activeDeployCalls, 1);
+  assert.equal(saved.phase, "quarantined");
+  assert.equal(saved.incident.cause.code, "wrangler-command-failed");
+  assert.equal(saved.mutations.find((item: any) => item.kind === "workers-dev-enable").status, "pending");
+});
+
+test("a full-marker postcondition failure journals postcondition-failed and does not advance", async () => {
+  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, bindings: expectedReleaseMarker.bindings.slice(1) }), false);
+  assert.equal(releaseMarkerMatches(expectedReleaseMarker, { ...expectedReleaseMarker, lifecycle: "another-lifecycle" }), false);
+  let captured: any;
+  try {
+    await markerMutationFixture([
+      new Response(null, { status: 404 }),
+      markerResponse(expectedReleaseMarker),
+    ], { finalizeError: new Error("deployment identity did not advance") });
+  } catch (error: any) {
+    captured = error;
+  }
+  assert.ok(captured);
+  assert.equal(captured.stagingCause, "postcondition-failed");
+  assert.equal(captured.journal.incident.cause.code, "postcondition-failed");
+  assert.equal(captured.journal.phase, "pre-write");
+  assert.equal(captured.mutations, 1);
 });
 
 function inventory() {
