@@ -73,10 +73,26 @@ export function createEvidenceEnvelope(input) {
 
 const REQUIRED_ABSENCE_DOMAINS = ["route", "hostname", "credential", "secret", "worker", "durable-object", "d1"];
 const ABSENCE_DOMAINS = [...REQUIRED_ABSENCE_DOMAINS, "token"];
+const ABSENCE_PROOF_FIELDS = ["count", "absent", "proofMethod"];
+const ROUTE_ABSENCE_PROOF_METHODS = new Set(["provider-read", "owning-worker-deletion"]);
+
+function validateRouteAbsenceProofMethods(value, routeKeys) {
+  if (value === undefined) return undefined;
+  const methods = record(value, "routeAbsenceProofMethods");
+  const keys = Object.keys(methods);
+  if (keys.length !== routeKeys.length || keys.some((key) => !routeKeys.includes(key))) throw new Error("route absence proof methods are incomplete");
+  if (Object.values(methods).some((method) => !ROUTE_ABSENCE_PROOF_METHODS.has(method))) throw new Error("route absence proof method is invalid");
+  return methods;
+}
+
+function validatePacketProofMethod(proof, domain) {
+  if (proof.proofMethod === undefined) return;
+  if (domain !== "route" || !ROUTE_ABSENCE_PROOF_METHODS.has(proof.proofMethod)) throw new Error("final evidence packet route absence proof method is invalid");
+}
 
 export function createFinalEvidencePacket(input) {
   const value = record(input, "final evidence");
-  rejectUnknown(value, ["runId", "sourceSha", "phase", "configDigest", "schemaDigest", "protectedRevisionBefore", "protectedRevisionAfter", "migrationCount", "absence", "rollback", "completedAt"], "final evidence");
+  rejectUnknown(value, ["runId", "sourceSha", "phase", "configDigest", "schemaDigest", "protectedRevisionBefore", "protectedRevisionAfter", "migrationCount", "absence", "routeAbsenceProofMethods", "rollback", "completedAt"], "final evidence");
   const runId = requiredString(value.runId, "runId");
   const sourceSha = requiredString(value.sourceSha, "sourceSha");
   const configDigest = requiredString(value.configDigest, "configDigest");
@@ -92,9 +108,17 @@ export function createFinalEvidencePacket(input) {
   const reportedDomains = rawAbsence && Object.keys(rawAbsence).some((key) => key.startsWith("token:"))
     ? ABSENCE_DOMAINS
     : REQUIRED_ABSENCE_DOMAINS;
+  const routeKeys = Object.keys(rawAbsence).filter((key) => key.startsWith("route:"));
+  const routeAbsenceProofMethods = validateRouteAbsenceProofMethods(value.routeAbsenceProofMethods, routeKeys);
   const absence = Object.fromEntries(reportedDomains.map((domain) => {
     const entries = Object.entries(rawAbsence).filter(([key]) => key.startsWith(`${domain}:`));
-    return [domain, { count: entries.length, absent: entries.length > 0 && entries.every(([, absent]) => absent === true) }];
+    const proof = { count: entries.length, absent: entries.length > 0 && entries.every(([, absent]) => absent === true) };
+    if (domain === "route" && routeAbsenceProofMethods !== undefined) {
+      proof.proofMethod = entries.some(([key]) => routeAbsenceProofMethods[key] === "owning-worker-deletion")
+        ? "owning-worker-deletion"
+        : "provider-read";
+    }
+    return [domain, proof];
   }));
   if (Object.values(absence).some(({ absent }) => !absent)) throw new Error("final evidence requires complete absence");
   const rollback = record(value.rollback, "rollback");
@@ -134,12 +158,14 @@ export async function saveEvidencePacket(file, packet) {
   rejectUnknown(absence, ABSENCE_DOMAINS, "absence");
   if (REQUIRED_ABSENCE_DOMAINS.some((domain) => {
     const proof = record(absence[domain], `absence.${domain}`);
-    rejectUnknown(proof, ["count", "absent"], `absence.${domain}`);
+    rejectUnknown(proof, ABSENCE_PROOF_FIELDS, `absence.${domain}`);
+    validatePacketProofMethod(proof, domain);
     return !Number.isSafeInteger(proof.count) || proof.count < 0 || proof.absent !== true;
   })) throw new Error("final evidence packet absence proof is invalid");
   if (absence.token !== undefined) {
     const proof = record(absence.token, "absence.token");
-    rejectUnknown(proof, ["count", "absent"], "absence.token");
+    rejectUnknown(proof, ABSENCE_PROOF_FIELDS, "absence.token");
+    validatePacketProofMethod(proof, "token");
     if (!Number.isSafeInteger(proof.count) || proof.count < 0 || proof.absent !== true) throw new Error("final evidence packet absence proof is invalid");
   }
   const rollback = record(validated.rollback, "rollback");

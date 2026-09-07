@@ -29,8 +29,39 @@ export interface ConfirmAbsenceResult {
   lastError: unknown | null;
 }
 
+export type { DeferredRouteInspection } from "./recovery.mjs";
+export type { RouteAbsenceProofMethod } from "./evidence.mjs";
+
+export interface ReleaseMarker {
+  sourceSha: string;
+  configDigest: string;
+  lifecycle: "legacy-sqlite-v1";
+  bindings: string[];
+}
+
+export interface ConfirmReleaseMarkerOptions extends ConfirmAbsenceOptions {
+  fetchTimeoutMs?: number;
+}
+
+export interface ConfirmReleaseMarkerResult {
+  outcome: "proven-owned" | "proven-not-owned" | "could-not-confirm";
+  attempts: number;
+  checkedAt: string;
+  cause: import("./journal.mjs").StagingFailureCause | null;
+  marker?: ReleaseMarker;
+}
+
+export interface JournaledMutationResult {
+  reconciled: boolean;
+  state: any;
+  observation?: ConfirmReleaseMarkerResult;
+}
+
 export function parseLiveArguments(argv: string[]): LiveCliArguments;
 export function confirmAbsence(probe: () => Promise<boolean>, options?: ConfirmAbsenceOptions): Promise<ConfirmAbsenceResult>;
+export function readReleaseMarker(fetch: typeof globalThis.fetch, origin: string, options?: { timeoutMs?: number }): Promise<ReleaseMarker | null>;
+export function releaseMarkerMatches(expected: ReleaseMarker, actual: unknown): boolean;
+export function confirmReleaseMarker(fetch: typeof globalThis.fetch, origin: string, expected: ReleaseMarker, options?: ConfirmReleaseMarkerOptions): Promise<ConfirmReleaseMarkerResult>;
 export function assertNoEnvironmentSuffixedWorker(inventory: { staging: { accountId: string } }, journal: { identity: { workerName: string } }, tokenClient: { listWorkerScripts(accountId: string): Promise<Array<{ name: string }>> }): Promise<void>;
 export function generateEffectiveConfig(options: Record<string, any>): Promise<{ configPath: string; migrationsDirectory: string; configDigest: string; lifecycleTag: string; deletionTag?: string }>;
 export function collectRemoteInventory(options: Record<string, any>): Promise<Record<string, any>>;
@@ -48,9 +79,10 @@ export function executeJournaledMutation(options: {
   mutate: () => Promise<any>;
   owns: (state: any) => boolean;
   reconcileExisting?: (context: { intent: any; state: any }) => Promise<boolean> | boolean;
+  confirmAfterMutation?: () => Promise<ConfirmReleaseMarkerResult>;
   intentMetadata?: Record<string, unknown>;
-  finalize?: (context: { journal: any; intent: any; owned: any; result: { reconciled: boolean; state: any } }) => Promise<void> | void;
-}): Promise<{ reconciled: boolean; state: any }>;
+  finalize?: (context: { journal: any; intent: any; owned: any; result: JournaledMutationResult }) => Promise<void> | void;
+}): Promise<JournaledMutationResult>;
 export function inspectSourceState(root: string): { actualSourceSha: string; worktreeClean: boolean };
 export function createApiTokenClient(options: Record<string, any>): { inspect(): Promise<Record<string, any>>; inspectId(id: string): Promise<Record<string, any>>; revoke(id: string): Promise<true>; listWorkerScripts(accountId: string): Promise<Array<{ name: string }>>; listWorkerRoutes(accountId: string): Promise<Array<{ pattern: string; script: string | null }>>; listWorkerDomains(accountId: string): Promise<Array<{ hostname: string; script: string | null; environment: string | null }>>; inspectWorkersDev(accountId: string, workerName: string): Promise<{ exists: boolean; enabled: boolean }>; inspectAccountSubdomain(accountId: string): Promise<string> };
 export function runLiveOperation(input: Record<string, any>, overrides?: Record<string, any> & LiveDriverTimerDependencies): Promise<Record<string, any>>;
