@@ -1798,8 +1798,71 @@ test("an unconfirmable route defers only until authenticated Worker absence", as
   assert.equal(postDeleteProof.routeAbsence, undefined, "the private config deploy must not record route absence");
   const completed = JSON.parse(await readFile(fixture.journalPath, "utf8"));
   assert.equal(completed.teardown.absence["route:route-post-write"], true);
+  assert.equal(completed.teardown.routeAbsenceProofMethods["route:route-post-write"], "owning-worker-deletion");
   assert.equal(completed.teardown.absence[`worker:${workerName}`], true);
   assert.equal(completed.mutations.find((item: any) => item.kind === "teardown-route")?.status, "applied");
+  const packet = JSON.parse(await readFile(`${fixture.journalPath}.evidence.json`, "utf8"));
+  assert.equal(packet.absence.route.proofMethod, "owning-worker-deletion");
+  assert.doesNotMatch(JSON.stringify(packet), /route-post-write/);
+});
+
+test("a route absence proved by its provider read records provider-read without sharing its identifier", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+
+  const result = await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+
+  assert.equal(result.cleanupComplete, true);
+  const journal = JSON.parse(await readFile(fixture.journalPath, "utf8"));
+  assert.equal(journal.teardown.routeAbsenceProofMethods["route:route-post-write"], "provider-read");
+  const packet = JSON.parse(await readFile(`${fixture.journalPath}.evidence.json`, "utf8"));
+  assert.equal(packet.absence.route.proofMethod, "provider-read");
+  assert.doesNotMatch(JSON.stringify(packet), /route-post-write/);
+});
+
+test("delayed absence keeps one independent workers.dev read and accepts a rate-limited answer", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  let workersDevReads = 0;
+  const exposureClient = createApiTokenClient({
+    token: "synthetic-cloud-token",
+    accountApiBase: "https://api.synthetic.invalid/accounts",
+    fetch: async () => {
+      workersDevReads += 1;
+      return new Response(null, { status: 429 });
+    },
+  });
+
+  const delayed = await runLiveOperation({ ...fixture.common, operation: "absence-check" }, {
+    ...fixture.dependencies,
+    tokenClientFactory: () => ({ ...baseTokenClient, inspectWorkersDev: exposureClient.inspectWorkersDev }),
+  });
+
+  assert.equal(delayed.passed, true);
+  assert.equal(workersDevReads, 1);
+});
+
+test("delayed absence fails when the independently observed workers.dev origin is enabled", async (t) => {
+  const fixture = await postWriteTeardownFixture(t);
+  await runLiveOperation({ ...fixture.common, operation: "teardown" }, fixture.dependencies);
+  const baseTokenClient = fixture.dependencies.tokenClientFactory();
+  const timers = immediateRetryTimers();
+  let workersDevReads = 0;
+
+  await assert.rejects(runLiveOperation({ ...fixture.common, operation: "absence-check" }, {
+    ...fixture.dependencies,
+    tokenClientFactory: () => ({
+      ...baseTokenClient,
+      inspectWorkersDev: async () => {
+        workersDevReads += 1;
+        return { exists: true, enabled: true };
+      },
+    }),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  }), /delayed absence proof failed/);
+
+  assert.ok(workersDevReads > 0, "the public origin must still be observed after Worker absence");
 });
 
 for (const scenario of [
