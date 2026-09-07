@@ -29,6 +29,8 @@ export interface ConfirmAbsenceResult {
   lastError: unknown | null;
 }
 
+export type { DeferredRouteInspection } from "./recovery.mjs";
+
 export interface ReleaseMarker {
   sourceSha: string;
   configDigest: string;

@@ -78,23 +78,36 @@ export async function runStackTeardown(options) {
   const resourceKeys = resources.map(({ domain, id }) => domain + ":" + id);
   if (new Set(resourceKeys).size !== resourceKeys.length) throw new Error("duplicate teardown resource identity");
   const absence = {};
+  const deferredUntilWorkerAbsence = new Set();
   let lastVerifiedRevision = expectedRevision;
   for (const domain of RESOURCE_ORDER) {
     for (const resource of resources.filter((candidate) => candidate.domain === domain)) {
       lastVerifiedRevision = await inspectRevision();
       if (lastVerifiedRevision !== expectedRevision) throw new Error("last-write identity changed");
-      const dependents = await listDependents(resource);
+      const dependents = await listDependents(resource, { deferredRouteProof: deferredUntilWorkerAbsence.size > 0 });
       if (!Array.isArray(dependents)) throw new Error("dependent inventory is unreadable");
       if (dependents.length > 0) throw new Error("unexpected dependent blocks teardown");
       const before = await inspectResource(resource);
+      const absenceKey = resource.domain + ":" + resource.id;
+      const deferredRouteProof = resource.domain === "route" && before?.exists === null && before?.deferAbsenceUntil === "worker";
       if (before?.exists) {
         if (before.runId !== journal.runId || before.owner !== journal.owner) throw new Error("remote resource identity mismatch");
         await removeResource(resource);
+      } else if (deferredRouteProof) {
+        // The route is still unproven. Its removal is exposure remediation only; the
+        // Worker's later authenticated absence read is the sole event that can settle it.
+        absence[absenceKey] = false;
+        deferredUntilWorkerAbsence.add(absenceKey);
+        await removeResource(resource);
+        continue;
       }
       const after = await inspectResource(resource);
-      const absenceKey = resource.domain + ":" + resource.id;
       absence[absenceKey] = after?.exists === false;
       if (!absence[absenceKey]) throw new Error(resource.domain + " absence proof failed");
+      if (resource.domain === "worker") {
+        for (const deferredKey of deferredUntilWorkerAbsence) absence[deferredKey] = true;
+        deferredUntilWorkerAbsence.clear();
+      }
     }
   }
   if (resources.some(({ domain }) => domain === "token") && await verifyTokenInactive() !== true) throw new Error("deployment token remains active");
