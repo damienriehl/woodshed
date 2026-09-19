@@ -117,3 +117,126 @@ describe("recommendation validation evidence", () => {
     await assert.rejects(() => runRecommendationValidation(source, join(root, "unsafe.json")), /synthetic/);
   });
 });
+
+describe("authority evidence and retirement boundaries",()=>{
+  it("consumes cutover gates through real shadow, conformance, authority and retirement transitions",()=>{
+    const registry=new AuthorityRegistry(),artifact=completeArtifact();
+    registry.assertRead("ballot","legacy");registry.assertWrite("ballot","legacy");
+    assert.throws(()=>registry.assertRead("ballot","woodshed"),/no readable shadow/);
+    assert.throws(()=>registry.transition("ballot","shadow-imported",{}),/watermark/);
+    registry.transition("ballot","shadow-imported",{refreshWatermark:0});registry.assertRead("ballot","woodshed");
+    assert.throws(()=>registry.transition("ballot","conformance-verified",{}),/conformance evidence/);
+    assert.throws(()=>registry.refresh("ballot",-1),/monotonic/);assert.throws(()=>registry.refresh("ballot",1.5),/monotonic/);
+    const shadow=compareShadow([{capability:"ballot",id:"synthetic-ballot",legacy:{votes:3},woodshed:{votes:3}}],{invariants:[pair=>pair.woodshed.votes===3]});
+    assert.equal(shadow.mismatches.length+shadow.invariantFailures.length,0);
+    registry.transition("ballot","conformance-verified",{conformanceId:"shadow-proof"});
+    assert.equal(evaluateCutover(artifact).readyForAuthority,true);
+    registry.transition("ballot","Woodshed-authoritative",{cutoverWatermark:0,commandsDrained:artifact.approvals.commandDrain,legacyWriterFrozen:artifact.approvals.writerFreeze,exactlyOneWriter:artifact.approvals.exactlyOneWriter});
+    assert.throws(()=>registry.assertWrite("ballot","legacy"),/not the authority/);
+    assert.throws(()=>registry.transition("ballot","legacy-retired",{}),/retirement approval/);
+    artifact.approvals.legacyRetirementApproved=true;assert.equal(evaluateCutover(artifact).readyForLegacyRetirement,true);
+    registry.transition("ballot","legacy-retired",{retirementApproval:"retirement-approved"});
+    registry.assertRead("ballot","woodshed");registry.assertWrite("ballot","woodshed");
+    assert.throws(()=>registry.assertRead("ballot","legacy"),/retired/);
+    assert.throws(()=>registry.rollback("ballot",{strategy:"journal-replay",evidenceId:"proof"}),/only applies/);
+    const snapshot=registry.get("ballot");snapshot.evidence.length=0;
+    assert.deepEqual(registry.get("ballot").evidence,["shadow-proof","retirement-approved"]);
+  });
+  it("rolls back before writes without recovery, and preserves authority during a forward fix",()=>{
+    const registry=new AuthorityRegistry();
+    const cutover=()=>{registry.transition("event","shadow-imported",{refreshWatermark:2});registry.transition("event","conformance-verified",{conformanceId:"proof"});registry.transition("event","Woodshed-authoritative",{cutoverWatermark:2,commandsDrained:true,legacyWriterFrozen:true,exactlyOneWriter:true})};
+    cutover();registry.rollback("event",{strategy:"none"});registry.assertWrite("event","legacy");
+    cutover();registry.assertWrite("event","woodshed");
+    assert.throws(()=>registry.rollback("event",{strategy:"freeze-snapshot-cutback"}),/unsafe rollback/);
+    registry.rollback("event",{strategy:"irreversible-forward-fix",evidenceId:"forward-fix"});
+    assert.equal(registry.get("event").state,"Woodshed-authoritative");assert.equal(registry.get("event").acceptedWrites,true);
+    registry.rollback("event",{strategy:"freeze-snapshot-cutback",evidenceId:"snapshot-proof"});
+    assert.equal(registry.get("event").acceptedWrites,false);registry.assertWrite("event","legacy");
+  });
+});
+
+describe("cutover failure inventory",()=>{
+  it("rejects incomplete and malformed nested inventories before readiness evaluation",()=>{
+    const malformed:unknown[]=[[],{...completeArtifact(),owner:undefined},{...completeArtifact(),release:null},{...completeArtifact(),baseline:[]},{...completeArtifact(),observations:[null]}, {...completeArtifact(),observations:[{at:5,status:"pass",evidenceId:"proof"}]},{...completeArtifact(),rollback:{commands:[],expected:{errorRateMax:NaN,mismatchRateMax:0}}},{...completeArtifact(),approvals:{...completeArtifact().approvals,writerFreeze:"true"}}];
+    for(const artifact of malformed){const result=evaluateCutover(artifact);assert.equal(result.readyForAuthority,false);assert.equal(result.readyForLegacyRetirement,false);assert.ok(result.failures.length)}
+  });
+  it("reports release, recovery, observation, metric and approval failures together",()=>{
+    const a=completeArtifact();a.approver=a.owner;a.release.exactReleaseMarker="wrong";a.baseline.queries=[];a.recovery.journalStart=undefined;
+    a.rollback.commands=[];a.rollback.expected.errorRateMax=-1;a.observability.queueDepth=1;
+    a.observations=[{at:"+5m",status:"fail",evidenceId:"failed-proof"},{at:"+1h",status:"pass",evidenceId:""}];
+    a.approvals={readFirstUat:false,commandDrain:false,writerFreeze:false,shadowReconciled:false,exactlyOneWriter:false,publicationApproved:false,legacyRetirementApproved:true};
+    const result=evaluateCutover(a);assert.equal(result.readyForAuthority,false);assert.equal(result.readyForLegacyRetirement,false);
+    for(const message of ["distinct owner","frozen release","baseline queries","journal replay start","rollback commands","observability gate","read-first UAT","command drain","writer freeze","shadow reconciliation","exactly one writer","publication approval"])assert.ok(result.failures.some(f=>f.includes(message)),message);
+    assert.equal(result.observationFailures.length,4);
+    a.recovery.strategy="none";assert.match(evaluateCutover(a).failures.join(" "),/safe recovery strategy/);
+  });
+  it("rejects unknown nested proof fields and permits metrics exactly at declared thresholds",()=>{
+    const a=completeArtifact();a.observability.errorRate=a.rollback.expected.errorRateMax;
+    assert.equal(evaluateCutover(a).readyForAuthority,true);
+    const unknown={...a,release:{...a.release,unreviewed:true},observations:[...a.observations,{at:"+24h",status:"pass",evidenceId:"proof",unreviewed:true}]};
+    assert.deepEqual(evaluateCutover(unknown).failures,["release inventory contains unknown fields","observation inventory contains unknown fields"]);
+    a.observability.errorRate+=.0001;assert.match(evaluateCutover(a).failures.join(" "),/observability/);
+  });
+  it("identifies failed invariants independently of equality and handles empty comparisons",()=>{
+    assert.deepEqual(compareShadow([],{invariants:[]}),{compared:0,mismatches:[],invariantFailures:[]});
+    const report=compareShadow([{capability:"live",id:"synthetic-id",legacy:{b:2,a:1},woodshed:{a:1,b:2}}],{invariants:[()=>true,p=>p.woodshed.a===2]});
+    assert.equal(report.mismatches.length,0);assert.equal(report.invariantFailures.length,1);assert.equal(report.invariantFailures[0]?.invariant,1);
+    assert.match(report.invariantFailures[0]!.idHash,/^[a-f0-9]{16}$/);assert.equal(JSON.stringify(report).includes("synthetic-id"),false);
+  });
+});
+
+describe("recommendation edge cohorts and scoring",()=>{
+  const base={version:"v1",seed:"synthetic",config:{demand:1,feasibility:1},input:[{id:"b",demand:1,feasibility:null},{id:"a",demand:0,feasibility:1}],organizerTrials:[]};
+  it("fails human validation gates with empty cohorts and zero-position trials",()=>{
+    const empty=validateRecommendation(base);assert.deepEqual(empty.measures,{acceptance:0,medianOverrideBurden:1,comprehension:0,overrideBurdenSamples:[]});
+    assert.deepEqual(empty.gates,{deterministic:true,acceptance:false,overrideBurden:false,comprehension:false});
+    const report=validateRecommendation({...base,organizerTrials:[{acceptedTopFive:false,changedPositions:0,totalPositions:0,understoodFactors:false}]});
+    assert.deepEqual(report.measures.overrideBurdenSamples,[1]);assert.equal(report.gates.overrideBurden,false);
+  });
+  it("ranks ties canonically, defaults missing weights and rejects malformed candidates",()=>{
+    const first=validateRecommendation(base),reversed=validateRecommendation({...base,input:[...base.input].reverse()});
+    assert.equal(first.outputFingerprint,reversed.outputFingerprint);assert.notEqual(first.inputFingerprint,reversed.inputFingerprint);
+    assert.equal(validateRecommendation({...base,config:{}}).gates.deterministic,true);
+    for(const input of [{},[{id:1,demand:1,feasibility:1}],[{id:"a",demand:"1",feasibility:1}],[{id:"a",demand:1}]])assert.throws(()=>validateRecommendation({...base,input}),/recommendation/);
+  });
+  it("uses sorted override burden and requires acceptance as well as low edit count",()=>{
+    const report=validateRecommendation({...base,organizerTrials:[{acceptedTopFive:true,changedPositions:4,totalPositions:4,understoodFactors:true},{acceptedTopFive:true,changedPositions:1,totalPositions:4,understoodFactors:true},{acceptedTopFive:false,changedPositions:0,totalPositions:4,understoodFactors:false}]});
+    assert.deepEqual(report.measures.overrideBurdenSamples,[0,.25,1]);assert.equal(report.measures.medianOverrideBurden,.25);
+    assert.equal(report.measures.acceptance,1/3);assert.equal(report.gates.overrideBurden,true);assert.equal(report.gates.acceptance,false);assert.equal(report.gates.comprehension,false);
+  });
+});
+
+import { spawnSync } from "node:child_process";
+import { rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+it("recommendation CLI validates synthetic input and preserves existing evidence on failed writes", async t => {
+  const root = await mkdtemp(join(tmpdir(), "woodshed-recommendation-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "input.json"), output = join(root, "evidence.json");
+  const payload = { datasetKind: "synthetic", containsPrivateData: false, evidenceTime: "2030-01-01T00:00:00Z", version: "test-v1", config: { demand: 1, feasibility: 1 }, seed: "synthetic", input: [{ id: "song_synthetic", demand: 1, feasibility: null }], organizerTrials: [] };
+  await writeFile(source, JSON.stringify(payload));
+  const run = (args: string[]) => {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/validation/run-recommendation.mjs", import.meta.url)), ...args], { encoding: "utf8" });
+    if (result.stderr) process.stderr.write(result.stderr);
+    return result;
+  };
+  const missing = run([]);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /usage:/);
+  assert.equal(run([source, output]).status, 0);
+  const original = await readFile(output, "utf8");
+  const parsed = JSON.parse(original);
+  assert.equal(parsed.generatedAt, payload.evidenceTime);
+  assert.equal(parsed.datasetKind, "synthetic");
+  assert.equal(parsed.gates.acceptance, false);
+  assert.equal(run([source, output]).status, 1);
+  assert.equal(await readFile(output, "utf8"), original);
+  await writeFile(source, "{malformed");
+  const invalid = run([source, join(root, "invalid.json")]);
+  assert.equal(invalid.status, 1);
+  await assert.rejects(readFile(join(root, "invalid.json")), { code: "ENOENT" });
+  await writeFile(source, JSON.stringify({ ...payload, datasetKind: "unknown" }));
+  assert.equal(run([source, join(root, "refused.json")]).status, 1);
+  await assert.rejects(readFile(join(root, "refused.json")), { code: "ENOENT" });
+});

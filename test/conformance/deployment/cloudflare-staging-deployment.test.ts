@@ -18,7 +18,7 @@ import {
   runBoundedSubprocess,
   runMigrationFirstDeployment,
 } from "../../../tools/cloudflare/deployment.mjs";
-import { createJournal } from "../../../tools/cloudflare/journal.mjs";
+import { createJournal, saveJournal, loadJournal } from "../../../tools/cloudflare/journal.mjs";
 import { D1_MIGRATIONS } from "../../../tools/cloudflare/migrations.mjs";
 
 const sourceSha = "a".repeat(40);
@@ -608,4 +608,197 @@ test("every Cloudflare tool export has a declaration in its .d.mts sibling", asy
     }
   }
   assert.deepEqual(missing, [], `exports without a .d.mts declaration: ${missing.join(", ")}`);
+});
+
+test("bounded subprocess runs a real local stdin/stdout/stderr chain and preserves nonzero exits", async () => {
+  const result = await runBoundedSubprocess(process.execPath, ["-e", "process.stdin.on('data', c => process.stdout.write(c)); process.stdin.on('end', () => { process.stderr.write('diagnostic'); process.exitCode = 7; });"], {
+    cwd: process.cwd(), env: {}, input: "bounded-input", timeoutMs: 10_000,
+  });
+  assert.deepEqual(result, { exitCode: 7, signal: null, stdout: "bounded-input", stderr: "diagnostic" });
+  await assert.rejects(runBoundedSubprocess("/definitely-absent-coverage-executable", [], { cwd: process.cwd(), env: {}, timeoutMs: 1_000 }), /ENOENT/);
+  await assert.rejects(runBoundedSubprocess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: process.cwd(), env: {}, timeoutMs: 100, killGraceMs: 100 }), /timed out/);
+});
+
+for (const limits of [{ timeoutMs: 0 }, { timeoutMs: 1.5 }, { timeoutMs: 1, killGraceMs: 0 }, { timeoutMs: 1, maxOutputBytes: -1 }]) {
+  test(`bounded subprocess rejects invalid limits ${JSON.stringify(limits)} before spawn`, () => {
+    assert.throws(() => runBoundedSubprocess("unused", [], { ...limits, spawn: () => { assert.fail("must not spawn"); } }), /positive integers/);
+  });
+}
+
+test("bounded subprocess counts combined UTF-8 streams and preserves first failure through late events", async () => {
+  const child: any = new EventEmitter();
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+  const signals: string[] = [];
+  child.kill = (signal: string) => { signals.push(signal); throw new Error("kill failed"); };
+  const pending = runBoundedSubprocess("unused", [], { timeoutMs: 5, killGraceMs: 15, maxOutputBytes: 4, spawn: () => child });
+  child.stdout.emit("data", "é"); child.stderr.emit("data", "abc"); child.stdout.emit("data", "ignored");
+  await assert.rejects(pending, /output limit/);
+  child.emit("error", new Error("late error")); child.emit("close", 0, null);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("Wrangler adapter rejects invalid prerequisites, malformed output, failed commands and unsafe secret requests", async () => {
+  assert.throws(() => createWranglerAdapter({ root: "", token: "test" }), /required/);
+  assert.throws(() => createWranglerAdapter({ root: "/repo", token: "" }), /required/);
+  for (const result of [undefined, { exitCode: 1, stderr: "private detail" }]) {
+    const adapter = createWranglerAdapter({ root: "/repo", token: "test", spawn: async () => result });
+    await assert.rejects(adapter.json(["d1", "list"]), { message: "Wrangler command failed" });
+  }
+  const adapter = createWranglerAdapter({ root: "/repo", token: "test", spawn: async () => ({ exitCode: 0, stdout: "invalid" }) });
+  await assert.rejects(adapter.json(["d1", "list"]), /malformed/);
+  for (const value of [null, "short", 42]) await assert.rejects(adapter.secretPut("LIVE_COMMAND_SECRET", value, { workerName: identity.workerName }), /valid root secret/);
+  await assert.rejects(adapter.secretPut("OTHER", "x".repeat(32), { workerName: identity.workerName }), /valid root secret/);
+  for (const workerName of [undefined, "production", "staging.INVALID", "staging-", "staging-dns"]) {
+    await assert.rejects(adapter.secretPut("LIVE_COMMAND_SECRET", "x".repeat(32), { workerName }), /safe staging|route mutation/);
+  }
+});
+
+test("preflight validates inventories, rejects sparse records and recognizes declared route aliases", () => {
+  const inventory = { staging: identity, forbidden: { accountIds: [], databaseIds: [], workerNames: [], origins: ["https://blocked.invalid"] } };
+  const remote = { accountId: identity.accountId, databases: [], workers: [], routes: [], secretNames: [], deployments: [] };
+  for (const value of [null, { ...remote, accountId: "other" }]) assert.throws(() => assertCredentialedPreflight(inventory, value), /account/);
+  for (const field of ["databases", "workers", "routes", "secretNames", "deployments"]) assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, [field]: {} }), /unreadable/);
+  for (const field of ["url", "pattern"]) assert.doesNotThrow(() => assertCredentialedPreflight(inventory, { ...remote, routes: [{ [field]: "https://blocked.invalid/route" }] }, { localSecretAvailable: true }));
+  for (const field of ["databases", "workers", "routes"]) for (const record of [null, {}]) assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, [field]: [record] }, { localSecretAvailable: true }), /unreadable/);
+  assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, databases: [{ id: identity.databaseId, name: "different-staging" }] }, { localSecretAvailable: true }), /already exists/);
+});
+
+test("assigned database identity rejects mismatches, deduplicates ownership and propagates durability failures", async () => {
+  for (const database of [null, { id: "bad", name: identity.databaseName }, { id: identity.databaseId, name: "different" }]) {
+    await assert.rejects(persistAssignedDatabaseIdentity({ journal: journal(), database, persistJournal: async () => assert.fail("invalid identity must not persist") }), /invalid/);
+  }
+  await assert.rejects(persistAssignedDatabaseIdentity({ journal: journal(), database: { id: "22222222-2222-4222-8222-222222222222", name: identity.databaseName }, persistJournal: async () => {} }), /changed/);
+  const state = journal();
+  const options = { journal: state, database: { id: identity.databaseId, name: identity.databaseName }, persistJournal: async () => {} };
+  await persistAssignedDatabaseIdentity(options); await persistAssignedDatabaseIdentity(options);
+  assert.equal(state.resources.length, 1);
+  await assert.rejects(persistAssignedDatabaseIdentity({ ...options, persistJournal: async () => { throw new Error("disk unavailable"); } }), /disk unavailable/);
+});
+
+test("ledger requires valid rows, strict order, complete digest and source provenance", () => {
+  for (const remote of [null, {}, [null], [{ name: 1 }]]) assert.throws(() => reconcileMigrationLedger({ remote, manifest: D1_MIGRATIONS, journal: journal() }), /malformed/);
+  const first = D1_MIGRATIONS[0]!;
+  for (const override of [{ sha256: "0".repeat(64) }, { sourceSha: "c".repeat(40) }]) {
+    const state = journal(); state.migrations.push({ ...first, sourceSha, status: "applied", ...override });
+    assert.throws(() => reconcileMigrationLedger({ remote: JSON.stringify([{ name: first.filename }]), manifest: [first], journal: state }), /provenance/);
+  }
+  assert.throws(() => reconcileMigrationLedger({ remote: [{ name: first.filename }, { name: first.filename }], manifest: [first], journal: journal() }), /exact prefix/);
+});
+
+test("schema rejects missing sets, foreign-key, seed and row-preservation errors", () => {
+  const expected = { tables: ["events"], indexes: [], triggers: [], constraints: [] };
+  const actual = { ...expected, foreignKeysEnabled: true, foreignKeyViolations: 0, integrity: "ok", choiceConfigSeeded: true, migration009: { beforeRows: 1, afterRows: 1, beforeAssociations: 0, afterAssociations: 0, beforeAssociationDigest: "f".repeat(64), afterAssociationDigest: "f".repeat(64) } };
+  for (const [override, error] of [
+    [{ foreignKeysEnabled: false }, /foreign key/], [{ foreignKeyViolations: 1 }, /foreign key/],
+    [{ tables: null }, /tables/], [{ indexes: ["extra"] }, /indexes/], [{ tables: ["other"] }, /tables/],
+    [{ choiceConfigSeeded: false }, /seed/], [{ migration009: null }, /preservation/],
+    [{ migration009: { ...actual.migration009, afterRows: 0 } }, /preservation/],
+  ] as const) assert.throws(() => assertSchemaInvariants({ ...actual, ...override }, expected), error);
+  assert.throws(() => assertSchemaInvariants(actual, { ...expected, tables: null }), /tables/);
+});
+
+test("deployment identity validates defaults, release digest and supported lifecycle", () => {
+  const expected = { sourceSha, configDigest: "a".repeat(64), lifecycle: "legacy-sqlite-v1" };
+  const actual = { ...expected, deploymentId: "v1", bindings: ["DB", "APP_ORIGIN", "LIVE_COORDINATOR", "LIVE_COMMAND_SECRET"] };
+  assert.equal(assertDeploymentIdentity(expected, actual), true);
+  for (const value of [null, {}, { ...actual, configDigest: "wrong" }, { ...actual, lifecycle: "different" }]) assert.throws(() => assertDeploymentIdentity(expected, value), /identity|lifecycle/);
+  assert.throws(() => assertDeploymentIdentity({ ...expected, lifecycle: "unsupported" }, { ...actual, lifecycle: "unsupported" }), /lifecycle/);
+});
+
+function deploymentFixture(overrides: any = {}) {
+  const state = journal();
+  return {
+    journal: state, lease, manifest: [], expectedSnapshot: {}, inspectSnapshot: async () => ({}), inspectLedger: async () => [],
+    persistJournal: async () => {}, applyMigration: async () => {}, verifyMigration: async () => true,
+    verifyFinalSchema: async () => {}, deployWorker: async () => ({ deploymentId: "version-test" }), verifyDeployment: async () => {}, ...overrides,
+  };
+}
+
+for (const invalidLease of [null, { ...lease, active: false }, { ...lease, runId: "other" }, { ...lease, owner: "other" }]) {
+  test(`deployment rejects invalid ownership lease ${JSON.stringify(invalidLease)}`, async () => {
+    await assert.rejects(runMigrationFirstDeployment(deploymentFixture({ lease: invalidLease, inspectSnapshot: async () => assert.fail("no inspection without lease") })), /ownership lease/);
+  });
+}
+
+for (const status of ["pending", "corrupt"]) {
+  test(`restart fails closed on ${status} migration with failed verification`, async () => {
+    const state = journal(); const first = D1_MIGRATIONS[0]!;
+    state.migrations.push({ ...first, sourceSha, status: status as "pending" });
+    await assert.rejects(runMigrationFirstDeployment(deploymentFixture({ journal: state, manifest: [first], inspectLedger: async () => [{ name: first.filename }], verifyMigration: async () => false, deployWorker: async () => assert.fail("must not deploy") })), /postcondition failed|status is invalid/);
+  });
+}
+
+for (const recovery of ["absent", "failed-postcondition", "successful-write-failed-postcondition"]) {
+  test(`migration failure preserves pending intent when ${recovery}`, async () => {
+    const first = D1_MIGRATIONS[0]!; let attempted = false;
+    const options = deploymentFixture({ manifest: [first], inspectLedger: async () => attempted && recovery !== "absent" ? [{ name: first.filename }] : [], applyMigration: async () => { attempted = true; if (recovery !== "successful-write-failed-postcondition") throw new Error("lost response"); }, verifyMigration: async () => false, deployWorker: async () => assert.fail("must not deploy") });
+    await assert.rejects(runMigrationFirstDeployment(options), /outcome is uncertain|postcondition failed/);
+    assert.equal(options.journal.migrations[0].status, "pending"); assert.equal(options.journal.mutations.length, 0);
+  });
+}
+
+for (const point of ["migration", "deploy"]) {
+  test(`inventory drift immediately before ${point} blocks mutation`, async () => {
+    let reads = 0;
+    const options = deploymentFixture({ manifest: point === "migration" ? [D1_MIGRATIONS[0]] : [], inspectSnapshot: async () => ++reads === 1 ? {} : { changed: true }, applyMigration: async () => assert.fail("must not migrate"), deployWorker: async () => assert.fail("must not deploy") });
+    await assert.rejects(runMigrationFirstDeployment(options), /inventory changed/);
+    assert.equal(options.journal.mutations.length, 0); assert.equal(options.journal.migrations.length, 0);
+  });
+}
+
+for (const variant of ["duplicate", "bad-status", "bad-source", "missing-inspector", "absent-remote", "already-applied"]) {
+  test(`deployment intent reconciliation handles ${variant}`, async () => {
+    const state = journal();
+    state.mutations.push({ kind: "worker-deploy", sourceSha: variant === "bad-source" ? "b".repeat(40) : sourceSha, status: variant === "bad-status" ? "unknown" as "pending" : variant === "already-applied" ? "applied" : "pending" });
+    if (variant === "duplicate") state.mutations.push({ ...state.mutations[0]! });
+    const options = deploymentFixture({ journal: state, inspectDeployment: variant === "missing-inspector" ? undefined : async () => variant === "absent-remote" ? null : { deploymentId: "recovered" }, deployWorker: async () => assert.fail("never replay") });
+    if (variant === "already-applied") {
+      assert.equal((await runMigrationFirstDeployment(options)).deployment.deploymentId, "recovered");
+      assert.equal(state.phase, "worker-deployed");
+    } else await assert.rejects(runMigrationFirstDeployment(options), /duplicate intents|cannot be reconciled|outcome is uncertain/);
+  });
+}
+
+for (const inspector of [undefined, async () => null]) {
+  test(`deployment response loss without recoverable remote identity (${typeof inspector}) preserves pending intent`, async () => {
+    const cause = new Error("response loss");
+    const options = deploymentFixture({ deployWorker: async () => { throw cause; }, inspectDeployment: inspector });
+    await assert.rejects(runMigrationFirstDeployment(options), (error: any) => { assert.match(error.message, /outcome is uncertain/); assert.equal(error.cause, cause); return true; });
+    assert.equal(options.journal.mutations[0].status, "pending"); assert.equal(options.journal.phase, "pre-write");
+  });
+}
+
+test("deployment verification failures leave durable intent pending and do not mark deployment complete", async () => {
+  const options = deploymentFixture({ verifyDeployment: async () => { throw new Error("wrong release"); } });
+  await assert.rejects(runMigrationFirstDeployment(options), /wrong release/);
+  assert.equal(options.journal.mutations[0].status, "pending"); assert.equal(options.journal.phase, "pre-write");
+});
+
+test("migration deployment integration persists real journal through restart with complete manifest provenance", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-deployment-coverage-"));
+  try {
+    const file = path.join(directory, "journal.json"); const remote: { name: string }[] = [];
+    const options = deploymentFixture({ manifest: D1_MIGRATIONS, inspectLedger: async () => JSON.stringify(remote), persistJournal: async (state: any) => saveJournal(file, state),
+      applyMigration: async (migration: any) => {
+        const durable = await loadJournal(file);
+        assert.equal(durable.migrations.at(-1)?.filename, migration.filename);
+        assert.equal(durable.migrations.at(-1)?.status, "pending");
+        remote.push({ name: migration.filename });
+      },
+      verifyMigration: async (migration: any) => remote.some(({ name }) => name === migration.filename),
+      deployWorker: async () => {
+        const durable = await loadJournal(file);
+        assert.equal(durable.migrations.length, D1_MIGRATIONS.length);
+        assert.ok(durable.migrations.every(({ status }: any) => status === "applied"));
+        assert.equal((durable.mutations.at(-1) as any).status, "pending");
+        return { deploymentId: "durable-version" };
+      },
+    });
+    await runMigrationFirstDeployment(options);
+    const recovered = await loadJournal(file);
+    assert.equal(recovered.phase, "worker-deployed");
+    const replay = await runMigrationFirstDeployment({ ...options, journal: recovered, applyMigration: async () => assert.fail("must not replay migration"), deployWorker: async () => assert.fail("must not replay deployment"), inspectDeployment: async () => ({ deploymentId: "durable-version" }) });
+    assert.equal(replay.rollback, "forward-fix-only");
+    assert.deepEqual((await loadJournal(file)).migrations, recovered.migrations);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

@@ -95,6 +95,100 @@ describe("Cloudflare Worker runtime", () => {
     }
   });
 
+  it("returns private JSON errors for unsupported routes and methods", async () => {
+    const fixture = await runtime();
+    try {
+      for (const [pathname, method] of [["/api/missing", "GET"], ["/api/discovery", "POST"], ["/api/events/event_public/join-open", "GET"], ["/api/events/event_public/ballot", "DELETE"]] as const) {
+        const response = await fixture.fetch(pathname, { method, headers: fixture.authHeaders(true) });
+        assert.equal(response.status, 404, `${method} ${pathname}`);
+        assert.deepEqual(await response.json(), { error: "not-found" });
+        assert.equal(response.headers.get("cache-control"), "private, no-store");
+        assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      }
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM ballots").first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("rejects malformed bodies and failed mutation guards without creating participation", async () => {
+    const fixture = await runtime();
+    try {
+      for (const body of ["{", "null", "[]", "false"]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: fixture.mutationHeaders(), body });
+        assert.equal(response.status, 400);
+        assert.deepEqual(await response.json(), { error: "invalid-command" });
+      }
+      for (const operationId of [undefined, "", 42]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId }) });
+        assert.equal(response.status, 400);
+        assert.deepEqual(await response.json(), { error: "invalid-request" });
+      }
+      for (const overrides of [{ origin: "https://other.example" }, { "x-csrf-token": "wrong" }]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: { ...fixture.mutationHeaders(), ...overrides }, body: JSON.stringify({ operationId: "guarded_join" }) });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM guest_participations").first<{ count: number }>())?.count, 1);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM open_join_receipts").first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("ignores malformed cookies and gives a supplied bearer credential precedence", async () => {
+    const fixture = await runtime();
+    try {
+      const cookieName = `woodshed_session_${createHash("sha256").update("event_public").digest("hex").slice(0, 16)}`;
+      const malformed = `no-equals; =value; empty=; ${cookieName}=%E0%A4%A`;
+      const rejected = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: malformed } });
+      assert.equal(rejected.status, 401);
+      assert.deepEqual(await rejected.json(), { error: "unauthorized" });
+      const accepted = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: `${malformed}; ${cookieName}=${encodeURIComponent(sessionToken)}`, authorization: "Basic ignored" } });
+      assert.equal(accepted.status, 200);
+      assert.equal((await accepted.json() as { event: { id: string } }).event.id, "event_public");
+      const invalidBearer = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: `${cookieName}=${sessionToken}`, authorization: "Bearer unknown-session" } });
+      assert.equal(invalidBearer.status, 401);
+    } finally { await fixture.close(); }
+  });
+
+  it("enforces persisted roles and live command identity before any operation is saved", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.prepare("UPDATE participant_sessions SET role='observer' WHERE id_hash=?").bind(sessionHash).run();
+      for (const [pathname, method] of [["/ballot", "GET"], ["/proposals", "POST"], ["/live/authority/acquire", "POST"], ["/live/commands", "POST"]] as const) {
+        const response = await fixture.fetch(`/api/events/event_public${pathname}`, { method, headers: fixture.authHeaders(true), ...(method === "POST" ? { body: "{}" } : {}) });
+        assert.equal(response.status, 403, pathname);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      await fixture.DB.prepare("UPDATE participant_sessions SET role='community-admin' WHERE id_hash=?").bind(sessionHash).run();
+      for (const overrides of [{ eventId: "event_other" }, { communityId: "community_other" }, { actorId: "another-participant" }]) {
+        const response = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand(overrides)) });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      const noAuthority = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand()) });
+      assert.equal(noAuthority.status, 409);
+      assert.deepEqual(await noAuthority.json(), { error: "superseded-authority" });
+      for (const table of ["ballots", "choice_proposals", "live_operation_receipts"])
+        assert.equal((await fixture.DB.prepare(`SELECT count(*) count FROM ${table}`).first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("redacts a real D1 write failure and allows a clean retry after rollback", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.exec("CREATE TRIGGER fail_http_join BEFORE INSERT ON open_join_receipts BEGIN SELECT RAISE(ABORT, 'private database diagnostic'); END;");
+      const request = { method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId: "http_failure_retry" }) };
+      const failed = await fixture.fetch("/api/events/event_public/join-open", request);
+      assert.equal(failed.status, 500);
+      assert.deepEqual(await failed.json(), { error: "internal-error" });
+      assert.equal(failed.headers.get("set-cookie"), null);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM participant_sessions").first<{ count: number }>())?.count, 1);
+      await fixture.DB.exec("DROP TRIGGER fail_http_join;");
+      const retry = await fixture.fetch("/api/events/event_public/join-open", request);
+      assert.equal(retry.status, 200);
+      const cookie = retry.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie } })).status, 200);
+    } finally { await fixture.close(); }
+  });
+
   it("completes the accountless participant first loop with event-scoped sessions", async () => {
     const fixture = await runtime();
     try {
@@ -454,3 +548,116 @@ function sessionLookupFailure(database: D1Database): D1Database {
     },
   });
 }
+
+const runtimeCode = (code: string) => (error: unknown) => error instanceof Error && "code" in error && error.code === code;
+
+describe("D1 participant runtime persistence and validation", () => {
+  it("rejects malformed commands before creating ballots, proposals or receipts", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      for (const value of [null, [], false, "text", {}, { expectedRevision: -1, rankings: [], operationId: "bad" }, { expectedRevision: 0.5, rankings: [], operationId: "bad" }, { expectedRevision: 0, rankings: [1], operationId: "bad" }, { expectedRevision: 0, rankings: [], operationId: "" }]) {
+        await assert.rejects(() => choice.replaceBallot(session, value), runtimeCode("invalid-command"));
+      }
+      for (const value of [null, [], {}, { title: "   ", operationId: "bad" }, { title: 12, operationId: "bad" }, { title: "Song", operationId: "" }]) {
+        await assert.rejects(() => choice.propose(session, value), runtimeCode("invalid-command"));
+      }
+      for (const table of ["ballots", "ballot_versions", "choice_proposals", "proposal_receipts"])
+        assert.equal((await fixture.DB.prepare(`SELECT count(*) count FROM ${table}`).first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("enforces event scope and exact session expiration with real persisted credentials", async () => {
+    const fixture = await runtime();
+    try {
+      let now = new Date("2030-01-01T12:01:00Z");
+      const choice = new D1ChoiceRuntime(fixture.DB, () => now);
+      const issued = await choice.joinOpen("event_public", "runtime_expiry");
+      const session = await choice.session(issued.token);
+      await choice.assertEvent(session, "event_public");
+      assert.equal((await choice.eventContext(session)).id, "event_public");
+      await assert.rejects(() => choice.assertEvent(session, "event_other"), runtimeCode("denied"));
+      await assert.rejects(() => choice.assertEvent({ ...session, communityId: "community_other" }, "event_public"), runtimeCode("denied"));
+      await assert.rejects(() => choice.assertEvent({ ...session, eventId: "missing" }, "missing"), runtimeCode("denied"));
+      await assert.rejects(() => choice.eventContext({ ...session, communityId: "community_other" }), runtimeCode("not-found"));
+      await assert.rejects(() => choice.ballot({ ...session, communityId: "community_other" }), runtimeCode("denied"));
+      now = new Date("2030-01-02T12:01:00Z");
+      await assert.rejects(() => choice.session(issued.token), runtimeCode("unauthorized"));
+      await choice.revokeSession("unknown");
+      await choice.revokeSession(issued.token); await choice.revokeSession(issued.token);
+      assert.equal((await fixture.DB.prepare("SELECT revoked_at FROM participant_sessions WHERE participation_id=?").bind(session.participationId).first<{ revoked_at: string }>())?.revoked_at, now.toISOString());
+    } finally { await fixture.close(); }
+  });
+
+  it("validates join eligibility and rolls back an interrupted batch", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB);
+      await assert.rejects(() => choice.joinOpen("event_public", ""), runtimeCode("invalid-request"));
+      await assert.rejects(() => choice.joinOpen("missing", "join_missing"), runtimeCode("not-found"));
+      await fixture.DB.prepare("UPDATE events SET state='draft' WHERE id='event_public'").run();
+      await assert.rejects(() => choice.joinOpen("event_public", "draft_join"), runtimeCode("denied"));
+      await fixture.DB.prepare("UPDATE events SET state='live', participation_policy='invite' WHERE id='event_public'").run();
+      await assert.rejects(() => choice.joinOpen("event_public", "invite_join"), runtimeCode("denied"));
+      await fixture.DB.prepare("UPDATE events SET participation_policy='open' WHERE id='event_public'").run();
+      await fixture.DB.exec("CREATE TRIGGER fail_join BEFORE INSERT ON open_join_receipts BEGIN SELECT RAISE(ABORT, 'join receipt unavailable'); END;");
+      await assert.rejects(() => choice.joinOpen("event_public", "rollback_join"), /join receipt unavailable/);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM guest_participations").first<{ count: number }>())?.count, 1);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM participant_sessions").first<{ count: number }>())?.count, 1);
+      await fixture.DB.exec("DROP TRIGGER fail_join;");
+      const joined = await choice.joinOpen("event_public", "rollback_join");
+      assert.equal((await choice.session(joined.token)).participationId, joined.participationId);
+    } finally { await fixture.close(); }
+  });
+
+  it("normalizes proposal titles, persists immediate eligibility, and rolls back receipt failures", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      await fixture.DB.prepare("UPDATE event_choice_config SET proposal_policy='immediate' WHERE event_id='event_public'").run();
+      await fixture.DB.exec("CREATE TRIGGER fail_proposal BEFORE INSERT ON proposal_receipts BEGIN SELECT RAISE(ABORT, 'proposal receipt unavailable'); END;");
+      await assert.rejects(() => choice.propose(session, { title: "  Song  ", operationId: "normalized" }), /proposal receipt unavailable/);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 0);
+      await fixture.DB.exec("DROP TRIGGER fail_proposal;");
+      const result = await choice.propose(session, { title: "  Song  ", operationId: "normalized" });
+      assert.equal(result.title, "Song"); assert.equal(result.state, "eligible");
+      assert.deepEqual(await choice.propose(session, { title: "Song", operationId: "normalized" }), result);
+      await fixture.DB.prepare("DELETE FROM event_choice_config WHERE event_id='event_public'").run();
+      await assert.rejects(() => choice.propose(session, { title: "Other", operationId: "missing_config" }), runtimeCode("not-found"));
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 1);
+    } finally { await fixture.close(); }
+  });
+
+  it("drops removed candidates from saved rankings and handles an empty ballot", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      await choice.replaceBallot(session, { expectedRevision: 0, rankings: ["song_bravo", "song_alpha"], operationId: "saved_order" });
+      await fixture.DB.prepare("DELETE FROM event_eligible_songs WHERE event_id='event_public' AND song_id='song_bravo'").run();
+      assert.deepEqual((await choice.ballot(session)).candidates.map(song => song.id), ["song_alpha"]);
+      await fixture.DB.prepare("DELETE FROM event_eligible_songs WHERE event_id='event_public'").run();
+      assert.deepEqual(await choice.ballot(session), { method: "ranked-choice", revision: 1, candidates: [] });
+      await fixture.DB.prepare("UPDATE ballots SET state='closed'").run();
+      await assert.rejects(() => choice.replaceBallot(session, { expectedRevision: 1, rankings: [], operationId: "closed" }), runtimeCode("voting-closed"));
+    } finally { await fixture.close(); }
+  });
+});
+
+it("D1 concurrent proposal retries persist one result and reject divergent reuse", async () => {
+  const fixture = await runtime();
+  try {
+    const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+    const session = await choice.session(sessionToken);
+    const repeated = await Promise.all(Array.from({ length: 4 }, () => choice.propose(session, { title: "Shared song", operationId: "concurrent_exact" })));
+    for (const result of repeated) assert.deepEqual(result, repeated[0]);
+    const divergent = await Promise.allSettled(["First title", "Second title"].map(title => choice.propose(session, { title, operationId: "concurrent_mismatch" })));
+    assert.equal(divergent.filter(result => result.status === "fulfilled").length, 1);
+    const rejected = divergent.find(result => result.status === "rejected");
+    assert.ok(rejected?.status === "rejected" && runtimeCode("replay-mismatch")(rejected.reason));
+    assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 2);
+    assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM proposal_receipts").first<{ count: number }>())?.count, 2);
+  } finally { await fixture.close(); }
+});

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -226,4 +228,149 @@ test("migrations replay on empty and populated databases without losing state", 
       reopened.close();
     }
   });
+});
+
+import { communityId, guestParticipationId, canonicalSongId, eventSongDecisionVersionId, ballotId, proposalId, auditEventId, parseBallotState, parseEventState, parseProposalState } from "../../packages/contracts/src/index.ts";
+
+for (const [prefix, parse] of [
+  ["community", communityId], ["event", eventId], ["participation", guestParticipationId],
+  ["song", canonicalSongId], ["decision", eventSongDecisionVersionId], ["ballot", ballotId],
+  ["proposal", proposalId], ["audit", auditEventId],
+] as const) {
+  test(`${prefix} identifiers enforce length, alphabet, and type boundaries`, () => {
+    assert.equal(parse(`${prefix}_abc`), `${prefix}_abc`);
+    assert.equal(parse(`${prefix}_${"a".repeat(128)}`), `${prefix}_${"a".repeat(128)}`);
+    for (const suffix of ["ab", "a".repeat(129), "Abc", "-abc", " abc", "abc ", "a/b", "a.b"]) {
+      assert.throws(() => parse(`${prefix}_${suffix}`), ContractValidationError);
+    }
+    for (const value of [undefined, null, 42, "", "   "]) assert.throws(() => parse(value), ContractValidationError);
+  });
+}
+
+test("record schemas reject nonobjects, blank names, invalid revisions, and nonarray rankings", () => {
+  for (const parse of [parseCommunity, parseEvent, parseGuestParticipation, parseCanonicalSong, parseEventSongDecisionVersion, parseBallot, parseProposal, parseAuditEvent]) {
+    for (const value of [null, [], "record", 1]) assert.throws(() => parse(value), /must be an object/);
+  }
+  assert.throws(() => parseCommunity({ id: IDS.community, name: " " }), /non-empty/);
+  assert.throws(() => parseCanonicalSong({ id: IDS.songA, communityId: IDS.community, title: false }), /non-empty/);
+  for (const revision of [0, -1, 1.5, "1", NaN]) {
+    assert.throws(() => parseEventSongDecisionVersion({ id: "decision_synthetic", eventId: IDS.event, songId: IDS.songA, revision }), /revision must be positive/);
+  }
+  for (const rankings of [null, {}, "song_alpha", undefined]) assert.throws(() => parseBallot({ id: "ballot_synthetic", rankings }), /must be an array/);
+  assert.deepEqual(parseBallot({ id: "ballot_synthetic", rankings: [] }), { id: "ballot_synthetic", rankings: [] });
+});
+
+test("lifecycle parsing and terminal-state guards reject unknown values and backward transitions", () => {
+  for (const parse of [parseBallotState, parseEventState, parseProposalState]) {
+    for (const value of [null, 1, "", "unknown"]) assert.throws(() => parse(value), ContractValidationError);
+  }
+  assert.equal(parseBallotState("reopened"), "reopened");
+  assert.equal(parseProposalState("withdrawn"), "withdrawn");
+  assert.equal(parseEventState("cancelled"), "cancelled");
+  let ballot = transitionBallot("draft", "open");
+  ballot = transitionBallot(ballot, "closed");
+  ballot = transitionBallot(ballot, "reopened");
+  ballot = transitionBallot(ballot, "closed");
+  assert.equal(transitionBallot(ballot, "final"), "final");
+  assert.throws(() => transitionBallot("unknown" as never, "open"), /invalid ballot transition/);
+  assert.throws(() => transitionEvent("unknown" as never, "draft"), /invalid event transition/);
+  assert.throws(() => transitionProposal("unknown" as never, "submitted"), /invalid proposal transition/);
+  assert.throws(() => transitionEvent("archived", "published"), /invalid event transition/);
+  assert.throws(() => transitionProposal("withdrawn", "submitted"), /invalid proposal transition/);
+});
+
+for (const [label, overrides, expected] of [
+  ["unknown schema", { schemaVersion: 2 }, /schema version/],
+  ["unknown scope", { scope: "global" }, /scope/],
+  ["missing event", { eventId: undefined }, /require eventId/],
+  ["fractional revision", { expectedRevision: 0.5 }, /non-negative/],
+  ["string revision", { expectedRevision: "0" }, /non-negative/],
+  ["invalid issuance", { issuedAt: "invalid" }, /expiry/],
+  ["invalid expiry", { expiresAt: "invalid" }, /expiry/],
+  ["equal dates", { expiresAt: "2030-01-01T12:00:00.000Z" }, /expiry/],
+  ["excessive lifetime", { expiresAt: "2030-01-02T12:00:00.001Z" }, /maximum/],
+] as const) {
+  test(`command rejects ${label} before SQLite can write state`, async () => {
+    await withKernel(kernel => {
+      const invalid = command(overrides);
+      assert.throws(() => parseCommandEnvelope(invalid), expected);
+      assert.throws(() => kernel.replaceBallot(invalid, [IDS.songA], new Date("2030-01-01T12:01:00Z")), error => error instanceof Error && "code" in error && error.code === "invalid-command");
+      for (const table of ["ballot_versions", "audit_events", "idempotency_receipts"]) assert.equal(kernel.count(table), 0);
+    });
+  });
+}
+
+test("community envelopes omit event scope and maximum command lifetime is inclusive", () => {
+  const parsed = parseCommandEnvelope(command({ scope: "community", eventId: undefined, expiresAt: "2030-01-02T12:00:00.000Z" }));
+  assert.equal(parsed.scope, "community");
+  assert.equal(parsed.eventId, undefined);
+  assert.equal(parsed.expiresAt, "2030-01-02T12:00:00.000Z");
+  for (const field of ["aggregateType", "aggregateId", "actorId", "capability", "operationId", "issuedAt", "expiresAt"]) {
+    assert.throws(() => parseCommandEnvelope(command({ [field]: " " })), /non-empty/);
+  }
+});
+
+test("kernel accepts the issuance and expiry instants and rejects one millisecond outside", async () => {
+  await withKernel(kernel => {
+    assert.equal(kernel.latestBallotCreatedAt(), undefined);
+    assert.throws(() => kernel.replaceBallot(command(), [IDS.songA], new Date("2030-01-01T11:59:59.999Z")), /not yet valid/);
+    const first = kernel.replaceBallot(command(), [], new Date("2030-01-01T12:00:00.000Z"));
+    assert.deepEqual(first, { method: "ranked-choice", revision: 1, rankings: [] });
+    const second = command({ operationId: "operation_boundary_two", expectedRevision: 1 });
+    assert.equal(kernel.replaceBallot(second, [IDS.songA], new Date("2030-01-01T12:10:00.000Z")).revision, 2);
+    assert.throws(() => kernel.replaceBallot(command({ operationId: "operation_late", expectedRevision: 2 }), [IDS.songA], new Date("2030-01-01T12:10:00.001Z")), /expired/);
+    assert.equal(kernel.latestBallotCreatedAt(), "2030-01-01T12:10:00.000Z");
+    assert.deepEqual(kernel.invariantViolations(), []);
+    assert.throws(() => kernel.count("ballots; DROP TABLE communities"), /unsupported count target/);
+    assert.equal(kernel.count("communities"), 2);
+  });
+});
+
+test("SQLite migration checksum failure preserves data and migration execution failure rolls back", async () => {
+  await withKernel(kernel => {
+    const row = kernel.database.prepare("SELECT name, checksum FROM schema_migrations ORDER BY name LIMIT 1").get() as { name: string; checksum: string };
+    kernel.database.prepare("UPDATE schema_migrations SET checksum='wrong' WHERE name=?").run(row.name);
+    assert.throws(() => kernel.migrate(), /checksum mismatch/);
+    assert.equal(kernel.count("communities"), 2);
+    kernel.database.prepare("UPDATE schema_migrations SET checksum=? WHERE name=?").run(row.checksum, row.name);
+    kernel.migrate();
+  });
+  const kernel = new SqliteKernel();
+  try {
+    kernel.database.exec("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL) STRICT");
+    kernel.database.exec("CREATE TRIGGER fail_migration BEFORE INSERT ON schema_migrations BEGIN SELECT RAISE(ABORT, 'synthetic ledger failure'); END");
+    assert.throws(() => kernel.migrate(), /synthetic ledger failure/);
+    assert.equal(kernel.count("schema_migrations"), 0);
+    assert.equal(kernel.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='communities'").get(), undefined);
+    kernel.database.exec("DROP TRIGGER fail_migration");
+    kernel.migrate();
+    kernel.seedSyntheticFirstLoop(IDS);
+    assert.equal(kernel.replaceBallot(command(), [IDS.songA], new Date("2030-01-01T12:01:00Z")).revision, 1);
+  } finally { kernel.close(); }
+});
+
+
+test("foundation verifier accepts the real synthetic fixture", () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/verify-foundation.mjs", import.meta.url))], { encoding: "utf8", timeout: 5_000 });
+  if (result.stderr) process.stderr.write(result.stderr);
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Foundation build verification passed/);
+});
+
+for (const [name, fixture] of [
+  ["non-synthetic community", { communityId: "community_invalid", events: [{ visibility: "public" }], organizer: { email: "person@example.com" } }],
+  ["non-public event", { communityId: "community_example_test", events: [{ visibility: "unlisted" }], organizer: { email: "person@example.com" } }],
+  ["unexpected organizer", { communityId: "community_example_test", events: [{ visibility: "public" }], organizer: { email: "other@example.com" } }],
+] as const) test(`foundation verifier rejects ${name}`, async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "woodshed-foundation-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await mkdir(path.join(directory, "test/fixtures/synthetic"), { recursive: true });
+  await writeFile(path.join(directory, "test/fixtures/synthetic/community.json"), JSON.stringify(fixture));
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/verify-foundation.mjs", import.meta.url))], { cwd: directory, encoding: "utf8", timeout: 5_000 });
+  if (result.stderr) process.stderr.write(result.stderr);
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /AssertionError/);
+  assert.doesNotMatch(result.stdout, /verification passed/);
 });

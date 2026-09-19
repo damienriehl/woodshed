@@ -305,3 +305,22 @@ test("Windows teardown reports incomplete descendant cleanup when both tree kill
   assert.deepEqual(signals, ["SIGTERM"]);
   assert.match(failures[0], /descendants may still be running/i);
 });
+
+test("launcher settlement cancels its sole grace timer and permits later cleanup", () => {
+  const timers = [], cancelled = [], signals = [];
+  const controller = createTeardownController({ children: [{ pid: 1 }], terminate: (_child, signal) => signals.push(signal), setTimer: callback => { const timer = { callback, unref() {} }; timers.push(timer); return timer; }, clearTimer: timer => cancelled.push(timer), exit: () => assert.fail("cancelled timer must not exit") });
+  assert.equal(controller.requestedSignal, null);
+  assert.equal(controller.requestedExitCode, null);
+  controller.settled();
+  assert.deepEqual(cancelled, []);
+  controller.stop("SIGINT");
+  controller.stop("SIGTERM");
+  assert.equal(timers.length, 1);
+  controller.settled();
+  assert.deepEqual(cancelled, [timers[0]]);
+  controller.stop();
+  assert.equal(timers.length, 2);
+  controller.settled();
+  assert.deepEqual(signals, ["SIGINT", "SIGTERM", "SIGTERM"]);
+  assert.equal(signalExitCode("UNKNOWN"), 1);
+});

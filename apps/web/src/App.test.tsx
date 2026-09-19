@@ -1,9 +1,16 @@
+import { createRequire } from "node:module";
+import type { createApi as CreateApiType } from "../../api-node/src/app.ts";
+import type { ChoiceService as ChoiceServiceType } from "../../../packages/application/src/choice-service.ts";
+// Native loading preserves migration file URLs and shares ChoiceError identity with the server.
+const nativeRequire = createRequire(`${process.cwd()}/package.json`);
+const { createApi } = nativeRequire("../api-node/src/app.ts") as { createApi: typeof CreateApiType };
+const { ChoiceService } = nativeRequire("../../packages/application/src/choice-service.ts") as { ChoiceService: typeof ChoiceServiceType };
 import "@testing-library/jest-dom/vitest";
 import { act,render,screen,waitFor } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 import { describe,expect,it,vi } from "vitest";
 import { App, LiveWorkspace, ProposalForm, RankedBallot, RehearsalWorkspace } from "./App.tsx";
-import { ApiError, type WoodshedApi } from "./api.ts";
+import { ApiError, createWoodshedApi, type WoodshedApi } from "./api.ts";
 
 function connectedApi(overrides: Partial<WoodshedApi> = {}): WoodshedApi {
   return {
@@ -56,4 +63,208 @@ describe("live stage-lead accessibility",()=>{
 
 describe("rehearsal coordination accessibility",()=>{
   it("keeps selected arrangement context obvious and supports assignment/readiness workflow by keyboard",async()=>{const user=userEvent.setup();render(<RehearsalWorkspace/>);const second=screen.getByRole("button",{name:/Open Road arrangement/});await user.tab();while(document.activeElement!==second)await user.tab();await user.keyboard("{Enter}");expect(screen.getByRole("heading",{name:"Open Road"})).toBeVisible();expect(screen.getByText("Selected arrangement")).toBeVisible();await user.click(screen.getByRole("button",{name:"Offer lead vocal to Avery"}));expect(screen.getByRole("status")).toHaveTextContent("Offer sent to Avery");expect(screen.getByRole("button",{name:"Mark lead vocal rehearsal-ready"})).toBeEnabled();});
+});
+
+
+describe("participant interface with real persistence", () => {
+  it("joins, saves a reordered ballot, proposes a song, and reloads the saved order from SQLite", async () => {
+    const service = new ChoiceService(":memory:");
+    service.migrate();
+    service.seedDemo({ publicParticipationPolicy: "open" });
+    const origin = "https://woodshed.example";
+    const server = createApi(service, { origin });
+    const cookies = new Map<string, string>();
+    const api = createWoodshedApi(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      headers.set("origin", origin);
+      headers.set("cookie", [...cookies].map(([key, value]) => `${key}=${value}`).join("; "));
+      // jsdom signals cannot cross into Node's native Request constructor.
+      const response = await server.request(String(input), { ...init, headers, signal: undefined });
+      for (const cookie of response.headers.getSetCookie()) {
+        const pair = cookie.split(";", 1)[0]!;
+        const split = pair.indexOf("=");
+        cookies.set(pair.slice(0, split), pair.slice(split + 1));
+      }
+      return response;
+    });
+    const user = userEvent.setup();
+    let view = render(<App api={api}/>);
+    try {
+      await screen.findByText("Open public participation");
+      const before = await api.ballot("event_public");
+      const firstTitle = before.candidates[0]!.title;
+      await user.click(screen.getByRole("button", { name: `Move ${firstTitle} down` }));
+      await user.click(screen.getByRole("button", { name: "Save ranked ballot" }));
+      expect(await screen.findByText("Ballot saved · revision 1")).toBeVisible();
+      const savedOrder = before.candidates.map(candidate => candidate.id).reverse();
+      expect(service.database.prepare("SELECT current_revision, rankings_json FROM participant_ballots").get()).toMatchObject({ current_revision: 1, rankings_json: JSON.stringify(savedOrder) });
+      await user.type(screen.getByRole("textbox", { name: "Song title" }), "  Lantern Song  ");
+      await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+      expect(await screen.findByText("Lantern Song accepted by this event’s immediate proposal policy.")).toBeVisible();
+      expect(service.database.prepare("SELECT title, state FROM choice_proposals").get()).toMatchObject({ title: "Lantern Song", state: "eligible" });
+      view.unmount();
+      view = render(<App api={api}/>);
+      expect(await screen.findByText("Saved · revision 1")).toBeVisible();
+      expect(screen.getAllByRole("button", { name: /^Move .+ down$/ }).map(button => button.getAttribute("aria-label"))).toEqual(before.candidates.toReversed().map(candidate => `Move ${candidate.title} down`));
+      expect((await api.ballot("event_public")).candidates.map(candidate => candidate.id)).toEqual(savedOrder);
+      expect(service.database.prepare("SELECT count(*) AS count FROM guest_participations").get()).toMatchObject({ count: 1 });
+    } finally { view.unmount(); service.close(); }
+  });
+});
+
+describe("participant interface edge and error states", () => {
+  it("requires an invite after both authentication and recovery fail without joining publicly", async () => {
+    const joinOpen = vi.fn();
+    render(<App api={connectedApi({ discover: async () => ({ events: [{ id: "event_invited", name: "Invite only", state: "voting", visibility: "unlisted", participationPolicy: "invite" }] }), ballot: async () => { throw new ApiError(401, "unauthorized"); }, joinOpen })}/>);
+    expect(await screen.findByText("Open this event through an organizer-provided invite link.")).toBeVisible();
+    expect(joinOpen).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Save ranked ballot" })).not.toBeInTheDocument();
+  });
+
+  it("reports recovery infrastructure failures without minting a new public identity", async () => {
+    const joinOpen = vi.fn();
+    render(<App api={connectedApi({ ballot: async () => { throw new ApiError(401, "unauthorized"); }, recover: async () => { throw new ApiError(500, "internal-error"); }, joinOpen })}/>);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Participant services are unavailable");
+    expect(joinOpen).not.toHaveBeenCalled();
+  });
+
+  it("closes voting when recovery reports a lifecycle change", async () => {
+    const joinOpen = vi.fn();
+    render(<App api={connectedApi({ ballot: async () => { throw new ApiError(401, "unauthorized"); }, recover: async () => { throw new ApiError(409, "voting-closed"); }, joinOpen })}/>);
+    expect(await screen.findByText("Voting is closed")).toBeVisible();
+    expect(joinOpen).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("retains the displayed ballot and explains a failed conflict reconciliation", async () => {
+    let reads = 0;
+    render(<App api={connectedApi({ ballot: async () => { if (reads++ > 0) throw new Error("offline"); return { method: "ranked-choice", revision: 2, candidates: [{ id: "song_alpha", title: "North Star" }] }; }, saveBallot: async () => { throw new ApiError(409, "conflict"); } })}/>);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Save ranked ballot" }));
+    expect(await screen.findByText("Ballot changed elsewhere · refresh needed")).toBeVisible();
+    expect(screen.getByText("Another tab changed this ballot, but the latest ballot could not be loaded. Refresh before saving again.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /North Star Eligible/ })).toBeVisible();
+  });
+
+  it("deduplicates public and active discoveries by event id", async () => {
+    const base = connectedApi();
+    render(<App api={connectedApi({ activeEvents: base.discover })}/>);
+    await screen.findByText("Open public participation");
+    expect(screen.getAllByRole("option", { name: "Summer Singalong" })).toHaveLength(1);
+  });
+
+  it.each([401, 403, 404])("falls back to public discovery when a direct event link returns %s", async status => {
+    window.history.pushState({}, "", "/events/event_missing");
+    try {
+      render(<App api={connectedApi({ eventContext: async () => { throw new ApiError(status, "unavailable"); } })}/>);
+      expect(await screen.findByText("Open public participation")).toBeVisible();
+      expect(screen.getByRole("heading", { name: "Summer Singalong" })).toBeVisible();
+    } finally { window.history.pushState({}, "", "/"); }
+  });
+
+  it("surfaces direct-link infrastructure failure", async () => {
+    window.history.pushState({}, "", "/events/event_missing");
+    try {
+      render(<App api={connectedApi({ eventContext: async () => { throw new ApiError(500, "internal-error"); } })}/>);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Participant services are unavailable");
+    } finally { window.history.pushState({}, "", "/"); }
+  });
+
+  it("rejects whitespace-only proposals and generates a new operation after editing a failed title", async () => {
+    const submit = vi.fn().mockRejectedValue(new Error("offline"));
+    const user = userEvent.setup();
+    render(<ProposalForm onSubmit={submit}/>);
+    const input = screen.getByRole("textbox", { name: "Song title" });
+    await user.type(input, "   ");
+    await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+    expect(submit).not.toHaveBeenCalled();
+    await user.type(input, "First Song  ");
+    await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+    await screen.findByText("Proposal was not sent. Please try again.");
+    await user.clear(input);
+    await user.type(input, "Second Song");
+    await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+    expect(submit.mock.calls[0]?.[0]).toBe("First Song");
+    expect(submit.mock.calls[1]?.[1]).not.toBe(submit.mock.calls[0]?.[1]);
+  });
+
+  it("saves an empty eligible-song list without manufacturing candidates", async () => {
+    const save = vi.fn().mockResolvedValue(1);
+    const user = userEvent.setup();
+    render(<RankedBallot initial={[]} revision={0} onSave={save}/>);
+    expect(screen.queryByRole("group", { name: /Move/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save ranked ballot" }));
+    expect(await screen.findByText("Ballot saved · revision 1")).toBeVisible();
+    expect(save).toHaveBeenCalledWith([], 0, expect.stringMatching(/^ballot_/));
+  });
+});
+
+
+describe("proposal and demo action boundaries", () => {
+  it("disables proposal editing and duplicate submits until the request settles", async () => {
+    let resolve: ((value: "eligible") => void) | undefined;
+    const submit = vi.fn(() => new Promise<"eligible">(done => { resolve = done; }));
+    const user = userEvent.setup();
+    render(<ProposalForm onSubmit={submit}/>);
+    const input = screen.getByRole("textbox", { name: "Song title" });
+    await user.type(input, "Lantern Song");
+    await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+    expect(input).toBeDisabled();
+    const sending = screen.getByRole("button", { name: "Sending…" });
+    expect(sending).toBeDisabled();
+    await user.click(sending);
+    expect(submit).toHaveBeenCalledTimes(1);
+    await act(async () => resolve?.("eligible"));
+    expect(await screen.findByText("Lantern Song accepted by this event’s immediate proposal policy.")).toBeVisible();
+    expect(input).toBeEnabled();
+    expect(input).toHaveValue("");
+  });
+
+  it("allocates a new ballot operation when rankings change after an ambiguous failure", async () => {
+    const save = vi.fn().mockRejectedValueOnce(new Error("response lost")).mockResolvedValueOnce(1);
+    const user = userEvent.setup();
+    render(<RankedBallot onSave={save}/>);
+    await user.click(screen.getByRole("button", { name: "Save ranked ballot" }));
+    await screen.findByText("Save failed · try again");
+    await user.click(screen.getByRole("button", { name: "Move North Star down" }));
+    await user.click(screen.getByRole("button", { name: "Save ranked ballot" }));
+    await screen.findByText("Ballot saved · revision 1");
+    expect(save.mock.calls[1]?.[0]).toEqual(["song_bravo", "song_alpha", "song_charlie"]);
+    expect(save.mock.calls[1]?.[2]).not.toBe(save.mock.calls[0]?.[2]);
+  });
+
+  it("announces a simulated proposal and clears its input", async () => {
+    const user = userEvent.setup();
+    render(<ProposalForm/>);
+    const input = screen.getByRole("textbox", { name: "Song title" });
+    await user.type(input, "Demo Song");
+    await user.click(screen.getByRole("button", { name: "Send for consideration" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Demo Song submission simulated. Nothing was queued or sent.");
+    expect(input).toHaveValue("");
+  });
+
+  it("cancels a simulated handoff and keeps device clearing explicitly synthetic", async () => {
+    const user = userEvent.setup();
+    render(<LiveWorkspace/>);
+    await user.click(screen.getByRole("button", { name: "Hand off stage lead" }));
+    expect(screen.getByText("Simulated handoff pending")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Handoff simulation opened; no server request was sent");
+    await user.click(screen.getByRole("button", { name: "Cancel handoff" }));
+    expect(screen.queryByText("Simulated handoff pending")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Handoff simulation cancelled");
+    await user.click(screen.getByRole("button", { name: "Clear this device" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Clear-device action simulated; no persistent event data exists");
+  });
+
+  it("resets arrangement-specific offer controls after changing the selected arrangement", async () => {
+    const user = userEvent.setup();
+    render(<RehearsalWorkspace/>);
+    await user.click(screen.getByRole("button", { name: "Offer lead vocal to Avery" }));
+    await user.click(screen.getByRole("button", { name: "Mark lead vocal rehearsal-ready" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Lead vocal marked rehearsal-ready");
+    await user.click(screen.getByRole("button", { name: "Open Road arrangement" }));
+    expect(screen.getByRole("button", { name: "Offer lead vocal to Avery" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Mark lead vocal rehearsal-ready" })).not.toBeInTheDocument();
+  });
 });
