@@ -95,6 +95,100 @@ describe("Cloudflare Worker runtime", () => {
     }
   });
 
+  it("returns private JSON errors for unsupported routes and methods", async () => {
+    const fixture = await runtime();
+    try {
+      for (const [pathname, method] of [["/api/missing", "GET"], ["/api/discovery", "POST"], ["/api/events/event_public/join-open", "GET"], ["/api/events/event_public/ballot", "DELETE"]] as const) {
+        const response = await fixture.fetch(pathname, { method, headers: fixture.authHeaders(true) });
+        assert.equal(response.status, 404, `${method} ${pathname}`);
+        assert.deepEqual(await response.json(), { error: "not-found" });
+        assert.equal(response.headers.get("cache-control"), "private, no-store");
+        assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      }
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM ballots").first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("rejects malformed bodies and failed mutation guards without creating participation", async () => {
+    const fixture = await runtime();
+    try {
+      for (const body of ["{", "null", "[]", "false"]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: fixture.mutationHeaders(), body });
+        assert.equal(response.status, 400);
+        assert.deepEqual(await response.json(), { error: "invalid-command" });
+      }
+      for (const operationId of [undefined, "", 42]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId }) });
+        assert.equal(response.status, 400);
+        assert.deepEqual(await response.json(), { error: "invalid-request" });
+      }
+      for (const overrides of [{ origin: "https://other.example" }, { "x-csrf-token": "wrong" }]) {
+        const response = await fixture.fetch("/api/events/event_public/join-open", { method: "POST", headers: { ...fixture.mutationHeaders(), ...overrides }, body: JSON.stringify({ operationId: "guarded_join" }) });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM guest_participations").first<{ count: number }>())?.count, 1);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM open_join_receipts").first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("ignores malformed cookies and gives a supplied bearer credential precedence", async () => {
+    const fixture = await runtime();
+    try {
+      const cookieName = `woodshed_session_${createHash("sha256").update("event_public").digest("hex").slice(0, 16)}`;
+      const malformed = `no-equals; =value; empty=; ${cookieName}=%E0%A4%A`;
+      const rejected = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: malformed } });
+      assert.equal(rejected.status, 401);
+      assert.deepEqual(await rejected.json(), { error: "unauthorized" });
+      const accepted = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: `${malformed}; ${cookieName}=${encodeURIComponent(sessionToken)}`, authorization: "Basic ignored" } });
+      assert.equal(accepted.status, 200);
+      assert.equal((await accepted.json() as { event: { id: string } }).event.id, "event_public");
+      const invalidBearer = await fixture.fetch("/api/events/event_public/context", { headers: { cookie: `${cookieName}=${sessionToken}`, authorization: "Bearer unknown-session" } });
+      assert.equal(invalidBearer.status, 401);
+    } finally { await fixture.close(); }
+  });
+
+  it("enforces persisted roles and live command identity before any operation is saved", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.prepare("UPDATE participant_sessions SET role='observer' WHERE id_hash=?").bind(sessionHash).run();
+      for (const [pathname, method] of [["/ballot", "GET"], ["/proposals", "POST"], ["/live/authority/acquire", "POST"], ["/live/commands", "POST"]] as const) {
+        const response = await fixture.fetch(`/api/events/event_public${pathname}`, { method, headers: fixture.authHeaders(true), ...(method === "POST" ? { body: "{}" } : {}) });
+        assert.equal(response.status, 403, pathname);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      await fixture.DB.prepare("UPDATE participant_sessions SET role='community-admin' WHERE id_hash=?").bind(sessionHash).run();
+      for (const overrides of [{ eventId: "event_other" }, { communityId: "community_other" }, { actorId: "another-participant" }]) {
+        const response = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand(overrides)) });
+        assert.equal(response.status, 403);
+        assert.deepEqual(await response.json(), { error: "denied" });
+      }
+      const noAuthority = await fixture.fetch("/api/events/event_public/live/commands", { method: "POST", headers: fixture.authHeaders(true), body: JSON.stringify(await signedCommand()) });
+      assert.equal(noAuthority.status, 409);
+      assert.deepEqual(await noAuthority.json(), { error: "superseded-authority" });
+      for (const table of ["ballots", "choice_proposals", "live_operation_receipts"])
+        assert.equal((await fixture.DB.prepare(`SELECT count(*) count FROM ${table}`).first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("redacts a real D1 write failure and allows a clean retry after rollback", async () => {
+    const fixture = await runtime();
+    try {
+      await fixture.DB.exec("CREATE TRIGGER fail_http_join BEFORE INSERT ON open_join_receipts BEGIN SELECT RAISE(ABORT, 'private database diagnostic'); END;");
+      const request = { method: "POST", headers: fixture.mutationHeaders(), body: JSON.stringify({ operationId: "http_failure_retry" }) };
+      const failed = await fixture.fetch("/api/events/event_public/join-open", request);
+      assert.equal(failed.status, 500);
+      assert.deepEqual(await failed.json(), { error: "internal-error" });
+      assert.equal(failed.headers.get("set-cookie"), null);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM participant_sessions").first<{ count: number }>())?.count, 1);
+      await fixture.DB.exec("DROP TRIGGER fail_http_join;");
+      const retry = await fixture.fetch("/api/events/event_public/join-open", request);
+      assert.equal(retry.status, 200);
+      const cookie = retry.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+      assert.equal((await fixture.fetch("/api/events/event_public/context", { headers: { cookie } })).status, 200);
+    } finally { await fixture.close(); }
+  });
+
   it("completes the accountless participant first loop with event-scoped sessions", async () => {
     const fixture = await runtime();
     try {
