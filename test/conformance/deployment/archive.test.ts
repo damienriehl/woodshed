@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { generateKeyPairSync } from "node:crypto";
+import { createCipheriv, generateKeyPairSync, randomBytes } from "node:crypto";
+import { canonicalJson } from "../../../packages/contracts/src/snapshot.ts";
 import {
   ArchiveCoordinator, BoundedEncryptedArchiveBuffer, InMemoryArchiveRepository, MemoryArchiveExportAuthorizer, MemoryKeyCustody,
   canonicalManifest, createCommunityArchive, openCommunityArchive,
@@ -227,4 +228,57 @@ test("invalid custody key is destroyed even when payload encryption fails",()=>{
   const invalidKey=Buffer.alloc(31,9),custody=new MemoryKeyCustody();let destroyed=false;
   assert.throws(()=>createCommunityArchive(payload,{recipientPublicKey:keys.publicKey,keyCustody:{generateDataKey:()=>invalidKey,destroyDataKey:key=>{destroyed=true;custody.destroyDataKey(key)}},now}),/key length/i);
   assert.equal(destroyed,true);assert.deepEqual(invalidKey,Buffer.alloc(31));
+});
+
+
+// Model a faulty exporter: encryption authenticates successfully, but the
+// decrypted document still needs structural and envelope consistency checks.
+function authenticatedArchivePayload(encode: (value: CommunityArchive) => string) {
+  const value = openCommunityArchive(archive(), { recipientPrivateKey: keys.privateKey, expectedDestinationCommunityId: "community_destination", now });
+  let retainedKey: Buffer | undefined;
+  const envelope = createCommunityArchive(value, {
+    recipientPublicKey: keys.publicKey, now,
+    keyCustody: {
+      generateDataKey() { const key = randomBytes(32); retainedKey = Buffer.from(key); return key; },
+      destroyDataKey(key) { key.fill(0); },
+    },
+  });
+  try {
+    const { envelopeVersion, profile, schemaVersion, archiveId, sourceCommunityId, destinationCommunityId, createdAt, expiresAt, recipientKeyId } = envelope;
+    const payloadIv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", retainedKey!, payloadIv);
+    cipher.setAAD(Buffer.from(canonicalJson({ envelopeVersion, profile, schemaVersion, archiveId, sourceCommunityId, destinationCommunityId, createdAt, expiresAt, recipientKeyId })));
+    const ciphertext = Buffer.concat([cipher.update(encode(value), "utf8"), cipher.final()]);
+    return { ...envelope, payloadIv: payloadIv.toString("base64"), ciphertext: ciphertext.toString("base64"), payloadTag: cipher.getAuthTag().toString("base64") };
+  } finally { retainedKey?.fill(0); }
+}
+
+test("authenticated archive payload passes decryption, validation, staging and activation", () => {
+  const envelope = authenticatedArchivePayload(value => canonicalJson({ ...value, records: [...value.records, { type: "event", id: "event_verified", parentId: "community_source", tombstone: false, consentScope: "community", attributes: { name: "Synthetic verified event" } }] }));
+  const opened = openCommunityArchive(envelope, { recipientPrivateKey: keys.privateKey, expectedDestinationCommunityId: "community_destination", now });
+  const repository = new InMemoryArchiveRepository();
+  const coordinator = new ArchiveCoordinator(repository);
+  coordinator.stageImport(opened);
+  coordinator.commitImport(opened.archiveId);
+  assert.equal(repository.active.get("community_destination")?.manifest.counts.event, 2);
+});
+
+for (const [field, replacement] of [
+  ["archiveId", "archive_other"],
+  ["sourceCommunityId", "community_other"],
+  ["destinationCommunityId", "community_other"],
+  ["createdAt", "2026-08-09T10:00:00Z"],
+  ["expiresAt", "2026-08-09T14:00:00Z"],
+] as const) test(`authenticated payload cannot disagree with envelope ${field}`, () => {
+  const envelope = authenticatedArchivePayload(value => canonicalJson({ ...value, [field]: replacement }));
+  assert.throws(() => openCommunityArchive(envelope, { recipientPrivateKey: keys.privateKey, expectedDestinationCommunityId: "community_destination", now }), /archive envelope payload metadata mismatch/);
+});
+
+for (const [name, encode, expected] of [
+  ["malformed JSON", () => "{", SyntaxError],
+  ["unsupported schema", (value: CommunityArchive) => canonicalJson({ ...value, schemaVersion: 2 }), /unsupported archive schema/],
+  ["broken relationship", (value: CommunityArchive) => canonicalJson({ ...value, records: [{ ...value.records[0], parentId: "missing_parent" }] }), /missing archive relationship/],
+] as const) test(`authenticated payload rejects ${name} after successful decryption`, () => {
+  const envelope = authenticatedArchivePayload(encode);
+  assert.throws(() => openCommunityArchive(envelope, { recipientPrivateKey: keys.privateKey, expectedDestinationCommunityId: "community_destination", now }), expected);
 });
