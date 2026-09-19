@@ -306,3 +306,130 @@ test("final evidence reduces exact teardown identities to domain counts and refu
   assert.throws(() => createFinalEvidencePacket({ ...input, absence: { ...input.absence, [`hostname:${privateResourceId}`]: undefined } }), /complete absence/);
   assert.throws(() => createFinalEvidencePacket({ ...input, rollback: { ...input.rollback, wholeStackRollback: true } }), /must not be claimed/);
 });
+
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+test("staging step reconciles existing ownership and stops foreign or uncertain mutations", async () => {
+  const state = { exists: true, id: "owned" };
+  const result = await executeStep({ inspect: async () => state, owns: value => value.id === "owned", mutate: async () => assert.fail("existing state must not mutate") });
+  assert.deepEqual(result, { reconciled: true, state });
+  await assert.rejects(executeStep({ inspect: async () => state, owns: () => false, mutate: async () => assert.fail("foreign state must not mutate") }), /not owned/);
+  const failure = new Error("synthetic response loss");
+  for (const after of [undefined, { exists: false }, { exists: true, id: "foreign" }]) {
+    let inspections = 0, mutations = 0;
+    await assert.rejects(executeStep({ inspect: async () => (++inspections === 1 ? undefined : after) as { exists: boolean; id?: string }, owns: value => value.id === "owned", mutate: async () => { mutations++; throw failure; } }), error => error instanceof Error && /no retry authorized/.test(error.message) && error.cause === failure);
+    assert.equal(inspections, 2);
+    assert.equal(mutations, 1);
+  }
+});
+
+test("staging step executes a real file mutation once and reconciles its persisted result", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-step-chain-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, "resource.json");
+  const inspect = async () => {
+    try { return { ...JSON.parse(await readFile(file, "utf8")), exists: true }; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false }; throw error; }
+  };
+  const step = { inspect, owns: (value: { exists: boolean; id?: string }) => value.id === "run-a", mutate: async () => { await writeFile(file, JSON.stringify({ id: "run-a" }), { flag: "wx" }); return inspect(); } };
+  const first = await executeStep(step);
+  assert.equal(first.reconciled, false);
+  const second = await executeStep(step);
+  assert.equal(second.reconciled, true);
+  assert.deepEqual(second.state, first.state);
+});
+
+test("staging plan and preflight never mutate; apply and verify forward only authorized operations", async () => {
+  for (const operation of ["plan", "preflight"]) {
+    assert.deepEqual(await runStagingOperation({ operation, inventory: identity, boundaries: { mutate: async () => assert.fail("read-only operation") } }), { operation, mutationCount: 0 });
+  }
+  for (const operation of ["apply", "verify"]) {
+    const base = { operation, inventory: identity, runId: "run-a", owner: "owner-a", lease: { active: true, runId: "run-a", owner: "owner-a" }, expectedIdentity: identity, remoteIdentity: identity };
+    assert.deepEqual(await runStagingOperation({ ...base, boundaries: { mutate: async (request: { operation: string }) => request } }), { operation });
+    await assert.rejects(runStagingOperation({ ...base, remoteIdentity: undefined }), /identity changed/);
+    await assert.rejects(runStagingOperation({ ...base, expectedIdentity: undefined }), /identity changed/);
+  }
+  await assert.rejects(runStagingOperation({ operation: "unknown" }), /unknown staging operation/);
+  await assert.rejects(runStagingOperation({ operation: "status" }), /journal path is required/);
+});
+
+test("staging teardown binds a real persisted journal to active ownership and complete remote identity", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-runner-chain-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const journalPath = path.join(directory, "journal.json");
+  const journal = createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity });
+  journal.phase = "quarantined";
+  await saveJournal(journalPath, journal);
+  const base = { operation: "teardown", journalPath, runId: "run-a", owner: "owner-a", lease: { active: true, runId: "run-a", owner: "owner-a" } };
+  for (const lease of [undefined, { ...base.lease, active: false }, { ...base.lease, runId: "foreign" }, { ...base.lease, owner: "foreign" }]) {
+    await assert.rejects(runStagingOperation({ ...base, lease }), /ownership lease/);
+  }
+  for (const field of Object.keys(identity)) {
+    await assert.rejects(runStagingOperation({ ...base, boundaries: { inspect: async () => ({ ...identity, [field]: "changed" }), mutate: async () => assert.fail("must not mutate drifted identity") } }), /identity changed/);
+  }
+  await assert.rejects(runStagingOperation(base), /identity changed/);
+  const result = await runStagingOperation({ ...base, boundaries: { inspect: async () => identity, mutate: async ({ journal: owned }: { journal: ReturnType<typeof createJournal> }) => {
+    owned.phase = "cleanup-complete";
+    await saveJournal(journalPath, owned);
+    return { removed: true };
+  } } });
+  assert.deepEqual(result, { removed: true });
+  assert.equal((await runStagingOperation({ operation: "status", journalPath })).phase, "cleanup-complete");
+});
+
+test("staging status CLI reads a real journal and reports invalid invocations without external commands", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-status-cli-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const journalPath = path.join(directory, "journal.json");
+  await saveJournal(journalPath, createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity }));
+  const run = (args: string[]) => {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../../tools/cloudflare-staging.mjs", import.meta.url)), ...args], { encoding: "utf8" });
+    if (result.stderr) process.stderr.write(result.stderr);
+    return result;
+  };
+  const status = run(["status", journalPath]);
+  assert.equal(status.status, 0);
+  assert.deepEqual(JSON.parse(status.stdout), { runId: "run-a", phase: "pre-write" });
+  for (const args of [[], ["apply"], ["status"], ["status", path.join(directory, "missing.json")]]) {
+    const failed = run(args);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /usage:|journal path is required|unreadable or corrupt/);
+  }
+});
+
+for (const [label, patch, expected] of [
+  ["blank run", { runId: " " }, /runId/],
+  ["missing source", { sourceSha: "" }, /sourceSha/],
+  ["short source", { sourceSha: "abc" }, /sourceSha/],
+  ["missing phase", { phase: "" }, /phase/],
+  ["array outcomes", { outcomes: [] }, /outcomes must be an object/],
+  ["array security", { outcomes: { security: [] } }, /security must be an object/],
+  ["unknown security field", { outcomes: { security: { extra: true } } }, /unknown field/],
+  ["nonboolean security", { outcomes: { security: { missingCsrf: 1 } } }, /must be boolean/],
+  ["array counts", { counts: [] }, /counts must be an object/],
+  ["unknown count", { counts: { extra: 1 } }, /unknown field/],
+  ["fractional count", { counts: { liveEntries: 1.5 } }, /safe integer/],
+  ["unsafe count", { counts: { liveEntries: Number.MAX_SAFE_INTEGER + 1 } }, /safe integer/],
+  ["array ids", { ids: [] }, /ids must be an object/],
+  ["blank id", { ids: { deploymentId: " " } }, /non-empty string/],
+] as const) {
+  test(`shareable evidence rejects ${label}`, () => {
+    assert.throws(() => createEvidenceEnvelope(Object.assign({ runId: "run-a", sourceSha: "a".repeat(40), phase: "verified" }, patch) as Parameters<typeof createEvidenceEnvelope>[0]), expected);
+  });
+}
+
+test("failure evidence recursively redacts arrays and configured values without changing safe values", async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "woodshed-evidence-chain-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const journalPath = path.join(directory, "journal.json");
+  await saveJournal(journalPath, createJournal({ runId: "run-a", owner: "owner-a", sourceSha: "a".repeat(40), identity }));
+  const journal = await loadJournal(journalPath);
+  const evidence = createEvidenceEnvelope({ runId: journal.runId, sourceSha: journal.sourceSha, phase: journal.phase });
+  assert.deepEqual(evidence.counts, {});
+  assert.deepEqual(evidence.outcomes, {});
+  assert.equal(evidence.productionAuthority, false);
+  const input = { values: [null, 0, false, "Bearer synthetic-value", { secret: "synthetic", message: "opaque-value repeated opaque-value" }] };
+  assert.deepEqual(redactEvidence(input, ["", "opaque-value"]), { values: [null, 0, false, "Bearer [REDACTED]", { secret: "[REDACTED]", message: "[REDACTED] repeated [REDACTED]" }] });
+  assert.equal(input.values[3], "Bearer synthetic-value");
+});

@@ -268,3 +268,35 @@ test("operator aggregates thrown probe errors and non-Error recovery failures", 
   assert.deepEqual(result.checks, { service: false, database: false, migrations: false, keyCustody: false, recovery: false });
   assert.deepEqual(result.recovery, ["backup evidence unavailable", "backup artifact evidence missing"]);
 });
+
+test("extension permissions admit public and rights-approved work but never private content", async () => {
+  const host = new ExtensionHost();
+  const extension = { id: "synthetic-extension", permissions: ["theme:read", "content:read", "private:read"] };
+  assert.deepEqual(await host.invoke(extension, "theme:read", {}), { extensionId: extension.id, capability: "theme:read", status: "accepted" });
+  await assert.rejects(host.invoke(extension, "content:read", {}), /rights approval required/);
+  assert.equal((await host.invoke(extension, "content:read", { rightsApproved: true })).status, "accepted");
+  for (const privacyApproved of [undefined, false, true]) {
+    await assert.rejects(host.invoke(extension, "private:read", { rightsApproved: true, privacyApproved }), /private content disabled/);
+  }
+  assert.equal(host.privateContentEnabled, false);
+  await assert.rejects(host.invoke({ id: extension.id, permissions: [] }, "theme:read", { rightsApproved: true, privacyApproved: true }), /capability denied/);
+});
+
+test("provider registry validates scopes, snapshots input and disconnects only its owned connection", async () => {
+  const registry = new ProviderRegistry();
+  assert.equal(registry.get("missing"), undefined);
+  assert.deepEqual(await registry.disconnect("missing"), { revoked: false, deletedDerivedData: 0 });
+  assert.throws(() => registry.connect({ id: "invalid", scopes: [], derivedData: [] }), /scopes required/);
+  assert.equal(registry.get("invalid"), undefined);
+  const connection = { id: "synthetic-one", scopes: ["freebusy"], derivedData: ["cache-one", "cache-two"] };
+  registry.connect(connection);
+  connection.scopes.push("changed");
+  connection.derivedData.length = 0;
+  registry.connect({ id: "synthetic-two", scopes: ["freebusy"], derivedData: [] });
+  assert.deepEqual(registry.get("synthetic-one"), { id: "synthetic-one", scopes: ["freebusy"], derivedData: ["cache-one", "cache-two"] });
+  assert.deepEqual(await registry.disconnect("synthetic-one"), { revoked: true, deletedDerivedData: 2 });
+  assert.equal(registry.get("synthetic-one"), undefined);
+  assert.equal(registry.get("synthetic-two")?.id, "synthetic-two");
+  assert.deepEqual(await registry.disconnect("synthetic-one"), { revoked: false, deletedDerivedData: 0 });
+  assert.deepEqual(await registry.disconnect("synthetic-two"), { revoked: true, deletedDerivedData: 0 });
+});

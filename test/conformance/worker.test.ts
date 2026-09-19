@@ -454,3 +454,116 @@ function sessionLookupFailure(database: D1Database): D1Database {
     },
   });
 }
+
+const runtimeCode = (code: string) => (error: unknown) => error instanceof Error && "code" in error && error.code === code;
+
+describe("D1 participant runtime persistence and validation", () => {
+  it("rejects malformed commands before creating ballots, proposals or receipts", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      for (const value of [null, [], false, "text", {}, { expectedRevision: -1, rankings: [], operationId: "bad" }, { expectedRevision: 0.5, rankings: [], operationId: "bad" }, { expectedRevision: 0, rankings: [1], operationId: "bad" }, { expectedRevision: 0, rankings: [], operationId: "" }]) {
+        await assert.rejects(() => choice.replaceBallot(session, value), runtimeCode("invalid-command"));
+      }
+      for (const value of [null, [], {}, { title: "   ", operationId: "bad" }, { title: 12, operationId: "bad" }, { title: "Song", operationId: "" }]) {
+        await assert.rejects(() => choice.propose(session, value), runtimeCode("invalid-command"));
+      }
+      for (const table of ["ballots", "ballot_versions", "choice_proposals", "proposal_receipts"])
+        assert.equal((await fixture.DB.prepare(`SELECT count(*) count FROM ${table}`).first<{ count: number }>())?.count, 0);
+    } finally { await fixture.close(); }
+  });
+
+  it("enforces event scope and exact session expiration with real persisted credentials", async () => {
+    const fixture = await runtime();
+    try {
+      let now = new Date("2030-01-01T12:01:00Z");
+      const choice = new D1ChoiceRuntime(fixture.DB, () => now);
+      const issued = await choice.joinOpen("event_public", "runtime_expiry");
+      const session = await choice.session(issued.token);
+      await choice.assertEvent(session, "event_public");
+      assert.equal((await choice.eventContext(session)).id, "event_public");
+      await assert.rejects(() => choice.assertEvent(session, "event_other"), runtimeCode("denied"));
+      await assert.rejects(() => choice.assertEvent({ ...session, communityId: "community_other" }, "event_public"), runtimeCode("denied"));
+      await assert.rejects(() => choice.assertEvent({ ...session, eventId: "missing" }, "missing"), runtimeCode("denied"));
+      await assert.rejects(() => choice.eventContext({ ...session, communityId: "community_other" }), runtimeCode("not-found"));
+      await assert.rejects(() => choice.ballot({ ...session, communityId: "community_other" }), runtimeCode("denied"));
+      now = new Date("2030-01-02T12:01:00Z");
+      await assert.rejects(() => choice.session(issued.token), runtimeCode("unauthorized"));
+      await choice.revokeSession("unknown");
+      await choice.revokeSession(issued.token); await choice.revokeSession(issued.token);
+      assert.equal((await fixture.DB.prepare("SELECT revoked_at FROM participant_sessions WHERE participation_id=?").bind(session.participationId).first<{ revoked_at: string }>())?.revoked_at, now.toISOString());
+    } finally { await fixture.close(); }
+  });
+
+  it("validates join eligibility and rolls back an interrupted batch", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB);
+      await assert.rejects(() => choice.joinOpen("event_public", ""), runtimeCode("invalid-request"));
+      await assert.rejects(() => choice.joinOpen("missing", "join_missing"), runtimeCode("not-found"));
+      await fixture.DB.prepare("UPDATE events SET state='draft' WHERE id='event_public'").run();
+      await assert.rejects(() => choice.joinOpen("event_public", "draft_join"), runtimeCode("denied"));
+      await fixture.DB.prepare("UPDATE events SET state='live', participation_policy='invite' WHERE id='event_public'").run();
+      await assert.rejects(() => choice.joinOpen("event_public", "invite_join"), runtimeCode("denied"));
+      await fixture.DB.prepare("UPDATE events SET participation_policy='open' WHERE id='event_public'").run();
+      await fixture.DB.exec("CREATE TRIGGER fail_join BEFORE INSERT ON open_join_receipts BEGIN SELECT RAISE(ABORT, 'join receipt unavailable'); END;");
+      await assert.rejects(() => choice.joinOpen("event_public", "rollback_join"), /join receipt unavailable/);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM guest_participations").first<{ count: number }>())?.count, 1);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM participant_sessions").first<{ count: number }>())?.count, 1);
+      await fixture.DB.exec("DROP TRIGGER fail_join;");
+      const joined = await choice.joinOpen("event_public", "rollback_join");
+      assert.equal((await choice.session(joined.token)).participationId, joined.participationId);
+    } finally { await fixture.close(); }
+  });
+
+  it("normalizes proposal titles, persists immediate eligibility, and rolls back receipt failures", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      await fixture.DB.prepare("UPDATE event_choice_config SET proposal_policy='immediate' WHERE event_id='event_public'").run();
+      await fixture.DB.exec("CREATE TRIGGER fail_proposal BEFORE INSERT ON proposal_receipts BEGIN SELECT RAISE(ABORT, 'proposal receipt unavailable'); END;");
+      await assert.rejects(() => choice.propose(session, { title: "  Song  ", operationId: "normalized" }), /proposal receipt unavailable/);
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 0);
+      await fixture.DB.exec("DROP TRIGGER fail_proposal;");
+      const result = await choice.propose(session, { title: "  Song  ", operationId: "normalized" });
+      assert.equal(result.title, "Song"); assert.equal(result.state, "eligible");
+      assert.deepEqual(await choice.propose(session, { title: "Song", operationId: "normalized" }), result);
+      await fixture.DB.prepare("DELETE FROM event_choice_config WHERE event_id='event_public'").run();
+      await assert.rejects(() => choice.propose(session, { title: "Other", operationId: "missing_config" }), runtimeCode("not-found"));
+      assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 1);
+    } finally { await fixture.close(); }
+  });
+
+  it("drops removed candidates from saved rankings and handles an empty ballot", async () => {
+    const fixture = await runtime();
+    try {
+      const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+      const session = await choice.session(sessionToken);
+      await choice.replaceBallot(session, { expectedRevision: 0, rankings: ["song_bravo", "song_alpha"], operationId: "saved_order" });
+      await fixture.DB.prepare("DELETE FROM event_eligible_songs WHERE event_id='event_public' AND song_id='song_bravo'").run();
+      assert.deepEqual((await choice.ballot(session)).candidates.map(song => song.id), ["song_alpha"]);
+      await fixture.DB.prepare("DELETE FROM event_eligible_songs WHERE event_id='event_public'").run();
+      assert.deepEqual(await choice.ballot(session), { method: "ranked-choice", revision: 1, candidates: [] });
+      await fixture.DB.prepare("UPDATE ballots SET state='closed'").run();
+      await assert.rejects(() => choice.replaceBallot(session, { expectedRevision: 1, rankings: [], operationId: "closed" }), runtimeCode("voting-closed"));
+    } finally { await fixture.close(); }
+  });
+});
+
+it("D1 concurrent proposal retries persist one result and reject divergent reuse", async () => {
+  const fixture = await runtime();
+  try {
+    const choice = new D1ChoiceRuntime(fixture.DB, () => new Date("2030-01-01T12:01:00Z"));
+    const session = await choice.session(sessionToken);
+    const repeated = await Promise.all(Array.from({ length: 4 }, () => choice.propose(session, { title: "Shared song", operationId: "concurrent_exact" })));
+    for (const result of repeated) assert.deepEqual(result, repeated[0]);
+    const divergent = await Promise.allSettled(["First title", "Second title"].map(title => choice.propose(session, { title, operationId: "concurrent_mismatch" })));
+    assert.equal(divergent.filter(result => result.status === "fulfilled").length, 1);
+    const rejected = divergent.find(result => result.status === "rejected");
+    assert.ok(rejected?.status === "rejected" && runtimeCode("replay-mismatch")(rejected.reason));
+    assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM choice_proposals").first<{ count: number }>())?.count, 2);
+    assert.equal((await fixture.DB.prepare("SELECT count(*) count FROM proposal_receipts").first<{ count: number }>())?.count, 2);
+  } finally { await fixture.close(); }
+});
