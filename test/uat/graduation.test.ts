@@ -205,3 +205,38 @@ describe("recommendation edge cohorts and scoring",()=>{
     assert.equal(report.measures.acceptance,1/3);assert.equal(report.gates.overrideBurden,true);assert.equal(report.gates.acceptance,false);assert.equal(report.gates.comprehension,false);
   });
 });
+
+import { spawnSync } from "node:child_process";
+import { rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+it("recommendation CLI validates synthetic input and preserves existing evidence on failed writes", async t => {
+  const root = await mkdtemp(join(tmpdir(), "woodshed-recommendation-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "input.json"), output = join(root, "evidence.json");
+  const payload = { datasetKind: "synthetic", containsPrivateData: false, evidenceTime: "2030-01-01T00:00:00Z", version: "test-v1", config: { demand: 1, feasibility: 1 }, seed: "synthetic", input: [{ id: "song_synthetic", demand: 1, feasibility: null }], organizerTrials: [] };
+  await writeFile(source, JSON.stringify(payload));
+  const run = (args: string[]) => {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/validation/run-recommendation.mjs", import.meta.url)), ...args], { encoding: "utf8" });
+    if (result.stderr) process.stderr.write(result.stderr);
+    return result;
+  };
+  const missing = run([]);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /usage:/);
+  assert.equal(run([source, output]).status, 0);
+  const original = await readFile(output, "utf8");
+  const parsed = JSON.parse(original);
+  assert.equal(parsed.generatedAt, payload.evidenceTime);
+  assert.equal(parsed.datasetKind, "synthetic");
+  assert.equal(parsed.gates.acceptance, false);
+  assert.equal(run([source, output]).status, 1);
+  assert.equal(await readFile(output, "utf8"), original);
+  await writeFile(source, "{malformed");
+  const invalid = run([source, join(root, "invalid.json")]);
+  assert.equal(invalid.status, 1);
+  await assert.rejects(readFile(join(root, "invalid.json")), { code: "ENOENT" });
+  await writeFile(source, JSON.stringify({ ...payload, datasetKind: "unknown" }));
+  assert.equal(run([source, join(root, "refused.json")]).status, 1);
+  await assert.rejects(readFile(join(root, "refused.json")), { code: "ENOENT" });
+});

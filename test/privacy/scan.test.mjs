@@ -218,3 +218,58 @@ test("manifest CLI verifies real files and fails when required paths disappear o
   assert.match(failed.stderr, /unreviewed public path: unreviewed.txt/);
   assert.match(failed.stderr, /manifest path is missing: safe.txt/);
 });
+
+import { readFile } from "node:fs/promises";
+
+function runRelease(root, args) {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/release/verify.mjs", import.meta.url)), ...args], { cwd: root, encoding: "utf8" });
+  if (result.stderr) process.stderr.write(result.stderr);
+  return result;
+}
+
+async function releaseFixture(t) {
+  const root = await fixture({ "safe.txt": "synthetic safe text", "tools/privacy/scan.mjs": await readFile(new URL("../../tools/privacy/scan.mjs", import.meta.url)), "tools/privacy/scanner.mjs": await readFile(new URL("../../tools/privacy/scanner.mjs", import.meta.url)) });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  localGit(root, ["init", "--quiet"]);
+  localGit(root, ["add", "safe.txt", "tools/privacy/scan.mjs", "tools/privacy/scanner.mjs"]);
+  localGit(root, ["-c", "user.name=Synthetic Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "synthetic release fixture"]);
+  return { root, sha: localGit(root, ["rev-parse", "HEAD"]).trim() };
+}
+
+test("release verification requires an exact immutable reference and clean local checkout", async t => {
+  const { root, sha } = await releaseFixture(t);
+  for (const args of [[], ["--expected-ref"], ["--expected-ref", "main"], ["--expected-ref", "a".repeat(39)]]) {
+    const invalid = runRelease(root, args);
+    assert.equal(invalid.status, 2);
+    assert.match(invalid.stderr, /full immutable commit ID/);
+  }
+  const mismatch = runRelease(root, ["--expected-ref", "a".repeat(40)]);
+  assert.equal(mismatch.status, 1);
+  assert.match(mismatch.stderr, /identity does not match/);
+  const verified = runRelease(root, ["--expected-ref", sha]);
+  assert.equal(verified.status, 0);
+  assert.match(verified.stdout, new RegExp(`Release privacy verification passed for ${sha}`));
+  await writeFile(path.join(root, "safe.txt"), "changed synthetic text");
+  const dirty = runRelease(root, ["--expected-ref", sha]);
+  assert.equal(dirty.status, 1);
+  assert.match(dirty.stderr, /clean worktree/);
+});
+
+test("release verification rejects a clean commit containing a synthetic privacy violation", async t => {
+  const { root } = await releaseFixture(t);
+  await writeFile(path.join(root, "safe.txt"), "synthetic.contact@" + "coverage.invalid");
+  localGit(root, ["add", "safe.txt"]);
+  localGit(root, ["-c", "user.name=Synthetic Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "synthetic negative fixture"]);
+  const sha = localGit(root, ["rev-parse", "HEAD"]).trim();
+  const result = runRelease(root, ["--expected-ref", sha]);
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stdout, /verification passed/);
+});
+
+test("release verification propagates failure when Git cannot identify the checkout", async t => {
+  const root = await fixture({ "safe.txt": "synthetic safe text" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = runRelease(root, ["--expected-ref", "a".repeat(40)]);
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stdout, /verification passed/);
+});

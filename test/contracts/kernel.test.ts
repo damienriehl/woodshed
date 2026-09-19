@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -345,4 +347,30 @@ test("SQLite migration checksum failure preserves data and migration execution f
     kernel.seedSyntheticFirstLoop(IDS);
     assert.equal(kernel.replaceBallot(command(), [IDS.songA], new Date("2030-01-01T12:01:00Z")).revision, 1);
   } finally { kernel.close(); }
+});
+
+
+test("foundation verifier accepts the real synthetic fixture", () => {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/verify-foundation.mjs", import.meta.url))], { encoding: "utf8", timeout: 5_000 });
+  if (result.stderr) process.stderr.write(result.stderr);
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Foundation build verification passed/);
+});
+
+for (const [name, fixture] of [
+  ["non-synthetic community", { communityId: "community_invalid", events: [{ visibility: "public" }], organizer: { email: "person@example.com" } }],
+  ["non-public event", { communityId: "community_example_test", events: [{ visibility: "unlisted" }], organizer: { email: "person@example.com" } }],
+  ["unexpected organizer", { communityId: "community_example_test", events: [{ visibility: "public" }], organizer: { email: "other@example.com" } }],
+] as const) test(`foundation verifier rejects ${name}`, async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "woodshed-foundation-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await mkdir(path.join(directory, "test/fixtures/synthetic"), { recursive: true });
+  await writeFile(path.join(directory, "test/fixtures/synthetic/community.json"), JSON.stringify(fixture));
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../tools/verify-foundation.mjs", import.meta.url))], { cwd: directory, encoding: "utf8", timeout: 5_000 });
+  if (result.stderr) process.stderr.write(result.stderr);
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /AssertionError/);
+  assert.doesNotMatch(result.stdout, /verification passed/);
 });

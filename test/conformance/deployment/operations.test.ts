@@ -300,3 +300,52 @@ test("provider registry validates scopes, snapshots input and disconnects only i
   assert.deepEqual(await registry.disconnect("synthetic-one"), { revoked: false, deletedDerivedData: 0 });
   assert.deepEqual(await registry.disconnect("synthetic-two"), { revoked: true, deletedDerivedData: 0 });
 });
+
+import { spawnSync } from "node:child_process";
+
+function operatorCli(args: string[], environment: NodeJS.ProcessEnv = {}) {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../../apps/operator/src/cli.ts", import.meta.url)), ...args], { encoding: "utf8", env: { PATH: process.env.PATH, ...environment, ...(process.env.NODE_V8_COVERAGE ? { NODE_V8_COVERAGE: process.env.NODE_V8_COVERAGE } : {}) } });
+  if (result.stderr) process.stderr.write(result.stderr);
+  return result;
+}
+
+test("operator CLI distinguishes unsupported commands from supported operations requiring adapters", () => {
+  for (const args of [[], ["unsupported"]]) {
+    const result = operatorCli(args);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /Usage: woodshed-operator/);
+  }
+  for (const command of ["archive:export", "archive:import:dry-run", "backup:verify", "restore:verify", "upgrade:dry-run"]) {
+    const result = operatorCli([command]);
+    assert.equal(result.status, 1);
+    assert.deepEqual(JSON.parse(result.stdout), { command, status: "adapter-required" });
+  }
+  const health = operatorCli(["health"]);
+  assert.equal(health.status, 1);
+  assert.equal(JSON.parse(health.stdout).status, "adapter-required");
+});
+
+test("operator CLI health consumes synthetic files and a real SQLite migration ledger", async t => {
+  const root = await mkdtemp(join(tmpdir(), "woodshed-operator-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const migrations = join(root, "migrations");
+  await mkdir(migrations);
+  await writeFile(join(migrations, "001.sql"), "SELECT 1;");
+  const environment = { ...syntheticHealthEnvironment(), WOODSHED_DB: join(root, "database.sqlite"), WOODSHED_MIGRATIONS_PATH: migrations, WOODSHED_KEY_PATH: join(root, "material.bin"), WOODSHED_BACKUP_EVIDENCE: join(root, "evidence.json") };
+  const database = new DatabaseSync(environment.WOODSHED_DB);
+  try {
+    database.exec("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, checksum TEXT NOT NULL)");
+    const entry = requiredMigrationManifest(migrations)[0]!;
+    database.prepare("INSERT INTO schema_migrations VALUES (?,?)").run(entry.name, entry.checksum);
+  } finally { database.close(); }
+  const current = new Date(Date.now() - 1_000).toISOString();
+  await writeFile(environment.WOODSHED_KEY_PATH, Buffer.alloc(32, 8));
+  await writeFile(environment.WOODSHED_BACKUP_EVIDENCE, JSON.stringify({ ...freshEvidence(), lastBackupAt: current, lastRestoreDrillAt: current, rollbackEvidenceAt: current }));
+  const healthy = operatorCli(["health"], environment);
+  assert.equal(healthy.status, 0);
+  assert.equal(JSON.parse(healthy.stdout).status, "healthy");
+  await rm(environment.WOODSHED_BACKUP_EVIDENCE);
+  const degraded = operatorCli(["health"], environment);
+  assert.equal(degraded.status, 1);
+  assert.equal(JSON.parse(degraded.stdout).checks.recovery, false);
+});

@@ -105,6 +105,7 @@ describe("participant interface with real persistence", () => {
       view.unmount();
       view = render(<App api={api}/>);
       expect(await screen.findByText("Saved · revision 1")).toBeVisible();
+      expect(screen.getAllByRole("button", { name: /^Move .+ down$/ }).map(button => button.getAttribute("aria-label"))).toEqual(before.candidates.toReversed().map(candidate => `Move ${candidate.title} down`));
       expect((await api.ballot("event_public")).candidates.map(candidate => candidate.id)).toEqual(savedOrder);
       expect(service.database.prepare("SELECT count(*) AS count FROM guest_participations").get()).toMatchObject({ count: 1 });
     } finally { view.unmount(); service.close(); }
