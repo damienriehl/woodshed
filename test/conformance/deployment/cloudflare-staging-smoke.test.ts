@@ -291,7 +291,7 @@ test("deployed acceptance executes the real Worker, D1, Durable Object and persi
   assert.equal(evidence.outcomes.acceptance, true);
   assert.deepEqual(evidence.counts, { fixtureRows: 8, choiceRevision: 1, liveRevision: 1, liveEntries: 1 });
   const persisted = await loadJournal(file);
-  assert.equal(persisted.phase, "quarantined");
+  assert.equal(persisted.phase, "verified");
   assert.equal(persisted.acceptance!.status, "passed");
   assert.equal(await db.prepare("SELECT count(*) n FROM live_queue_entries WHERE event_id=?").bind(plan.eventId).first<number>("n"), 1);
   assert.equal(await db.prepare("SELECT count(*) n FROM open_join_receipts WHERE event_id=?").bind(plan.eventId).first<number>("n"), 1);
@@ -342,7 +342,7 @@ const acceptanceFaults: AcceptanceFault[] = [
   { stage: "live-result", value: { revision: 1, entry: { id: "different-entry", state: "queued" } }, error: /live state readback mismatch/ },
 ];
 
-for (const [index, fault] of acceptanceFaults.entries()) test(`acceptance quarantines contract fault ${index + 1} at ${fault.stage}`, async () => {
+for (const [index, fault] of acceptanceFaults.entries()) test(`acceptance records contract fault ${index + 1} at ${fault.stage}`, async () => {
   const { journal, plan } = deployedFixture(`acceptance-fault-${index}`);
   const participantCookie = "woodshed_session_1234567890abcdef=synthetic-participant";
   let written = false, liveWritten = false, loggedOut = false;
@@ -380,7 +380,7 @@ for (const [index, fault] of acceptanceFaults.entries()) test(`acceptance quaran
       assert.fail(`unexpected route ${path}`);
     },
   }), fault.error);
-  assert.equal(journal.phase, "quarantined");
+  assert.equal(journal.phase, "verified");
   assert.equal(journal.acceptance!.status, "failed");
   assert.equal(journal.acceptance!.cleanupComplete, false);
   assert.deepEqual(persisted.at(-1), journal);

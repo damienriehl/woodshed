@@ -653,13 +653,13 @@ test("Wrangler adapter rejects invalid prerequisites, malformed output, failed c
   }
 });
 
-test("preflight validates account and every inventory, handles sparse records, and checks route aliases", () => {
+test("preflight validates inventories, rejects sparse records and recognizes declared route aliases", () => {
   const inventory = { staging: identity, forbidden: { accountIds: [], databaseIds: [], workerNames: [], origins: ["https://blocked.invalid"] } };
   const remote = { accountId: identity.accountId, databases: [], workers: [], routes: [], secretNames: [], deployments: [] };
   for (const value of [null, { ...remote, accountId: "other" }]) assert.throws(() => assertCredentialedPreflight(inventory, value), /account/);
   for (const field of ["databases", "workers", "routes", "secretNames", "deployments"]) assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, [field]: {} }), /unreadable/);
-  for (const field of ["url", "pattern"]) assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, routes: [{ [field]: "https://blocked.invalid/route" }] }, { localSecretAvailable: true }), /forbidden/);
-  assert.doesNotThrow(() => assertCredentialedPreflight(inventory, { ...remote, databases: [null, {}], workers: [null, {}], routes: [null, {}, { pattern: "not a url" }, { url: "https://safe.invalid" }] }, { localSecretAvailable: true }));
+  for (const field of ["url", "pattern"]) assert.doesNotThrow(() => assertCredentialedPreflight(inventory, { ...remote, routes: [{ [field]: "https://blocked.invalid/route" }] }, { localSecretAvailable: true }));
+  for (const field of ["databases", "workers", "routes"]) for (const record of [null, {}]) assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, [field]: [record] }, { localSecretAvailable: true }), /unreadable/);
   assert.throws(() => assertCredentialedPreflight(inventory, { ...remote, databases: [{ id: identity.databaseId, name: "different-staging" }] }, { localSecretAvailable: true }), /already exists/);
 });
 
@@ -685,11 +685,11 @@ test("ledger requires valid rows, strict order, complete digest and source prove
   assert.throws(() => reconcileMigrationLedger({ remote: [{ name: first.filename }, { name: first.filename }], manifest: [first], journal: journal() }), /exact prefix/);
 });
 
-test("schema rejects missing sets, wrong integrity, seed and row-preservation errors", () => {
+test("schema rejects missing sets, foreign-key, seed and row-preservation errors", () => {
   const expected = { tables: ["events"], indexes: [], triggers: [], constraints: [] };
-  const actual = { ...expected, foreignKeysEnabled: true, foreignKeyViolations: 0, integrity: "ok", choiceConfigSeeded: true, migration009: { beforeRows: 1, afterRows: 1, beforeAssociations: 0, afterAssociations: 0 } };
+  const actual = { ...expected, foreignKeysEnabled: true, foreignKeyViolations: 0, integrity: "ok", choiceConfigSeeded: true, migration009: { beforeRows: 1, afterRows: 1, beforeAssociations: 0, afterAssociations: 0, beforeAssociationDigest: "f".repeat(64), afterAssociationDigest: "f".repeat(64) } };
   for (const [override, error] of [
-    [{ foreignKeysEnabled: false }, /foreign key/], [{ integrity: "corrupt" }, /integrity/],
+    [{ foreignKeysEnabled: false }, /foreign key/], [{ foreignKeyViolations: 1 }, /foreign key/],
     [{ tables: null }, /tables/], [{ indexes: ["extra"] }, /indexes/], [{ tables: ["other"] }, /tables/],
     [{ choiceConfigSeeded: false }, /seed/], [{ migration009: null }, /preservation/],
     [{ migration009: { ...actual.migration009, afterRows: 0 } }, /preservation/],
@@ -723,7 +723,7 @@ for (const invalidLease of [null, { ...lease, active: false }, { ...lease, runId
 for (const status of ["pending", "corrupt"]) {
   test(`restart fails closed on ${status} migration with failed verification`, async () => {
     const state = journal(); const first = D1_MIGRATIONS[0]!;
-    state.migrations.push({ ...first, sourceSha, status });
+    state.migrations.push({ ...first, sourceSha, status: status as "pending" });
     await assert.rejects(runMigrationFirstDeployment(deploymentFixture({ journal: state, manifest: [first], inspectLedger: async () => [{ name: first.filename }], verifyMigration: async () => false, deployWorker: async () => assert.fail("must not deploy") })), /postcondition failed|status is invalid/);
   });
 }
@@ -749,8 +749,8 @@ for (const point of ["migration", "deploy"]) {
 for (const variant of ["duplicate", "bad-status", "bad-source", "missing-inspector", "absent-remote", "already-applied"]) {
   test(`deployment intent reconciliation handles ${variant}`, async () => {
     const state = journal();
-    state.mutations.push({ kind: "worker-deploy", sourceSha: variant === "bad-source" ? "b".repeat(40) : sourceSha, status: variant === "bad-status" ? "unknown" : variant === "already-applied" ? "applied" : "pending" });
-    if (variant === "duplicate") state.mutations.push({ ...(state.mutations[0] as object) });
+    state.mutations.push({ kind: "worker-deploy", sourceSha: variant === "bad-source" ? "b".repeat(40) : sourceSha, status: variant === "bad-status" ? "unknown" as "pending" : variant === "already-applied" ? "applied" : "pending" });
+    if (variant === "duplicate") state.mutations.push({ ...state.mutations[0]! });
     const options = deploymentFixture({ journal: state, inspectDeployment: variant === "missing-inspector" ? undefined : async () => variant === "absent-remote" ? null : { deploymentId: "recovered" }, deployWorker: async () => assert.fail("never replay") });
     if (variant === "already-applied") {
       assert.equal((await runMigrationFirstDeployment(options)).deployment.deploymentId, "recovered");

@@ -388,13 +388,13 @@ test("staging status CLI reads a real journal and reports invalid invocations wi
     if (result.stderr) process.stderr.write(result.stderr);
     return result;
   };
-  const status = run(["status", journalPath]);
+  const status = run(["status", "--env", "staging", "--journal", journalPath, "--run-id", "run-a", "--owner", "owner-a"]);
   assert.equal(status.status, 0);
-  assert.deepEqual(JSON.parse(status.stdout), { runId: "run-a", phase: "pre-write" });
-  for (const args of [[], ["apply"], ["status"], ["status", path.join(directory, "missing.json")]]) {
+  assert.deepEqual(JSON.parse(status.stdout), { operation: "status", phase: "pre-write", cleanupComplete: false });
+  for (const args of [[], ["apply"], ["status"], ["status", "--env", "staging", "--journal", path.join(directory, "missing.json"), "--run-id", "run-a", "--owner", "owner-a"]]) {
     const failed = run(args);
     assert.equal(failed.status, 1);
-    assert.match(failed.stderr, /usage:|journal path is required|unreadable or corrupt/);
+    assert.match(failed.stderr, /unknown staging operation|required|unreadable or corrupt/);
   }
 });
 

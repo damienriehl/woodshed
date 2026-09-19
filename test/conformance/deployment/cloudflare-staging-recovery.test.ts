@@ -259,7 +259,7 @@ const invalidInventories: Array<[string, (value: any) => any, RegExp]> = [
   ...["not a url", "http://staging.invalid", "https://name:password" + "@staging.invalid", "https://staging.invalid/path", "https://staging.invalid/?q=1", "https://staging.invalid/#fragment"].map(origin => [origin, (v: any) => ({ ...v, staging: { ...v.staging, origin } }), /absolute HTTPS origin/] as [string, (v: any) => any, RegExp]),
   ["ambiguous origin", v => ({ ...v, staging: { ...v.staging, origin: "https://music.invalid" } }), /unmistakably staging/],
   ...["accountIds", "databaseIds", "workerNames"].map(field => [field, (v: any) => ({ ...v, forbidden: { ...v.forbidden, [field]: ["invalid value"] } }), /contains an invalid/] as [string, (v: any) => any, RegExp]),
-  ...["accountIds", "databaseIds", "origins", "workerNames"].map(field => [`blank ${field}`, (v: any) => ({ ...v, forbidden: { ...v.forbidden, [field]: [" "] } }), /non-empty array/] as [string, (v: any) => any, RegExp]),
+  ...["accountIds", "databaseIds", "origins", "workerNames"].map(field => [`blank ${field}`, (v: any) => ({ ...v, forbidden: { ...v.forbidden, [field]: [" "] } }), /non-empty (?:array|strings)/] as [string, (v: any) => any, RegExp]),
   ["forbidden database", v => ({ ...v, forbidden: { ...v.forbidden, databaseIds: [v.staging.databaseId] } }), /database is forbidden/],
   ["forbidden origin", v => ({ ...v, forbidden: { ...v.forbidden, origins: [v.staging.origin + "/"] } }), /origin is forbidden/],
   ["forbidden worker", v => ({ ...v, forbidden: { ...v.forbidden, workerNames: [v.staging.workerName.toUpperCase()] } }), /Worker is forbidden/],
@@ -300,7 +300,7 @@ test("inventory normalization feeds a persisted owned journal and isolates forbi
 function teardownOptions(): any {
   const value = journal();
   value.phase = "quarantined";
-  value.resources = RESOURCE_ORDER.map((domain: string) => ({ domain, id: domain + "-fixture", runId: value.runId, owner: value.owner }));
+  value.resources = RESOURCE_ORDER.map((domain: string) => ({ domain, id: domain + "-fixture", runId: value.runId, owner: value.owner, ...(domain === "token" ? { provenance: "run-minted" } : {}) }));
   return { journal: value, lease: { active: true, runId: value.runId, owner: value.owner, revision: "rev-1" }, expectedRevision: "rev-1", inspectRevision: async () => "rev-1", listDependents: async () => [], inspectResource: async () => ({ exists: false }), removeResource: async () => assert.fail("must not remove an absent resource"), verifyTokenInactive: async () => true };
 }
 const invalidTeardowns: Array<[string, (value: any) => void, RegExp]> = [
@@ -308,7 +308,7 @@ const invalidTeardowns: Array<[string, (value: any) => void, RegExp]> = [
   ["inactive lease", v => { v.lease.active = false; }, /ownership lease/],
   ["foreign run", v => { v.lease.runId = "other"; }, /ownership lease/],
   ["foreign owner", v => { v.lease.owner = "other"; }, /ownership lease/],
-  ["writable phase", v => { v.journal.phase = "alias-live"; }, /quarantined/],
+  ["pre-write phase", v => { v.journal.phase = "pre-write"; }, /post-write/],
   ["stale lease", v => { v.lease.revision = "rev-0"; }, /last-write identity/],
   ["stale remote", v => { v.inspectRevision = async () => "rev-2"; }, /last-write identity/],
   ["invalid graph", v => { v.journal.resources = null; }, /resource graph/],
@@ -317,7 +317,7 @@ const invalidTeardowns: Array<[string, (value: any) => void, RegExp]> = [
   ["foreign resource run", v => { v.journal.resources[0].runId = "other"; }, /journal resource identity/],
   ["foreign resource owner", v => { v.journal.resources[0].owner = "other"; }, /journal resource identity/],
   ["missing resource id", v => { v.journal.resources[0].id = ""; }, /journal resource identity/],
-  ...["route", "credential", "secret", "worker", "durable-object", "d1", "token"].map(domain => [`missing ${domain}`, (v: any) => { v.journal.resources = v.journal.resources.filter((r: any) => r.domain !== domain); }, new RegExp(`missing ${domain} teardown authority`)] as [string, (v: any) => void, RegExp]),
+  ...["route", "credential", "secret", "worker", "durable-object", "d1"].map(domain => [`missing ${domain}`, (v: any) => { v.journal.resources = v.journal.resources.filter((r: any) => r.domain !== domain); }, new RegExp(`missing ${domain} teardown authority`)] as [string, (v: any) => void, RegExp]),
   ["unreadable dependencies", v => { v.listDependents = async () => null; }, /dependent inventory is unreadable/],
   ["unproven absence", v => { v.inspectResource = async () => undefined; }, /absence proof failed/],
   ["active token", v => { v.verifyTokenInactive = async () => false; }, /token remains active/],

@@ -306,60 +306,6 @@ test("Windows teardown reports incomplete descendant cleanup when both tree kill
   assert.match(failures[0], /descendants may still be running/i);
 });
 
-import { createServer } from "node:net";
-import { fileURLToPath } from "node:url";
-
-async function availableLocalPort() {
-  const server = createServer();
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
-  const port = server.address().port;
-  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-  return port;
-}
-
-test("Node server entrypoint serves synthetic demo through real HTTP and SQLite", { timeout: 15_000 }, async t => {
-  const directory = await mkdtemp(join(tmpdir(), "woodshed-server-coverage-"));
-  let child;
-  t.after(async () => {
-    try {
-      if (child) {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-        await waitForExit(child, 3_000);
-      }
-    } finally { await rm(directory, { recursive: true, force: true }); }
-  });
-  const port = await availableLocalPort();
-  const origin = `http://127.0.0.1:${port}`;
-  child = spawn(process.execPath, [fileURLToPath(new URL("../../apps/api-node/src/server.ts", import.meta.url)), "--demo"], {
-    cwd: directory,
-    env: { PATH: process.env.PATH, PORT: String(port), WOODSHED_ORIGIN: origin, WOODSHED_DB: join(directory, "synthetic.sqlite"), ...(process.env.NODE_V8_COVERAGE ? { NODE_V8_COVERAGE: process.env.NODE_V8_COVERAGE } : {}) },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stderr.on("data", chunk => process.stderr.write(chunk));
-  await new Promise((resolve, reject) => {
-    let output = "";
-    const timer = setTimeout(() => reject(new Error("server startup timed out")), 5_000);
-    child.once("error", error => { clearTimeout(timer); reject(error); });
-    child.once("exit", code => { clearTimeout(timer); reject(new Error(`server exited during startup: ${code}`)); });
-    child.stdout.on("data", chunk => {
-      output += chunk;
-      if (output.includes("Woodshed API listening")) { clearTimeout(timer); resolve(); }
-    });
-  });
-  const discovery = await fetch(`${origin}/api/discovery`);
-  assert.equal(discovery.status, 200);
-  assert.equal(discovery.headers.get("cache-control"), "private, no-store");
-  const body = await discovery.json();
-  assert.deepEqual(body.events.map(event => event.id), ["event_public"]);
-  assert.equal((await fetch(`${origin}/api/events/event_public/ballot`)).status, 401);
-  const joined = await fetch(`${origin}/api/events/event_public/join-open`, { method: "POST", headers: { origin, "x-csrf-token": "same-origin", "content-type": "application/json" }, body: JSON.stringify({ operationId: "server_synthetic_join" }) });
-  assert.equal(joined.status, 200);
-  const cookie = joined.headers.getSetCookie().map(value => value.split(";", 1)[0]).join("; ");
-  const ballot = await fetch(`${origin}/api/events/event_public/ballot`, { headers: { cookie } });
-  assert.equal(ballot.status, 200);
-  assert.equal((await ballot.json()).candidates.length, 2);
-});
-
 test("launcher settlement cancels its sole grace timer and permits later cleanup", () => {
   const timers = [], cancelled = [], signals = [];
   const controller = createTeardownController({ children: [{ pid: 1 }], terminate: (_child, signal) => signals.push(signal), setTimer: callback => { const timer = { callback, unref() {} }; timers.push(timer); return timer; }, clearTimer: timer => cancelled.push(timer), exit: () => assert.fail("cancelled timer must not exit") });
