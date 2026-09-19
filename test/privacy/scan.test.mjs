@@ -124,3 +124,97 @@ test("does not confuse an archive source directory with an exported archive arti
   const result = scanBuffer("packages/archive/package.json", Buffer.from('{"name":"archive-contract"}'));
   assert.deepEqual(result, []);
 });
+
+import { spawnSync } from "node:child_process";
+import { rm } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
+function localGit(root, args) {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  if (result.stderr) process.stderr.write(result.stderr);
+  assert.equal(result.status, 0, `git ${args[0]}: ${result.stderr}`);
+  return result.stdout;
+}
+
+test("real Git history scan finds deleted synthetic data while tracked and worktree scans stay clean", async t => {
+  const root = await fixture({ "history.txt": "contact: synthetic.person@" + "coverage.invalid" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  localGit(root, ["init", "--quiet"]);
+  localGit(root, ["add", "history.txt"]);
+  localGit(root, ["-c", "user.name=Synthetic Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "synthetic history fixture"]);
+  await writeFile(path.join(root, "history.txt"), "synthetic safe text");
+  localGit(root, ["add", "history.txt"]);
+  localGit(root, ["-c", "user.name=Synthetic Test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "remove synthetic fixture value"]);
+  const current = await runPrivacyScan({ cwd: root, modes: new Set(["--tracked", "--worktree"]) });
+  assert.deepEqual(current, { findings: [], errors: [] });
+  const history = await runPrivacyScan({ cwd: root, modes: new Set(["--history"]) });
+  assert.deepEqual(history, { findings: [{ path: "history:history.txt", rule: "email" }], errors: [] });
+  assert.doesNotMatch(JSON.stringify(history), /synthetic\.person/);
+});
+
+test("Git inventory failure is reported as a sanitized error", async t => {
+  const root = await fixture({ "safe.txt": "synthetic safe text" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = await runPrivacyScan({ cwd: root, modes: new Set(["--tracked"]) });
+  assert.deepEqual(result, { findings: [], errors: [{ path: "repository", error: "inventory-failed" }] });
+});
+
+test("explicit privacy paths resolve both relative and absolute inputs", async t => {
+  const root = await fixture({ "safe.txt": "synthetic safe text", "other.txt": "contact: person@" + "coverage.invalid" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.deepEqual(await runPrivacyScan({ cwd: root, modes: new Set(), explicit: ["safe.txt"] }), { findings: [], errors: [] });
+  const result = await runPrivacyScan({ cwd: root, modes: new Set(), explicit: [path.join(root, "other.txt")] });
+  assert.deepEqual(result.findings, [{ path: path.join(root, "other.txt"), rule: "email" }]);
+  assert.deepEqual(result.errors, []);
+});
+
+test("scanner excludes dependency and Git internals but still checks forbidden binary filenames", async t => {
+  const root = await fixture({ "node_modules/ignored.txt": "person@" + "coverage.invalid", ".git/ignored.txt": "person@" + "coverage.invalid", "nested/export.db": Buffer.from([0, 1, 2]) });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = await scanPaths([root]);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.findings, [{ path: path.join(root, "nested/export.db"), rule: "forbidden-artifact" }]);
+});
+
+test("manifest walks nested files and reports missing paths while excluding tool internals", async t => {
+  const root = await fixture({ "nested/reviewed.txt": "safe", "node_modules/ignored.txt": "safe", ".git/ignored.txt": "safe" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.deepEqual(await verifyManifest(root, ["nested/reviewed.txt", "absent.txt"]), { unexpected: [], missing: ["absent.txt"] });
+  await assert.rejects(verifyManifest(path.join(root, "missing"), []), { code: "ENOENT" });
+});
+
+function runPrivacyCli(script, root, args = []) {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL(`../../tools/privacy/${script}`, import.meta.url)), ...args], { cwd: root, encoding: "utf8" });
+  if (result.stderr) process.stderr.write(result.stderr);
+  return result;
+}
+
+test("privacy CLI default and explicit modes report pass or sanitized failure with real exit codes", async t => {
+  const root = await fixture({ "safe.txt": "synthetic safe text" });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const clean = runPrivacyCli("scan.mjs", root);
+  assert.equal(clean.status, 0);
+  assert.match(clean.stdout, /Privacy scan passed/);
+  const missing = runPrivacyCli("scan.mjs", root, ["missing.txt"]);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /privacy scan error: unreadable/);
+  await writeFile(path.join(root, "unsafe.txt"), "person@" + "coverage.invalid");
+  const unsafe = runPrivacyCli("scan.mjs", root, ["--worktree"]);
+  assert.equal(unsafe.status, 1);
+  assert.match(unsafe.stderr, /privacy finding: email/);
+  assert.doesNotMatch(unsafe.stderr, /person@/);
+});
+
+test("manifest CLI verifies real files and fails when required paths disappear or unreviewed paths appear", async t => {
+  const root = await fixture({ "safe.txt": "safe", "tools/privacy/public-files.json": JSON.stringify({ files: ["safe.txt", "tools/privacy/public-files.json"] }) });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const clean = runPrivacyCli("check-manifest.mjs", root);
+  assert.equal(clean.status, 0);
+  assert.match(clean.stdout, /Public file manifest passed/);
+  await rm(path.join(root, "safe.txt"));
+  await writeFile(path.join(root, "unreviewed.txt"), "synthetic safe text");
+  const failed = runPrivacyCli("check-manifest.mjs", root);
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /unreviewed public path: unreviewed.txt/);
+  assert.match(failed.stderr, /manifest path is missing: safe.txt/);
+});

@@ -252,7 +252,7 @@ test("operator adapters fail closed on missing databases, directories and malfor
   assert.equal(systemHealthAdapter.migrations(missing, missing), false);
   assert.equal(await systemHealthAdapter.keyCustody(missing), false);
   assert.equal(await systemHealthAdapter.service("not a URL"), false);
-  await assert.rejects(() => systemHealthAdapter.backupEvidence(missing));
+  await assert.rejects(async () => systemHealthAdapter.backupEvidence(missing));
 });
 
 test("operator aggregates thrown probe errors and non-Error recovery failures", async () => {
