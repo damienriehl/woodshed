@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { systemHealthAdapter } from "../../../apps/operator/src/index.ts";
 
 test("migration ledger is checksummed, supports mixed versions and blocks unsafe contract", () => {
@@ -211,6 +213,19 @@ for (const value of ["0", "-1", "NaN", "Infinity", "", "not-a-number"]) {
 }
 
 test("operator probes real SQLite, migration files, synthetic custody bytes, and recovery evidence end to end", async (t) => {
+  let requests = 0;
+  const service = createServer((_request, response) => {
+    requests += 1;
+    response.end("healthy");
+  });
+  t.after(async () => {
+    service.closeAllConnections();
+    await new Promise<void>((resolve, reject) => service.close(error => error ? reject(error) : resolve()));
+  });
+  service.listen(0, "127.0.0.1");
+  await once(service, "listening");
+  const address = service.address();
+  assert.ok(address && typeof address !== "string");
   const directory = await mkdtemp(join(tmpdir(), "woodshed-health-chain-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const migrationsPath = join(directory, "migrations");
@@ -219,7 +234,7 @@ test("operator probes real SQLite, migration files, synthetic custody bytes, and
   await writeFile(join(migrationsPath, "002_second.sql"), "SELECT 2;");
   await writeFile(join(migrationsPath, "001_first.sql"), "SELECT 1;");
   await writeFile(join(migrationsPath, "README.txt"), "synthetic migration fixture");
-  const config = healthConfigFromEnvironment({ ...syntheticHealthEnvironment(), WOODSHED_DB: join(directory, "community.sqlite"), WOODSHED_MIGRATIONS_PATH: migrationsPath, WOODSHED_KEY_PATH: join(directory, "material.bin"), WOODSHED_BACKUP_EVIDENCE: join(directory, "backup.json") })!;
+  const config = healthConfigFromEnvironment({ ...syntheticHealthEnvironment(), WOODSHED_HEALTH_URL: `http://127.0.0.1:${address.port}`, WOODSHED_DB: join(directory, "community.sqlite"), WOODSHED_MIGRATIONS_PATH: migrationsPath, WOODSHED_KEY_PATH: join(directory, "material.bin"), WOODSHED_BACKUP_EVIDENCE: join(directory, "backup.json") })!;
   const manifest = requiredMigrationManifest(migrationsPath);
   assert.deepEqual(manifest.map(entry => entry.name), ["001_first.sql", "002_second.sql"]);
   const database = new DatabaseSync(config.databasePath);
@@ -241,6 +256,7 @@ test("operator probes real SQLite, migration files, synthetic custody bytes, and
   assert.equal(degraded.exitCode, 1);
   assert.deepEqual(degraded.checks, { service: true, database: true, migrations: false, keyCustody: false, recovery: false });
   assert.ok(degraded.recovery.length >= 2);
+  assert.equal(requests, 2);
 });
 
 test("operator adapters fail closed on missing databases, directories and malformed service URLs", async (t) => {
