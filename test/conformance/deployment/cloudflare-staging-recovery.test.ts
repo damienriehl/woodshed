@@ -97,6 +97,54 @@ test("teardown is run-owned, dependency ordered, re-entrant, and proves every do
   assert.deepEqual(calls, []);
 });
 
+test("teardown defers route proof at its position and resolves it only after Worker absence", async () => {
+  const domains = ["route", "credential", "secret", "worker", "durable-object", "d1", "token"];
+  const state = new Map(domains.map((domain) => [domain, true]));
+  const calls: string[] = [];
+  let routeInspections = 0;
+  const journal = {
+    runId: "run-deferred", owner: "owner-deferred", phase: "quarantined", identity: {},
+    resources: domains.map((domain) => ({
+      domain,
+      id: `${domain}-deferred`,
+      runId: "run-deferred",
+      owner: "owner-deferred",
+      ...(domain === "token" ? { provenance: "run-minted" } : {}),
+    })),
+  };
+
+  const result = await runStackTeardown({
+    journal,
+    lease: { active: true, runId: journal.runId, owner: journal.owner, revision: "7" },
+    expectedRevision: "7",
+    inspectRevision: async () => "7",
+    listDependents: async () => [],
+    inspectResource: async ({ domain }: { domain: string }) => {
+      calls.push(`inspect:${domain}`);
+      if (domain === "route") {
+        routeInspections += 1;
+        return { exists: null, deferAbsenceUntil: "worker", runId: journal.runId, owner: journal.owner };
+      }
+      return { exists: state.get(domain), runId: journal.runId, owner: journal.owner };
+    },
+    removeResource: async ({ domain }: { domain: string }) => {
+      calls.push(`remove:${domain}`);
+      if (domain !== "route") state.set(domain, false);
+    },
+    verifyTokenInactive: async () => true,
+  });
+
+  assert.equal(routeInspections, 1, "a deferred route is remediated but not falsely re-read as absent");
+  assert.ok(calls.indexOf("remove:route") < calls.indexOf("remove:credential"));
+  assert.ok(calls.indexOf("remove:credential") < calls.indexOf("remove:secret"));
+  assert.ok(calls.indexOf("remove:secret") < calls.indexOf("remove:worker"));
+  assert.equal(result.absence["route:route-deferred"], true);
+  assert.equal(result.absence["worker:worker-deferred"], true);
+  assert.equal(Object.keys(result.absence).length, 7);
+  assert.deepEqual(Object.values(result.absence), [true, true, true, true, true, true, true]);
+  assert.equal(result.complete, true);
+});
+
 test("teardown removes every duplicate-domain resource and an applicable hostname", async () => {
   const resourceSpecs = [
     ["route", "route-a"], ["route", "route-b"], ["hostname", "host-a"],

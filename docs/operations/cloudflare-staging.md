@@ -4,7 +4,9 @@ This runbook governs the disposable Cloudflare staging stack only. A successful 
 
 ## Evidence and observability
 
-Keep the exact ownership journal and account inventory private. The final shareable packet contains only phase outcomes, counts, timestamps, source/config/schema/protected-inventory digests, and absence booleans. It must not contain account, deployment, database, Worker, route, hostname, or token identifiers; cookies; authorization headers; request or response bodies; ballots; session or device credentials; secret values; database results; or hashes derived from user-shaped values. An unexpected Worker exception, D1 failure, Durable Object failure, credential exposure, or 5xx blocks completion and produces a redacted report naming the incident owner and safe next action.
+Keep the exact ownership journal and account inventory private. The final shareable packet contains only phase outcomes, counts, timestamps, source/config/schema/protected-inventory digests, absence booleans, and one aggregate route proof method: `provider-read` unless any route used `owning-worker-deletion`. It must not contain account, deployment, database, Worker, route, hostname, or token identifiers; cookies; authorization headers; request or response bodies; ballots; session or device credentials; secret values; database results; or hashes derived from user-shaped values. An unexpected Worker exception, D1 failure, Durable Object failure, credential exposure, or 5xx blocks completion and produces a redacted report naming the incident owner and safe next action.
+
+Every CLI failure prints the redacted public error as its first line and appends one safe line, `cause: <code>`. The code is restricted to `wrangler-command-failed`, `edge-timeout`, `edge-rate-limited`, `marker-missing`, `marker-mismatch`, `marker-unreadable`, or `postcondition-failed`; an unclassified failure prints the conservative fallback `postcondition-failed`. When the driver journals a classified incident, the private field is exactly `incident.cause: { "code": "<code>" }`. No free-text provider message or identifier is permitted inside that cause object.
 
 The private journal remains available through the +1-hour and +24-hour absence/audit checks after teardown. After an incident, retain it through resolution and the following 24 hours. Only then may the operator dispose of it under the private retention policy.
 
@@ -18,9 +20,11 @@ D1 Time Travel is a separate, destructive recovery domain. Before restore, withd
 
 Every post-write failure is a partial-deployment incident. Quarantine the origin before restore or teardown, preserve the bookmark and frozen identities, and never automatically restore persistent state. A corrupt journal, owner/run mismatch, changed last-write identity, unreadable inventory, or unexpected dependent authorizes no deletion.
 
+Enable reconciliation is part of the original `apply` settlement, before quarantine. The full served-marker proof, exactly one new deployment identity, the applied `workers-dev-enable` intent, and the `alias-live` phase are persisted as one transition. Quarantine does not reconcile or apply a pending enable intent: it disables exposure. A journal in `quarantined` cannot resume acceptance, because `verify` accepts only `alias-live` or `verified`. Close the quarantined journal with `teardown`; any later acceptance starts from a new journal and run ID.
+
 `teardown` accepts any post-write phase — `resources-ready` through `quarantined` — so a run that failed before quarantine could finish is still closeable by the driver. Widening the entry phase changes no per-resource proof: ownership, identity revision, lease, forbidden-identity, and dependent checks are identical on every path, and a run that cannot satisfy them is still refused.
 
-When no Worker exists at the run's name, teardown records the `workers.dev` route absent without probing it and never redeploys the route; a route is a property of its Worker.
+When the authenticated account-wide script listing proves that no Worker exists at the run's name, teardown records the `workers.dev` route absent without probing it and never redeploys the route; a route is a property of its Worker.
 
 A failed or lost deploy leaves its `worker-deploy` intent pending. With a Worker present, a recorded deployment baseline, and exactly one new deployment identity, teardown reconciles the intent and removes the Worker as this run's. Until teardown runs, a foreign single-deployment Worker at the run's name would satisfy that rule; `apply` refusing an existing same-named D1 keeps a second driver run from producing that state. Otherwise the existing refusal, `remote Worker predates this run's deployment; refusing to remove it`, stands and a person decides.
 
@@ -28,7 +32,9 @@ A failed or lost deploy leaves its `worker-deploy` intent pending. With a Worker
 
 Cloudflare publishes no read-after-write consistency guarantee for the `workers.dev` subdomain endpoint, in either direction. Quarantine therefore retries the absence proof on a bounded schedule, and can still finish without an answer. When that happens the journal records `incident.originAbsence` with `status: "could-not-confirm"`, the attempt count, the timestamp, and whether the disable itself errored (`disableFailed`).
 
-That state is neither success nor failure. The phase does not advance to `quarantined`, because advancing would assert a proof that never happened, and `quarantineFailed` is not set, because that flag means the disable errored — a different incident. Treat the origin as possibly live and run `teardown`: deleting the Worker removes the exposure by construction, which is a stronger proof than the configuration read that could not settle. If `disableFailed` is `true`, the disable deploy failed as well, so inspect the Worker before assuming anything about its state.
+That state is neither success nor failure. The phase does not advance to `quarantined`, because advancing would assert a proof that never happened, and `quarantineFailed` is not set, because that flag means the disable errored — a different incident. Treat the origin as possibly live and run `teardown`. If `disableFailed` is `true`, the disable deploy failed as well, so inspect the Worker before assuming anything about its state.
+
+The D9 exception is narrower than a general claim that Worker deletion is stronger than a route read. It applies only during teardown when the run-owned Worker exists and route inspection returns `could-not-confirm`. The driver keeps the private-config redeploy as exposure remediation but records no route absence from that deploy; it defers the route key at `false`. Only after `listWorkerScripts` proves the owning Worker absent at the Worker step does teardown flip that deferred route key to `true` and record `owning-worker-deletion`. A route read that is `present` remains a hard refusal and is never deferred; a route read that is `proven-absent` records `provider-read` instead.
 
 ### Unowned near-miss Worker
 
@@ -96,11 +102,31 @@ npm run cloudflare:staging -- preflight --env staging --inventory "$STAGING_INVE
 npm run cloudflare:staging -- plan --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
 npm run cloudflare:staging -- status --env staging --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
 npm run cloudflare:staging -- apply --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
-npm run cloudflare:staging -- verify --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
-npm run cloudflare:staging -- teardown --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
 ```
 
-`preflight` and `plan` perform no Cloudflare mutation. Review the private plan/journal after `plan` and before `apply`. `apply` is migration-first and origin-last. `verify` uses real HTTPS, exercises the participant/security/authority/live-command boundaries, records same-lifecycle compatibility, states that the first Durable Object lifecycle is forward-fix-only, and quarantines the origin. `teardown` calls the dependency-ordered removers, never revokes the borrowed operator token, requires immediate per-domain absence, and writes `<journal>.evidence.json` with only counts, booleans, timestamps, and source/config/schema digests.
+Stop after `apply` and choose exactly one outcome:
+
+1. **Enable reconciled.** The full marker and the single new deployment identity were proven; the driver persisted the proof, applied intent, deployment ID, and `alias-live` phase together without retrying the mutation. **Next action:** run `verify` once with this same journal.
+
+   ```sh
+   npm run cloudflare:staging -- verify --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
+   ```
+
+2. **Enable not applied.** The bounded marker check proved the active release was not owned by this run. The driver left the enable intent pending, did not replay it, and entered automatic quarantine handling. **Next action:** run `teardown` with this same journal; do not run `apply` again.
+
+   ```sh
+   npm run cloudflare:staging -- teardown --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
+   ```
+
+3. **Enable unknown and the journal is quarantined.** The bounded marker check could not prove either ownership or non-ownership. The driver refused to retry the uncertain mutation, left the enable intent pending, and quarantined the run. **Next action:** run `teardown` with this same journal; after cleanup, create a new journal and run ID for a fresh acceptance run. Never run `apply` or `verify` from this quarantined journal.
+
+   ```sh
+   npm run cloudflare:staging -- teardown --env staging --inventory "$STAGING_INVENTORY_PATH" --journal "$STAGING_JOURNAL_PATH" --run-id "$STAGING_RUN_ID" --owner "$STAGING_OWNER"
+   ```
+
+Nothing in these outcomes authorizes retrying an uncertain mutation. The no-replay refusal remains in force.
+
+`preflight` and `plan` perform no Cloudflare mutation. Review the private plan/journal after `plan` and before `apply`. `apply` is migration-first and origin-last. `verify` uses real HTTPS, exercises the participant/security/authority/live-command boundaries, records same-lifecycle compatibility, states that the first Durable Object lifecycle is forward-fix-only, and quarantines the origin. After a successful `verify`, run `teardown` with the same journal. `teardown` calls the dependency-ordered removers, never revokes the borrowed operator token, requires immediate per-domain absence, and writes `<journal>.evidence.json` with counts, booleans, timestamps, source/config/schema digests, and the allowlisted aggregate route proof method.
 
 Wrangler runs with an isolated generated home and an explicit empty environment file; it does not inherit ambient Cloudflare credentials or load repository dotenv/dev-var files. Successful teardown deletes the run-specific generated configuration while retaining the private external journal and evidence packet for delayed audits. The hostname domain is journaled explicitly as not provisioned and receives its own absence observation because this driver accepts only the authenticated run-owned `workers.dev` origin; it never creates a custom hostname.
 
@@ -111,3 +137,7 @@ npm run cloudflare:staging -- absence-check --env staging --inventory "$STAGING_
 ```
 
 Retain the private journal until both checks pass. A failed or interrupted phase is re-entered with the same inventory, journal, run ID, and owner. Never start a second run against the graph, replay an uncertain migration blindly, restore D1 automatically, or claim that D1 recovery restored Durable Object state.
+
+Each delayed `absence-check` first requires the D1 database and Worker to be absent. Worker absence establishes the route's deletion proof, but the driver still performs an independent `workers.dev` read as an additional exposure check. `proven-absent` passes; `could-not-confirm` is non-fatal; an enabled origin is `present` and still fails the delayed check.
+
+Re-entry never means replaying `apply` from a quarantined journal or from an uncertain pending enable intent. The pending-mutation guard refuses replay, and `verify` has no quarantined acceptance path. Re-enter only the operation authorized by the journal state: for a failed enable, that is `teardown`; acceptance after cleanup uses a new journal and run ID.

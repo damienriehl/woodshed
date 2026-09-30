@@ -7,6 +7,16 @@ export const TEARDOWN_ENTRY_PHASES = Object.freeze(["resources-ready", "bookmark
 const REQUIRED_IDENTITY = ["accountId", "databaseName", "workerName", "origin"];
 const RESOURCE_DOMAINS = new Set(["route", "hostname", "credential", "secret", "worker", "durable-object", "d1", "token"]);
 const CLOSED_D1_REFUSAL_INCIDENTS = new Set(["d1-create-refused", "d1-acceptance-mismatch"]);
+export const STAGING_FAILURE_CAUSES = Object.freeze([
+  "wrangler-command-failed",
+  "edge-timeout",
+  "edge-rate-limited",
+  "marker-missing",
+  "marker-mismatch",
+  "marker-unreadable",
+  "postcondition-failed",
+]);
+const CLOSED_STAGING_FAILURE_CAUSES = new Set(STAGING_FAILURE_CAUSES);
 
 function requiredString(value, name) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`invalid journal: ${name} is required`);
@@ -38,6 +48,15 @@ export function validateJournal(value) {
   if (value.phase !== "pre-write" && !value.identity.databaseId && !closedD1Refusal) throw new Error("invalid journal: identity.databaseId is required after provisioning");
   if (!Array.isArray(value.resources) || !Array.isArray(value.mutations) || !Array.isArray(value.migrations)) throw new Error("invalid journal: ownership arrays");
   if (value.preflight !== undefined && (!value.preflight || typeof value.preflight !== "object" || value.preflight.operatorTokenPresent !== true)) throw new Error("invalid journal: operator token presence");
+  if (value.incident !== undefined) {
+    if (!value.incident || typeof value.incident !== "object" || Array.isArray(value.incident)) throw new Error("invalid journal: incident");
+    if (value.incident.cause !== undefined) {
+      const cause = value.incident.cause;
+      if (!cause || typeof cause !== "object" || Array.isArray(cause) || Object.keys(cause).length !== 1 || !CLOSED_STAGING_FAILURE_CAUSES.has(cause.code)) {
+        throw new Error("invalid journal: incident cause");
+      }
+    }
+  }
   const resourceKeys = new Set();
   for (const resource of value.resources) {
     if (!resource || typeof resource !== "object" || !RESOURCE_DOMAINS.has(resource.domain) || typeof resource.id !== "string" || !resource.id || resource.runId !== value.runId || resource.owner !== value.owner || (resource.status !== undefined && !["planned", "owned"].includes(resource.status))) throw new Error("invalid journal: resource ownership");
